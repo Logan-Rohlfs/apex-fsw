@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*", category=Warn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from apex_sim.analysis.compare import FlightMetrics, print_comparison
+from apex_sim.analysis.compare import FlightMetrics, plot_traces, print_comparison
 from apex_sim.config.loader import load_environment
 from apex_sim.sim.flight import run_baseline, run_flight
 
@@ -131,6 +131,9 @@ def main() -> None:
             time_to_apogee_s=round(t_apogee, 1),
         )
         print_comparison(sim_metrics)
+        out = plot_traces(flight)
+        if out:
+            print(f"  Trace plot saved to {out}")
 
     if args.save:
         out_dir = Path(__file__).resolve().parents[1] / "output"

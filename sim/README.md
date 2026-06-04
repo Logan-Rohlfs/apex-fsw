@@ -16,7 +16,7 @@ apex/sim/
 │   ├── sensors/       # sensor noise and bias models (not yet implemented)
 │   ├── sim/           # RocketPy wrappers — environment, rocket, airbrakes, flight
 │   ├── hil/           # serial protocol and hardware interface (not yet implemented)
-│   └── analysis/      # logging and plotting (not yet implemented)
+│   └── analysis/      # flight comparison — scalar table, trace plots, OR .ork parser
 ├── config/            # parameter files — edit these, not the Python
 │   ├── environment.yaml    # atmosphere model, rail, active_site pointer
 │   ├── rocket.yaml         # mass, geometry, motor, recovery
@@ -86,6 +86,7 @@ python scripts/run_sim.py [options]
 |---|---|
 | *(none)* | Competition sim — IREC Pecos TX, PID airbrakes active |
 | `--baseline` | Clean flight, no airbrakes — use for validating against real data |
+| `--compare` | Baseline against Seymour TX site; prints scalar table and saves trace plot to `output/comparison.png` |
 | `--site PROFILE` | Override the active site (e.g. `seymour_tx_2026_05_24`) |
 | `--model MODEL` | Override atmosphere model: `RAP`, `NAM`, `GFS`, `standard_atmosphere` |
 | `--full-descent` | Simulate through landing (default: stop at apogee) |
@@ -101,9 +102,23 @@ python scripts/run_sim.py
 # Validate against Seymour TX flight — standard atmosphere (fast, ~4.5% low vs real data)
 python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24
 
-# Same validation with ERA5 historical weather (accurate, requires Copernicus CDS key)
-python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24 --model ERA5
+# Full comparison: scalar table + trace plot vs TeleMega, Blue Raven, and OpenRocket
+python scripts/run_sim.py --compare
+
+# Same with ERA5 historical weather (accurate, requires Copernicus CDS key)
+python scripts/run_sim.py --compare --model ERA5
 ```
+
+**`--compare` output:**
+
+The scalar table shows RocketPy alongside TeleMega (baro), Blue Raven (baro and
+inertial), and OpenRocket — all read live from the data files in `data/`.  The trace
+plot (`output/comparison.png`) overlays altitude AGL and speed vs time for all four
+sources through apogee.
+
+OpenRocket data is parsed directly from `data/openrocket/Team307_TexasTechUniversity_PR3.ork`
+(the .ork is a ZIP containing a full simulation trace) — no separate OpenRocket install
+needed to view OR results.
 
 **Atmosphere note:** NOAA's OpenDAP service (RAP/NAM/GFS) was retired in 2025.
 Forecast sims will fall back to `standard_atmosphere` until RocketPy adds support for

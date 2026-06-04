@@ -25,3 +25,15 @@ launch_window:
   sim_datetime: "2026-05-24T16:29:39"   # UTC — confirmed from TeleMega GPS timestamp
   # Atmosphere model will auto-select ERA5 reanalysis for historical dates this far past.
   # Set model_override: "ERA5" in environment.yaml when running validation sims.
+
+# Post-flight analysis notes.
+flight_notes:
+  # At t=1.12s the rocket weathercocked to 15.33 degrees off vertical (into the wind).
+  # Baro consensus (BR 10,523 ft, TM 10,553 ft) is competition ground truth — ~10,538 ft avg.
+  # OR clean (no weathercock, ISA): 11,312 ft — 774 ft HIGH vs baro consensus.
+  # OR weathercocked (15.33 deg): 10,438 ft — 100 ft LOW vs baro consensus, closest predictor.
+  # The weathercock was a significant contributor to the actual apogee.
+  # BR inertial (11,338 ft) excluded as ground truth — ASL/AGL ambiguous in summary CSV.
+  weathercock_time_s: 1.12
+  weathercock_angle_deg: 15.33
+  or_weathercocked_apogee_ft: 10438   # from post-flight OR re-run by Apex director
