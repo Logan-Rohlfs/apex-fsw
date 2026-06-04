@@ -1,0 +1,41 @@
+#!/usr/bin/env zsh
+# Source to install/check and activate the venv in the current shell.
+# Run standalone to install/check without activating.
+#
+#   source apex-setup     installs if needed, activates
+#   apex-setup            installs if needed, prints hint
+#
+# Add bin/ to PATH once so all apex-* scripts are reachable:
+#   echo 'export PATH="$PATH:$HOME/git/apex/bin"' >> ~/.zshrc
+
+[[ "$ZSH_EVAL_CONTEXT" == *:file* ]] && _sourced=1 || _sourced=0
+(( _sourced )) && _this="${(%):-%x}" || _this="${0:A}"
+
+_root="${_this:A:h:h}"
+_sim="${_root}/sim"
+_venv="${_sim}/.venv"
+
+if [[ ! -d "$_venv" ]]; then
+    print "apex-setup: creating venv"
+    python3 -m venv "$_venv" || {
+        print "apex-setup: venv creation failed" >&2
+        unset _sourced _this _root _sim _venv
+        (( _sourced )) && return 1 || exit 1
+    }
+fi
+
+"$_venv/bin/pip" install -q --upgrade pip setuptools \
+    && "$_venv/bin/pip" install -q -e "${_sim}[dev]" || {
+    print "apex-setup: install failed" >&2
+    unset _sourced _this _root _sim _venv
+    (( _sourced )) && return 1 || exit 1
+}
+
+if (( _sourced )); then
+    source "$_venv/bin/activate"
+    print "$(python --version) — apex-sim active"
+else
+    print "venv ready — run: source apex-setup"
+fi
+
+unset _sourced _this _root _sim _venv
