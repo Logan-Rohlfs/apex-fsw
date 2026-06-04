@@ -1,0 +1,58 @@
+# conditions.yaml
+# Launch conditions for the Seymour TX test flight — 2026-05-24.
+# Used by validate_baseline.py to configure the RocketPy sim for comparison.
+
+flight:
+  date: "2026-05-24"
+  time_local: "11:29:40"           # from Blue Raven summary
+  time_utc: "16:29:39"             # from TeleMega GPS timestamp
+  location: "Seymour, TX"
+  notes: "Test flight. No active airbrake control. TeleMega callsign KJ5LDI (serial 16370)."
+
+launch_site:
+  # GPS coordinates from TeleMega first fix
+  latitude: 33.4986968
+  longitude: -99.3329858
+  # Pad altitude from Blue Raven summary (baro)
+  pad_altitude_asl_ft: 1199.11
+  pad_altitude_asl_m: 365.5
+
+atmosphere:
+  temperature_pad_f: 89.2           # from Blue Raven summary
+  temperature_pad_c: 31.8
+  # Use ERA5 reanalysis for this date/time to get actual wind profile.
+  # Requires Copernicus CDS API key. Falls back to standard_atmosphere.
+  model: "ERA5"
+  fallback_model: "standard_atmosphere"
+
+motor:
+  designation: "N3355"
+  eng_file: "data/motor/N3355_FINAL_FromStaticFireData2_notsmoothed.eng"
+  notes: "Static fire data from same day as test flight."
+
+airbrakes:
+  active: false                     # no active control during this flight — clean coast
+
+# Key measured outcomes for sim comparison
+measured:
+  # Blue Raven (primary altimeter)
+  blueraven:
+    max_altitude_agl_ft: 10523.40
+    max_altitude_agl_m: 3207.5
+    max_altitude_inertial_ft: 11338.1
+    max_altitude_inertial_m: 3456.3
+    max_velocity_fts: 930.42
+    max_velocity_ms: 283.6
+    time_to_burnout_s: 3.6
+    time_to_apogee_s: 28.4          # time to apogee channel fire
+    max_accel_gs: 14.1
+    tilt_at_burnout_deg: 5.0
+    roll_rate_at_burnout_dps: 527.4
+    main_deploy_altitude_ft: 997.6
+    rail_angle_deg: 1.0
+
+  # TeleMega (serial 16370) — populate after parsing CSV
+  telemega:
+    max_altitude_agl_m: null        # TODO: parse from telemega_flight_2026-05-24.csv
+    max_velocity_ms: null
+    time_to_apogee_s: null

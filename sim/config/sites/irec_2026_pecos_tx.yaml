@@ -1,0 +1,30 @@
+# sites/irec_2026_pecos_tx.yaml
+# IREC 2026 competition launch site — Pecos, TX.
+# Active during competition (June 17–20, 2026). Use for all pre-launch sims.
+
+site:
+  name: "IREC 2026 — Pecos, TX"
+  latitude: 31.0427222          # degrees N
+  longitude: -103.5316389       # degrees W (negative = west)
+  elevation_m: 889.0            # meters ASL — from Open Elevation at site coordinates
+  timezone: "US/Central"
+
+# Magnetic field at this site.
+# Sourced from IGRF model for West Texas, June 2026.
+# Verify at: https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+magnetic:
+  declination_deg: -7.5         # degrees east — negative = west of true north
+  inclination_deg: 58.5         # degrees — approximate dip angle for this latitude
+  field_strength_ut: 50.2       # microtesla — total field magnitude at site
+
+# Competition launch window. All times local (US/Central).
+launch_window:
+  open:  "2026-06-17T05:00:00"
+  close: "2026-06-20T15:00:00"
+  daily_windows:
+    wednesday:  { open: "05:00", close: "20:00" }
+    thursday:   { open: "05:00", close: "20:00" }
+    friday:     { open: "05:00", close: "20:00" }
+    saturday:   { open: "05:00", close: "15:00" }
+  # Default sim time: Wednesday first light — update once launch schedule is confirmed.
+  sim_datetime: "2026-06-17T08:00:00"

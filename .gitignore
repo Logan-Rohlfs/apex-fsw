@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+sim/.venv/
+.venv/
+venv/
+
+.ipynb_checkpoints/
+
+.DS_Store
+*.dSYM/
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PlatformIO build artifacts — firmware/ uses PlatformIO, .pio/ is its build cache
+firmware/.pio/
+
+# HIL serial logs captured during test runs
+sim/data/hil_logs/
+
+# Sim output — plots and result CSVs written by validate_baseline.py and run_sim.py
+sim/output/
+
+# ERA5 weather cache — large NetCDF files downloaded by the Copernicus CDS client
+sim/data/weather_cache/
+*.nc
+
+# OpenRocket autosave files
+*.ork.bak
+
+# MATLAB generated figures and workspace dumps
+*.fig
+*.mat
+sim/matlab/slprj/
+sim/matlab/codegen/

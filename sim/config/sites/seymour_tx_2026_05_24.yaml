@@ -1,0 +1,27 @@
+# sites/seymour_tx_2026_05_24.yaml
+# Seymour TX test flight site — 2026-05-24.
+# Use this profile when validating the sim against Blue Raven / TeleMega flight data.
+
+site:
+  name: "Seymour TX Test Flight — 2026-05-24"
+  # TeleMega GPS (s/n 16370, KJ5LDI) — 15 sats locked, stable for 10+ pre-launch rows.
+  latitude: 33.4986975          # degrees N
+  longitude: -99.3329862        # degrees W (negative = west)
+  # Pad altitude from Blue Raven baro summary. MATLAB used 393m — ~27m discrepancy,
+  # real sensor value preferred for validation.
+  elevation_m: 365.5            # meters ASL (~1,199 ft)
+  timezone: "US/Central"
+
+# Magnetic field at Seymour TX.
+# Approximate values for north-central Texas — verify with NOAA if needed.
+magnetic:
+  declination_deg: -3.5         # degrees east — less westerly than West Texas
+  inclination_deg: 61.0         # degrees — slightly steeper dip at higher latitude
+  field_strength_ut: 51.5       # microtesla
+
+# Actual launch time from GPS / altimeter timestamps.
+# No window here — this is a fixed historical datetime for sim comparison.
+launch_window:
+  sim_datetime: "2026-05-24T16:29:39"   # UTC — confirmed from TeleMega GPS timestamp
+  # Atmosphere model will auto-select ERA5 reanalysis for historical dates this far past.
+  # Set model_override: "ERA5" in environment.yaml when running validation sims.

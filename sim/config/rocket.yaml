@@ -1,0 +1,188 @@
+# rocket.yaml
+# Physical parameters for Team 307 — Texas Tech University — PR3.
+#
+# Primary source: Team307_TexasTechUniversity_PR3.ork (data/openrocket/)
+# This OpenRocket file was tuned to match the Seymour, TX test flight.
+# Update values here as the design evolves toward the IREC configuration.
+#
+# Aerodynamic Cd values are NOT taken from OpenRocket — those come from CFD
+# (see config/airbrakes.yaml). OpenRocket Cd is kept as reference only.
+#
+# Motor thrust curve: data/motor/N3355_FINAL_FromStaticFireData2_notsmoothed.eng
+# This is static fire data from the Seymour TX test day — use it in preference
+# to any commercial N3355 curve from ThrustCurve.org.
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+name: "Team307_TexasTechUniversity_PR3"
+designer: "Ishan Naik"
+revision: "V1"
+
+# ---------------------------------------------------------------------------
+# Mass properties
+# Dry mass = total without motor propellant.
+# Source: OpenRocket mass overrides summed across all components.
+# ---------------------------------------------------------------------------
+mass:
+  # Sum of all OpenRocket component mass overrides.
+  # Breakdown in data/openrocket/ README or OpenRocket file directly.
+  dry_mass_kg: 30.44          # matches MATLAB W=67.03 lbf → 30.39 kg within rounding
+
+  # Center of dry mass from nose tip, in meters.
+  # TODO: read from OpenRocket simulation panel — not in raw XML without running sim.
+  center_of_dry_mass_from_nose_m: null
+
+  # Motor: N3355 loaded from .eng file — propellant mass parsed automatically.
+  # Propellant mass from .eng header: 6.682 kg (second value in header line).
+  propellant_mass_kg: 6.682
+
+# ---------------------------------------------------------------------------
+# Geometry
+# All dimensions in meters, measured from nose tip.
+# Source: OpenRocket XML component lengths and radii.
+# ---------------------------------------------------------------------------
+geometry:
+  # Body radius (not diameter). Consistent across all tubes.
+  # Source: OpenRocket radius=0.078359m → diameter=156.7mm (~6.17 in)
+  body_radius_m: 0.078359
+
+  # Reference area for drag calculations: π × r²
+  # = π × 0.078359² = 0.019286 m²
+  # Note: MATLAB used S=0.2045143 ft²=0.019001 m² — small discrepancy, likely
+  # fin area inclusion. Use OpenRocket value here; keep MATLAB value in airbrakes.yaml.
+  reference_area_m2: 0.019286
+
+  # Total length from nose tip to aft end of motor retainer.
+  # 0.762 (nose) + 2.1336 (tube1) + 0.0635 (airbrakes) + 1.3462 (aft) + 0.0127 (retainer)
+  total_length_m: 4.318
+
+  nose_cone:
+    shape: "haack"              # Von Kármán / LV-Haack (shapeparameter=0.0)
+    length_m: 0.762
+    base_radius_m: 0.078359     # auto-matched to body tube
+    shoulder_length_m: 0.1524
+    shoulder_radius_m: 0.0762
+    mass_kg: 3.084              # fiberglass layup, overridden in OpenRocket
+
+  body_tubes:
+    - name: "Body Tube 1"       # forward airframe
+      length_m: 2.1336
+      mass_kg: 5.625
+
+    - name: "Airbrakes"         # airbrake housing section
+      length_m: 0.0635
+      mass_kg: 2.859
+
+    - name: "Aft Body Tube"     # aft airframe + motor section
+      length_m: 1.3462
+      mass_kg: 7.076
+
+    - name: "Motor Retainer"
+      length_m: 0.0127
+      mass_kg: 0.0
+
+  avionics_bay:
+    length_m: 0.3048
+    mass_kg: 4.032              # includes Apex flight computer, wiring, bulkheads
+
+  payload_bay:
+    length_m: 0.2921
+    mass_kg: 2.0
+
+  motor_mount_tube:
+    length_m: 1.0922
+
+# ---------------------------------------------------------------------------
+# Fins
+# Source: OpenRocket freeformfinset — 3-fin fiberglass set.
+# Fin shape is defined by four corner points (x=axial from fin root leading edge,
+# y=span). This is effectively a trapezoidal fin.
+# ---------------------------------------------------------------------------
+fins:
+  count: 3
+  material: "Fiberglass"
+  thickness_m: 0.00635          # 1/4 in
+
+  # Corner points [axial_m, span_m] from root leading edge, clockwise.
+  # Defines a trapezoidal shape.
+  points:
+    - [0.0,    0.0   ]          # root leading edge
+    - [0.1524, 0.1460]          # tip leading edge
+    - [0.2667, 0.1460]          # tip trailing edge
+    - [0.3048, 0.0   ]          # root trailing edge
+
+  # Derived dimensions for reference:
+  root_chord_m: 0.3048
+  tip_chord_m: 0.1143           # 0.2667 - 0.1524
+  span_m: 0.1460
+  leading_edge_sweep_m: 0.1524  # axial distance to tip LE
+
+  # Position: axial offset of fin root LE from nose tip.
+  # OpenRocket places fins at bottom of aft tube - 0.00823m.
+  # Aft tube starts at: 0.762 + 2.1336 + 0.0635 = 2.959m from nose
+  # Aft tube length: 1.3462m → bottom at 4.305m
+  # Fin LE at: 4.305 - 0.3048 - 0.00823 = 3.992m from nose
+  position_from_nose_m: 3.992
+
+  fillet_radius_m: 0.0305
+
+# ---------------------------------------------------------------------------
+# Motor
+# Designation: N3355 (custom static fire data)
+# .eng file: data/motor/N3355_FINAL_FromStaticFireData2_notsmoothed.eng
+# Header: N3355  97.993mm diameter  1219.202mm length
+#         total impulse, avg thrust, manufacturer = SpaceRaiders
+# Use this file in preference to any ThrustCurve.org entry.
+# ---------------------------------------------------------------------------
+motor:
+  designation: "N3355"
+  eng_file: "data/motor/N3355_FINAL_FromStaticFireData2_notsmoothed.eng"
+  diameter_mm: 97.993
+  length_mm: 1219.202
+  total_impulse_ns: null        # TODO: integrate .eng thrust curve to get exact value
+  avg_thrust_n: null            # TODO: computed from .eng
+  burn_time_s: 4.583            # approximate — last nonzero thrust point in .eng
+  propellant_mass_kg: 6.682     # from .eng header
+
+  # Position of motor aft end from nose tip (used to compute CG shift during burn).
+  # Motor fits inside 1.0922m motor mount tube in the aft body tube.
+  # Aft end of motor ≈ aft end of aft tube: ~4.305m from nose.
+  motor_position_from_nose_m: 3.213  # forward end of motor (4.305 - 1.092)
+
+# ---------------------------------------------------------------------------
+# Recovery system
+# Source: OpenRocket parachute components.
+# Two-stage deployment: reefed drogue at apogee, main disreefed at 1500 ft AGL.
+# ---------------------------------------------------------------------------
+recovery:
+  drogue:
+    name: "Parachute (Reefed)"
+    diameter_m: 3.048
+    cd: 1.5                     # OpenRocket used 'auto' — 1.5 is standard for round chute
+    deploy_event: "apogee"
+    deploy_delay_s: 0.0
+
+  main:
+    name: "Parachute (Disreefed)"
+    diameter_m: 4.2672
+    cd: 1.5                     # from OpenRocket
+    deploy_event: "altitude"
+    deploy_altitude_m: 457.2    # 1500 ft AGL
+    deploy_delay_s: 0.0
+    mass_kg: 1.994              # includes harness
+
+  shock_cord_mass_kg: 0.494
+
+# ---------------------------------------------------------------------------
+# OpenRocket simulation reference (Seymour TX, no airbrakes)
+# These are the sim outputs from the .ork file — not IREC predictions.
+# Use as a sanity check when validating the RocketPy model.
+# ---------------------------------------------------------------------------
+openrocket_reference:
+  note: "Seymour TX test flight conditions. No airbrakes. Not valid for IREC."
+  max_altitude_m: 3447.8        # 11,310 ft
+  max_velocity_ms: 287.4        # Mach 0.843
+  max_acceleration_mss: 130.4
+  time_to_apogee_s: 26.1
+  rail_exit_velocity_ms: 28.4

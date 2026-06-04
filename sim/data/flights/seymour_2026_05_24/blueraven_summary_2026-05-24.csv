@@ -1,0 +1,48 @@
+Rocket Name,Riley BluRav
+Firmware,74b3ab7 04/06/2026 11:36:51
+Serial number,SN1403 Riley BluRav
+Max Altitude,10523.40 feet
+Max velocity,930.42 feet/sec
+Pad altitude ASL,1199.11 feet
+Launch date,24-May-26
+Launch time,11:29:40.306
+Time to first burnout,3.6 sec
+Time to Apo channel fire,28.4 sec
+Time to gyro overload,0.0 sec
+Time to third channel fire,29.8 sec
+Time to main channel fire,247.7 sec
+Time to fourth channel fire,263.2 sec
+Launch rod angle,1.0 deg
+Tilt angle at burnout,5.0 deg
+Roll rate at burnout,527.4 deg/sec
+Thrust tilt efficiency,98.62%
+Number of ascent rolls,17.769
+Horiz. velocity at apogee,81.3 feet/sec
+Inertial navigation max alt,11338.1 feet
+Max motor burn acceleration,14.1 Gs
+Peak drag deceleration,3.9 Gs
+Apo channel max accel,3.3 Gs
+Main channel max accel,1.7 Gs
+3rd channel max accel,2.1 Gs
+4th channel max accel,1.7 Gs
+Max landing accel,140.9 Gs
+Drogue descent rate,-31.2 feet/sec
+Main chute deploy altitude,997.6 feet
+Main chute descent rate,-32.6 feet
+Landing Time,10:34:22.186
+Temperature on pad,89.2 F
+Max Temperature,90.6 F
+Min Temperature,89.18 F
+Battery voltage on pad,3.71 V
+Min Battery voltage,3.71 V
+Battery voltage at landing,3.7 V
+Build date,06-Apr-26
+Build time,11:36:51.000
+Flight number,1
+Direction of 1st motion,0.9997,-0.0223,-0.0048
+Gravity direction on pad,0.9999,-0.0057,-0.0087
+Low-G accel pad offset,-0.0066,0.0000,0.0001
+Hi-G accel pad offset,0.15,-61.38,0.52
+Pad gyro rates (deg/sec),0.01,0.17,-0.11
+Pad Hi-G accel,1.15,-61.39,0.51
+Pad Low-G Accel,0.99,-0.01,-0.01

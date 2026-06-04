@@ -1,0 +1,109 @@
+# airbrakes.yaml
+# Airbrake aerodynamics, servo constraints, and control law parameters.
+#
+# Aerodynamic values sourced from MATLAB sim (sim/matlab/) as of 2026-04-23.
+# These were tuned against the Seymour, TX test flight — not IREC conditions.
+# Update drag coefficients and gains once OpenRocket/CFD data for IREC is available.
+
+# ---------------------------------------------------------------------------
+# Aerodynamics
+# ---------------------------------------------------------------------------
+aerodynamics:
+  # Rocket drag coefficient with brakes fully retracted.
+  # Source: MATLAB rocket_sim_4_23_26.m — Cd_clean = 0.576
+  # TODO: replace with OpenRocket or RASAero value for the IREC configuration.
+  cd_clean: 0.576
+
+  # Rocket drag coefficient with brakes fully deployed.
+  # Source: MATLAB — Cd_brakes = 0.9
+  # TODO: validate against CFD or wind tunnel data for actual brake geometry.
+  cd_fully_deployed: 0.900
+
+  # Resulting drag coefficient increment at full deployment.
+  # delta_cd = cd_fully_deployed - cd_clean
+  delta_cd_max: 0.324
+
+  # Rocket body reference area in m². Used to compute drag force.
+  # Source: MATLAB S = 0.2045143 ft² = 0.019001 m²
+  # Implies body diameter ≈ 155.5 mm (~6.1 in). Confirm against OpenRocket.
+  reference_area_m2: 0.019001
+
+  # TODO: populate this table with Cd vs. deployment fraction once CFD or
+  # measured data is available. Until then, a linear interpolation between
+  # cd_clean (0.0) and cd_fully_deployed (1.0) is assumed.
+  #
+  # cd_vs_deployment:
+  #   - [0.00, 0.576]   # retracted
+  #   - [0.25, 0.657]
+  #   - [0.50, 0.738]
+  #   - [0.75, 0.819]
+  #   - [1.00, 0.900]   # fully deployed
+
+# ---------------------------------------------------------------------------
+# Physical geometry
+# ---------------------------------------------------------------------------
+# TODO: fill in once hardware dimensions are confirmed.
+geometry:
+  panel_count: null             # number of brake panels
+  panel_area_m2: null           # area of one panel (m²)
+  hinge_position_from_nose_m: null  # axial position of hinge line
+  max_deployment_angle_deg: null    # maximum physical travel angle
+
+# ---------------------------------------------------------------------------
+# Servo and actuator
+# ---------------------------------------------------------------------------
+servo:
+  # Full-travel time from 0% to 100% deployment in seconds.
+  # Source: MATLAB deploy_time = 0.24 s
+  full_travel_time_s: 0.240
+
+  # Derived maximum deployment rate (fraction per second).
+  # max_rate = 1.0 / full_travel_time_s
+  max_rate_per_s: 4.167
+
+  # TODO: fill in once servo hardware is confirmed.
+  pwm_min_us: null              # pulse width at 0% deployment (retracted)
+  pwm_max_us: null              # pulse width at 100% deployment (fully deployed)
+  pwm_frequency_hz: 50          # standard servo PWM frequency
+
+# ---------------------------------------------------------------------------
+# Control law
+# ---------------------------------------------------------------------------
+control:
+  # Target apogee altitude above ground level in meters.
+  # Source: MATLAB target_alt = 10,000 ft. Confirm IREC category requirement.
+  target_apogee_m: 3048.0       # 10,000 ft AGL
+
+  # Control loop update rate. Should match firmware control task rate.
+  loop_rate_hz: 100.0
+
+  # Active controller. Options: PID, EnergyManagement
+  # PID is the current competition controller per MATLAB files.
+  active_controller: "PID"
+
+  # PID controller
+  # Source: MATLAB rocket_sim_4_23_26.m and monte_carlo_4_23_2026.m
+  # Error signal: predicted_apogee - target_apogee (meters in RocketPy — was feet in MATLAB)
+  # D-term: uses velocity directly as proxy, not d(error)/dt — matches firmware.
+  # Gains below are from the MATLAB tuning run. Rescale for SI units before use:
+  #   MATLAB operated in feet; RocketPy operates in meters (1 ft = 0.3048 m).
+  #   Kp and Ki must be divided by 0.3048 to maintain the same response in SI.
+  #   Kd is unaffected (velocity term, not an altitude derivative).
+  # TODO: re-run Monte Carlo in SI or rescale these values before first HIL run.
+  pid:
+    kp: 0.4                     # proportional gain — MATLAB value, needs SI rescale
+    ki: -0.004                  # integral gain   — MATLAB value, needs SI rescale
+    kd: -0.04                   # derivative gain — uses velocity, not d(error)/dt
+    output_min: -15.0           # lower clamp on raw PID output
+    output_max: 30.0            # upper clamp on raw PID output
+
+  # Energy Management controller (alternate — see MATLAB for derivation)
+  # Error signal: (E_total - E_drag_estimated - E_target) / E_target  (normalized, dimensionless)
+  # Gains are dimensionless — no unit rescaling needed for SI.
+  energy_management:
+    kp: 0.5
+    ki: 0.004
+    kd: 0.004
+    output_min: 0.0
+    output_max: 0.05
+    avg_velocity_sq_factor: 0.4  # drag energy estimation factor — see MATLAB comments
