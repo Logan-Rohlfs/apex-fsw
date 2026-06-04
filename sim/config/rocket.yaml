@@ -30,8 +30,13 @@ mass:
   dry_mass_kg: 30.44          # matches MATLAB W=67.03 lbf → 30.39 kg within rounding
 
   # Center of dry mass from nose tip, in meters.
-  # TODO: read from OpenRocket simulation panel — not in raw XML without running sim.
-  center_of_dry_mass_from_nose_m: null
+  # Extracted from the OpenRocket databranch at burnout (t=4.583s) — the point
+  # where propellant mass is minimised and CG is closest to the dry-mass value.
+  # OR reports CG=2.625m at that instant (total 35.35 kg, motor casing 5.96 kg).
+  # The OR dry mass (29.39 kg) differs from our 30.44 kg by ~1 kg, likely motor
+  # casing accounting. Use this value until a physical balance-point measurement
+  # or a fresh OpenRocket run with corrected mass overrides is available.
+  center_of_dry_mass_from_nose_m: 2.625
 
   # Motor: N3355 loaded from .eng file — propellant mass parsed automatically.
   # Propellant mass from .eng header: 6.682 kg (second value in header line).
@@ -58,7 +63,7 @@ geometry:
   total_length_m: 4.318
 
   nose_cone:
-    shape: "haack"              # Von Kármán / LV-Haack (shapeparameter=0.0)
+    shape: "lvhaack"            # Von Kármán / LV-Haack (shapeparameter=0.0)
     length_m: 0.762
     base_radius_m: 0.078359     # auto-matched to body tube
     shoulder_length_m: 0.1524

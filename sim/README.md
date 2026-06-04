@@ -12,65 +12,109 @@ the loop.
 ```
 apex/sim/
 ├── apex_sim/          # installable Python package
-│   ├── sensors/       # sensor noise and bias models
-│   ├── sim/           # RocketPy rocket and flight wrappers
-│   ├── hil/           # serial protocol and hardware interface
-│   ├── analysis/      # logging and plotting
-│   └── config/        # YAML config loader
-├── config/            # parameter files (rocket, sensors, airbrakes, environment)
-├── scripts/           # run_hil.py, run_sil.py entry points
-├── tests/             # unit test suite
-└── docs/
-    └── sensors/       # per-sensor spec sheets and HIL parameters
+│   ├── config/        # YAML config loader (load_environment, SiteProfile, ...)
+│   ├── sensors/       # sensor noise and bias models (not yet implemented)
+│   ├── sim/           # RocketPy wrappers — environment, rocket, airbrakes, flight
+│   ├── hil/           # serial protocol and hardware interface (not yet implemented)
+│   └── analysis/      # logging and plotting (not yet implemented)
+├── config/            # parameter files — edit these, not the Python
+│   ├── environment.yaml    # atmosphere model, rail, active_site pointer
+│   ├── rocket.yaml         # mass, geometry, motor, recovery
+│   ├── airbrakes.yaml      # Cd values (CFD), servo travel, PID gains
+│   └── sites/
+│       ├── irec_2026_pecos_tx.yaml        # competition site (active by default)
+│       └── seymour_tx_2026_05_24.yaml     # Seymour TX test flight — use for validation
+├── data/
+│   ├── flights/seymour_2026_05_24/        # TeleMega + Blue Raven flight recordings
+│   ├── motor/                              # N3355 static fire .eng thrust curve
+│   └── openrocket/                         # Team307 PR3 .ork design file
+├── docs/sensors/      # per-sensor spec sheets and HIL noise parameters
+├── scripts/           # runnable entry points (see below)
+└── tests/
 ```
 
 ---
 
-## Requirements
+## Setup
 
-> *Not yet implemented — fill in once `pyproject.toml` is complete.*
+From the repo root, run once to create the virtualenv and install dependencies:
 
----
+```
+source apex-setup
+```
 
-## Installation
-
-> *Not yet implemented.*
+After that, `apex-setup` is always available as a command. Re-run it any time to sync
+dependencies. Source it (rather than run it) to activate the venv in your shell.
 
 ---
 
 ## Configuration
 
-All physical parameters live in `config/`. Edit these files to match the rocket —
-no code changes required for a new vehicle or launch site.
+All physical parameters live in `config/`. No code changes are required to swap a
+launch site or update a Cd value.
 
 | File | Contents |
 |---|---|
-| `config/rocket.yaml` | Mass, geometry, motor designation |
-| `config/sensors.yaml` | Noise, bias, and ODR for each sensor |
-| `config/airbrakes.yaml` | Drag coefficients, servo travel, PWM range |
-| `config/environment.yaml` | Launch site coordinates, elevation, wind model |
-| `config/hil.yaml` | Serial port, baud rate, packet rate, timeouts |
+| `config/environment.yaml` | Active site pointer, atmosphere model selection, rail |
+| `config/rocket.yaml` | Mass, geometry, fins, motor, recovery system |
+| `config/airbrakes.yaml` | Drag coefficients (CFD), servo travel, PID gains |
+| `config/sites/*.yaml` | One file per launch site — coordinates, elevation, launch time |
 
-> *Config files not yet created — see `docs/sensors/` for the parameter values that will populate `sensors.yaml`.*
+To switch between the competition site and the Seymour TX validation site, change one
+line in `config/environment.yaml`:
+
+```yaml
+active_site: "irec_2026_pecos_tx"        # competition
+active_site: "seymour_tx_2026_05_24"     # Seymour TX test flight — for validation
+```
 
 ---
 
-## Running the Simulation
+## Scripts
 
-### HIL Mode (Teensy connected)
+Run all scripts from `apex/sim/` with the venv active (`source apex-setup`).
 
-> *Not yet implemented.*
+### `scripts/run_sim.py` — flight simulation
 
-### SIL Mode (no hardware)
+Runs a full RocketPy flight simulation and prints key results.
 
-> *Not yet implemented.*
+```
+python scripts/run_sim.py [options]
+```
+
+| Flag | Description |
+|---|---|
+| *(none)* | Competition sim — IREC Pecos TX, PID airbrakes active |
+| `--baseline` | Clean flight, no airbrakes — use for validating against real data |
+| `--site PROFILE` | Override the active site (e.g. `seymour_tx_2026_05_24`) |
+| `--model MODEL` | Override atmosphere model: `RAP`, `NAM`, `GFS`, `standard_atmosphere` |
+| `--full-descent` | Simulate through landing (default: stop at apogee) |
+| `--save` | Write summary CSV and plots to `output/` |
+| `--verbose` | Print RocketPy integration progress |
+
+**Examples:**
+
+```bash
+# Competition sim
+python scripts/run_sim.py
+
+# Validate against Seymour TX flight — standard atmosphere (fast, ~4.5% low vs real data)
+python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24
+
+# Same validation with ERA5 historical weather (accurate, requires Copernicus CDS key)
+python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24 --model ERA5
+```
+
+**Atmosphere note:** NOAA's OpenDAP service (RAP/NAM/GFS) was retired in 2025.
+Forecast sims will fall back to `standard_atmosphere` until RocketPy adds support for
+the replacement service. For near-launch sims, force the model explicitly with
+`--model standard_atmosphere`. For historical validation, use ERA5.
 
 ---
 
 ## Sensor Models
 
 Noise and bias parameters for each sensor are documented in `docs/sensors/`.
-Values in those files should be used to populate `config/sensors.yaml`.
 
 | Sensor | Part | Doc |
 |---|---|---|
@@ -83,18 +127,22 @@ Values in those files should be used to populate `config/sensors.yaml`.
 
 ---
 
-## Serial Protocol
+## HIL Mode
 
-> *Not yet defined — see `apex_sim/hil/protocol.py` once implemented.*
+> *Not yet implemented — serial protocol definition pending.*
 
-The protocol spec will also be documented in `../interface/protocol_spec.md` at the
-repo root as the shared contract between this package and the firmware.
+The HIL loop will be started with `scripts/run_hil.py` (not yet created).
+The serial protocol spec lives in `apex_sim/hil/` once defined.
 
 ---
 
 ## Testing
 
-> *Not yet implemented.*
+```bash
+python -m pytest tests/
+```
+
+> *Test suite not yet implemented.*
 
 ---
 

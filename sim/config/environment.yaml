@@ -22,7 +22,12 @@ active_site: "irec_2026_pecos_tx"
 #
 # Set model_override: "ERA5" when running validation sims against the Seymour TX flight.
 atmosphere:
-  model_override: null          # null = auto-select; or "RAP"/"NAM"/"GFS"/"ERA5"/"standard_atmosphere"
+  # NOAA retired their OPeNDAP/DODS endpoint (nomads.ncep.noaa.gov/dods) in 2025.
+  # RocketPy 1.10 hardcodes those dead URLs — all forecast fetches fail with C-level
+  # parser errors that can't be suppressed cleanly. Forced to standard_atmosphere
+  # until RocketPy ships updated fetchers for the replacement NOMADS API.
+  # Track: https://github.com/RocketPy-Team/RocketPy/issues (search NOMADS)
+  model_override: "standard_atmosphere"
 
   # Days-until-launch thresholds that trigger each model.
   # Adjust if a model's actual availability window differs from these defaults.

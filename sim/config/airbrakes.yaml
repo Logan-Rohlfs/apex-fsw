@@ -77,8 +77,8 @@ control:
   # Control loop update rate. Should match firmware control task rate.
   loop_rate_hz: 100.0
 
-  # Active controller. Options: PID, EnergyManagement
-  # PID is the current competition controller per MATLAB files.
+  # PID is the competition controller. Energy Management exists in the MATLAB
+  # reference but has not been used in any flight and is not used here.
   active_controller: "PID"
 
   # PID controller
@@ -97,13 +97,12 @@ control:
     output_min: -15.0           # lower clamp on raw PID output
     output_max: 30.0            # upper clamp on raw PID output
 
-  # Energy Management controller (alternate — see MATLAB for derivation)
-  # Error signal: (E_total - E_drag_estimated - E_target) / E_target  (normalized, dimensionless)
-  # Gains are dimensionless — no unit rescaling needed for SI.
+  # Energy Management gains retained here for reference only — not used in sim or firmware.
+  # See sim/matlab/rocket_sim_4_23_26.m for the full derivation.
   energy_management:
     kp: 0.5
     ki: 0.004
     kd: 0.004
     output_min: 0.0
     output_max: 0.05
-    avg_velocity_sq_factor: 0.4  # drag energy estimation factor — see MATLAB comments
+    avg_velocity_sq_factor: 0.4
