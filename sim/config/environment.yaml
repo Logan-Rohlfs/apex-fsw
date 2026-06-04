@@ -1,0 +1,71 @@
+# environment.yaml
+# Launch site and atmospheric model configuration.
+# All simulations are based out of the IREC 2026 launch site near Pecos, TX.
+
+launch_site:
+  name: "IREC 2026 — Pecos, TX"
+  latitude: 31.0427222        # degrees N
+  longitude: -103.5316389     # degrees W (negative = west)
+  elevation_m: 889.0          # meters ASL — from Open Elevation at site coordinates
+  timezone: "US/Central"
+
+# Magnetic field parameters for the launch site.
+# Used by the magnetometer simulation model to generate heading-referenced readings.
+# Declination sourced from IGRF model for West Texas, June 2026.
+# Verify at: https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+magnetic:
+  declination_deg: -7.5       # degrees east — negative = west of true north
+  inclination_deg: 58.5       # degrees — approximate dip angle for this latitude
+  field_strength_ut: 50.2     # microtesla — total field magnitude at site
+
+# Launch window.
+# Competition window is June 17–20, 2026. Launch ASAP once the rocket is cleared.
+# Dates in ISO 8601. Time is local (US/Central).
+launch_window:
+  open:  "2026-06-17T05:00:00"   # Wednesday — first available slot
+  close: "2026-06-20T15:00:00"   # Saturday — competition closes at 3p
+  daily_windows:
+    wednesday:  { open: "05:00", close: "20:00" }
+    thursday:   { open: "05:00", close: "20:00" }
+    friday:     { open: "05:00", close: "20:00" }
+    saturday:   { open: "05:00", close: "15:00" }
+  # Default sim datetime: Wednesday morning, first slot.
+  # Update to the actual forecast window once the launch schedule is known.
+  sim_datetime: "2026-06-17T08:00:00"
+
+# Atmospheric model configuration.
+# The model is selected automatically at runtime based on how close today's date
+# is to sim_datetime. Set model_override to force a specific model regardless of date.
+#
+# Auto-selection ladder (most accurate wins if data is available):
+#   RAP    — NOAA Rapid Refresh.  Updates hourly. Available within ~18 hours of now.
+#   NAM    — North America Mesoscale. Higher res than GFS. Available within ~3 days.
+#   GFS    — NOAA Global Forecast System. Available within ~16 days.
+#   standard_atmosphere — ISA model, no wind. Always available. Used for dev/CI.
+#
+# Each model is attempted in order. If a fetch fails (no network, outside window),
+# the next model in the fallback chain is tried automatically.
+atmosphere:
+  model_override: null        # set to "RAP"/"NAM"/"GFS"/"standard_atmosphere" to force
+
+  # Days-until-launch thresholds that trigger each model.
+  # Adjust if a model's actual availability window differs from these defaults.
+  model_thresholds:
+    RAP_days:  0.75           # 18 hours — RAP is available, use it
+    NAM_days:  3.0            # within 3 days — NAM has good coverage
+    GFS_days:  16.0           # within 16 days — GFS forecast exists
+
+  # Fallback wind used only when standard_atmosphere is active (ISA has no wind).
+  # Based on June climatology for Pecos, TX: ~10 mph southerly, calmer at dawn.
+  wind:
+    speed_ms: 2.5             # m/s — ~5 mph, representative of early morning
+    direction_deg: 180.0      # degrees — wind coming FROM the south
+    shear_ms_per_m: 0.002     # m/s gained per meter altitude; 0 to disable
+
+# Launch rail configuration.
+# The rail sets initial flight direction. Confirm these values with the RSO at IREC.
+# Typical IREC rail: 12 ft (~3.6 m), near-vertical with slight wind compensation cant.
+rail:
+  length_m: 3.658             # 12 ft standard IREC rail
+  inclination_deg: 85.0       # degrees from horizontal — 90 = perfectly vertical
+  heading_deg: 0.0            # degrees from north — 0 = pointing north, adjust for wind
