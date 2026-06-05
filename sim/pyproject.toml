@@ -15,6 +15,9 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.7",
     "openpyxl>=3.1",        # Blue Raven .xlsx deploy config
+    "pyserial>=3.5",
+    "PyQt5>=5.15",
+    "pyqtgraph>=0.13",
 ]
 
 [project.optional-dependencies]

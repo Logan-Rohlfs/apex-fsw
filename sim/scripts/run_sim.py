@@ -11,8 +11,14 @@ Run from apex/sim/ with the venv active (source apex-setup):
   # Validation run — Seymour TX, clean flight, no brakes
   python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24
 
-  # Validate and compare against real Seymour TX flight data
+  # Validate and compare against real Seymour TX flight data (stored OR trace)
   python scripts/run_sim.py --compare
+
+  # Same comparison but also run a live OpenRocket sim with matched conditions
+  python scripts/run_sim.py --compare --run-or
+
+  # Live OR with weathercock angle (15.33° observed at t=1.12s, Seymour TX)
+  python scripts/run_sim.py --compare --run-or --or-rod-angle 15.33
 
   # Force a specific atmospheric model
   python scripts/run_sim.py --model standard_atmosphere
@@ -78,6 +84,25 @@ def main() -> None:
         help="Write summary CSV and plots to output/",
     )
     parser.add_argument(
+        "--run-or",
+        action="store_true",
+        help=(
+            "Run a live OpenRocket simulation with conditions matched to RocketPy "
+            "and include it in the comparison. Requires Java + data/openrocket/OpenRocket-23.09.jar."
+        ),
+    )
+    parser.add_argument(
+        "--or-rod-angle",
+        metavar="DEG",
+        type=float,
+        default=None,
+        help=(
+            "Launch rod angle from VERTICAL for the OR sim, in degrees "
+            "(0 = straight up, 15.33 = Seymour TX observed weathercock). "
+            "Defaults to rail inclination from site config."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print RocketPy integration progress",
@@ -130,8 +155,30 @@ def main() -> None:
             max_velocity_ms=round(max_v_ms, 1),
             time_to_apogee_s=round(t_apogee, 1),
         )
-        print_comparison(sim_metrics)
-        out = plot_traces(flight)
+
+        or_live_metrics = None
+        or_live_trace = None
+        if args.run_or:
+            from apex_sim.analysis.openrocket_runner import write_or_file, read_or_results
+            ork_out = write_or_file(
+                site=env_cfg.site,
+                atmosphere_cfg=env_cfg.atmosphere,
+                rail_cfg=env_cfg.rail,
+                launch_rod_angle_deg=args.or_rod_angle,
+            )
+            result = read_or_results(ork_out)
+            if result is None:
+                print(
+                    f"\n  OR file written to {ork_out}\n"
+                    f"  Open it in OpenRocket, run simulation 'IREC 2026', save, then re-run.\n"
+                )
+            else:
+                or_live_metrics, or_live_trace = result
+                print(f"OpenRocket (matched): {or_live_metrics.max_alt_agl_m:.1f} m  "
+                      f"({or_live_metrics.max_alt_agl_m / 0.3048:.0f} ft)")
+
+        print_comparison(sim_metrics, or_live=or_live_metrics)
+        out = plot_traces(flight, or_live_trace=or_live_trace)
         if out:
             print(f"  Trace plot saved to {out}")
 

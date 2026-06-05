@@ -214,19 +214,38 @@ def load_openrocket_metrics(or_file: Path = _OR_FILE) -> FlightMetrics:
 # ---------------------------------------------------------------------------
 
 
-def print_comparison(sim: FlightMetrics) -> None:
-    """Print a scalar comparison table of sim results vs all real-data sources."""
+def print_comparison(
+    sim: FlightMetrics,
+    or_live: FlightMetrics | None = None,
+) -> None:
+    """Print a scalar comparison table of sim results vs all real-data sources.
+
+    Parameters
+    ----------
+    sim : FlightMetrics
+        RocketPy simulation result.
+    or_live : FlightMetrics, optional
+        Live OR run from ``openrocket_runner.run_openrocket_sim``.  When
+        provided, replaces the stored-trace OR column.
+    """
     telemega = load_telemega()
     br_baro, br_inertial = load_blueraven()
-    or_metrics = load_openrocket_metrics()
-    # Post-flight OR re-run with 15.33° weathercock angle observed at t=1.12s.
-    # Scalar only — no time-series available without re-running OpenRocket.
-    or_weathercocked = FlightMetrics(
-        source="OR (weathercocked)",
-        max_alt_agl_m=round(10438 * _FT_PER_M, 1),
+    # Live OR replaces stored-trace metrics when available.
+    or_metrics = or_live if or_live is not None else load_openrocket_metrics()
+    # Post-flight OR re-run with 15.33° weathercock observed at t=1.12s.
+    # Only shown when we're using stored data — live run already sets its own angle.
+    or_weathercocked = (
+        None
+        if or_live is not None
+        else FlightMetrics(
+            source="OR (weathercocked)",
+            max_alt_agl_m=round(10438 * _FT_PER_M, 1),
+        )
     )
 
-    sources = [sim, telemega, br_baro, br_inertial, or_metrics, or_weathercocked]
+    sources = [sim, telemega, br_baro, br_inertial, or_metrics]
+    if or_weathercocked is not None:
+        sources.append(or_weathercocked)
 
     def _alt(m):
         return f"{m:.0f} m  ({m / _FT_PER_M:.0f} ft)" if m is not None else "—"
@@ -250,26 +269,22 @@ def print_comparison(sim: FlightMetrics) -> None:
     print(div)
     print(row("Max alt AGL",    [_alt(s.max_alt_agl_m) for s in sources]))
     print(row("Max velocity",   [_vel(s.max_velocity_ms) for s in sources]))
-    t_notes = ["", "", " †", "", "", ""]
+    t_notes = (["", "", " †", "", ""] + ([""] if or_weathercocked else []))
     print(row("Time to apogee", [_time(s.time_to_apogee_s, t_notes[i]) for i, s in enumerate(sources)]))
     print(div)
 
     # Baro consensus is competition-relevant ground truth.
-    # BR inertial is excluded — ASL/AGL ambiguous and shows likely drift.
+    # BR inertial excluded — ASL/AGL ambiguous, shows likely drift.
     baro_ref = (
         (telemega.max_alt_agl_m + br_baro.max_alt_agl_m) / 2
         if telemega.max_alt_agl_m and br_baro.max_alt_agl_m
         else telemega.max_alt_agl_m or br_baro.max_alt_agl_m
     )
-    if sim.max_alt_agl_m and baro_ref:
-        d = sim.max_alt_agl_m - baro_ref
-        print(f"\n  RocketPy vs baro consensus: {d:+.0f} m ({100*d/baro_ref:+.1f}%)")
-    if or_metrics.max_alt_agl_m and baro_ref:
-        d = or_metrics.max_alt_agl_m - baro_ref
-        print(f"  OR clean      vs baro consensus: {d:+.0f} m ({100*d/baro_ref:+.1f}%)")
-    if or_weathercocked.max_alt_agl_m and baro_ref:
-        d = or_weathercocked.max_alt_agl_m - baro_ref
-        print(f"  OR weathercocked vs baro consensus: {d:+.0f} m ({100*d/baro_ref:+.1f}%)")
+    print()
+    for src in [sim, or_metrics] + ([or_weathercocked] if or_weathercocked else []):
+        if src and src.max_alt_agl_m and baro_ref:
+            d = src.max_alt_agl_m - baro_ref
+            print(f"  {src.source:<30} vs baro consensus: {d:+.0f} m ({100*d/baro_ref:+.1f}%)")
 
     print(
         "\n  † Blue Raven time is apogee-channel fire, not true apogee — includes pyro delay."
@@ -284,13 +299,20 @@ def print_comparison(sim: FlightMetrics) -> None:
 # ---------------------------------------------------------------------------
 
 
-def plot_traces(sim_flight, save: bool = True) -> Path | None:
-    """Plot altitude and velocity traces for RocketPy, TeleMega, and Blue Raven.
+def plot_traces(
+    sim_flight,
+    or_live_trace: FlightTrace | None = None,
+    save: bool = True,
+) -> Path | None:
+    """Plot altitude and velocity traces for RocketPy, OR, TeleMega, and Blue Raven.
 
     Parameters
     ----------
     sim_flight : rocketpy.Flight
-        Completed simulation.
+        Completed RocketPy simulation.
+    or_live_trace : FlightTrace, optional
+        Live OR trace from ``openrocket_runner.run_openrocket_sim``.  When
+        provided, replaces the stored .ork trace.
     save : bool
         Write the figure to ``output/comparison.png``.
 
@@ -310,7 +332,7 @@ def plot_traces(sim_flight, save: bool = True) -> Path | None:
     sim_trace = rocketpy_trace(sim_flight)
     tm_trace = load_telemega_trace()
     br_trace = load_blueraven_trace()
-    or_trace = load_openrocket_trace()
+    or_trace = or_live_trace if or_live_trace is not None else load_openrocket_trace()
 
     burnout_t = 3.6  # from Blue Raven summary
 
@@ -319,7 +341,7 @@ def plot_traces(sim_flight, save: bool = True) -> Path | None:
 
     # Altitude
     ax_alt.plot(sim_trace.t, sim_trace.alt_m, label="RocketPy (ISA)", color="steelblue", lw=2)
-    ax_alt.plot(or_trace.t, or_trace.alt_m, label="OpenRocket", color="mediumpurple", lw=1.5, ls="-.")
+    ax_alt.plot(or_trace.t, or_trace.alt_m, label=or_trace.source, color="mediumpurple", lw=1.5, ls="-.")
     ax_alt.plot(tm_trace.t, tm_trace.alt_m, label="TeleMega (baro)", color="darkorange", lw=1.5, ls="--")
     ax_alt.plot(br_trace.t, br_trace.alt_m, label="Blue Raven baro (0–7 s)", color="seagreen", lw=1.5, ls=":")
     ax_alt.axvline(burnout_t, color="gray", ls="--", lw=1, alpha=0.6, label=f"Burnout (~{burnout_t} s)")
@@ -329,7 +351,7 @@ def plot_traces(sim_flight, save: bool = True) -> Path | None:
 
     # Velocity
     ax_vel.plot(sim_trace.t, sim_trace.speed_ms, label="RocketPy (ISA)", color="steelblue", lw=2)
-    ax_vel.plot(or_trace.t, or_trace.speed_ms, label="OpenRocket", color="mediumpurple", lw=1.5, ls="-.")
+    ax_vel.plot(or_trace.t, or_trace.speed_ms, label=or_trace.source, color="mediumpurple", lw=1.5, ls="-.")
     ax_vel.plot(tm_trace.t, tm_trace.speed_ms, label="TeleMega", color="darkorange", lw=1.5, ls="--")
     ax_vel.plot(br_trace.t, br_trace.speed_ms, label="Blue Raven (0–7 s)", color="seagreen", lw=1.5, ls=":")
     ax_vel.axvline(burnout_t, color="gray", ls="--", lw=1, alpha=0.6)

@@ -87,6 +87,8 @@ python scripts/run_sim.py [options]
 | *(none)* | Competition sim — IREC Pecos TX, PID airbrakes active |
 | `--baseline` | Clean flight, no airbrakes — use for validating against real data |
 | `--compare` | Baseline against Seymour TX site; prints scalar table and saves trace plot to `output/comparison.png` |
+| `--run-or` | Also run a live OpenRocket sim with the same conditions as RocketPy (requires Java + OR JAR — see below) |
+| `--or-rod-angle DEG` | Launch rod angle from vertical for the OR sim (e.g. `15.33` for observed Seymour TX weathercock) |
 | `--site PROFILE` | Override the active site (e.g. `seymour_tx_2026_05_24`) |
 | `--model MODEL` | Override atmosphere model: `RAP`, `NAM`, `GFS`, `standard_atmosphere` |
 | `--full-descent` | Simulate through landing (default: stop at apogee) |
@@ -99,11 +101,17 @@ python scripts/run_sim.py [options]
 # Competition sim
 python scripts/run_sim.py
 
-# Validate against Seymour TX flight — standard atmosphere (fast, ~4.5% low vs real data)
+# Validate against Seymour TX flight — standard atmosphere (fast, ~2.5% high vs real data)
 python scripts/run_sim.py --baseline --site seymour_tx_2026_05_24
 
-# Full comparison: scalar table + trace plot vs TeleMega, Blue Raven, and OpenRocket
+# Full comparison: scalar table + trace plot vs TeleMega, Blue Raven, and stored OR trace
 python scripts/run_sim.py --compare
+
+# Same but also run a live OR sim with matched conditions (needs Java + OR JAR)
+python scripts/run_sim.py --compare --run-or
+
+# Live OR with Seymour TX weathercock angle (15.33° observed at t=1.12s)
+python scripts/run_sim.py --compare --run-or --or-rod-angle 15.33
 
 # Same with ERA5 historical weather (accurate, requires Copernicus CDS key)
 python scripts/run_sim.py --compare --model ERA5
@@ -113,12 +121,25 @@ python scripts/run_sim.py --compare --model ERA5
 
 The scalar table shows RocketPy alongside TeleMega (baro), Blue Raven (baro and
 inertial), and OpenRocket — all read live from the data files in `data/`.  The trace
-plot (`output/comparison.png`) overlays altitude AGL and speed vs time for all four
-sources through apogee.
+plot (`output/comparison.png`) overlays altitude AGL and speed vs time for all sources
+through apogee.
 
-OpenRocket data is parsed directly from `data/openrocket/Team307_TexasTechUniversity_PR3.ork`
-(the .ork is a ZIP containing a full simulation trace) — no separate OpenRocket install
-needed to view OR results.
+Without `--run-or`, OR data is parsed directly from the stored simulation inside
+`data/openrocket/Team307_TexasTechUniversity_PR3.ork` — no separate OpenRocket install
+needed.
+
+**Live OpenRocket setup (`--run-or`):**
+
+1. Install Java: `brew install --cask temurin`
+2. Download OR JAR:
+   ```
+   curl -L -o data/openrocket/OpenRocket-23.09.jar \
+     https://github.com/openrocket/openrocket/releases/download/release-23.09/OpenRocket-23.09.jar
+   ```
+3. Run: `python scripts/run_sim.py --compare --run-or`
+
+The live OR run uses the same `.ork` rocket file but overrides conditions (lat, lon,
+elevation, wind, launch rod angle) to match the RocketPy config exactly.
 
 **Atmosphere note:** NOAA's OpenDAP service (RAP/NAM/GFS) was retired in 2025.
 Forecast sims will fall back to `standard_atmosphere` until RocketPy adds support for

@@ -1,0 +1,116 @@
+#pragma once
+
+// ─── Pins ─────────────────────────────────────────────────────────────────────
+
+// Barometer / high-g accel (I2C0)
+#define PIN_BAR_INT1        7
+#define PIN_ACC2_INT1       8
+
+// IMU (SPI0)
+#define PIN_ACC1_INT1       9
+#define PIN_ACC1_CS         10
+#define PIN_MOSI0           11
+#define PIN_MISO0           12
+#define PIN_SCK0            13
+
+// Magnetometer (I2C1)
+#define PIN_SDA1            17
+#define PIN_SCL1            16
+
+// GPS — MAX-M10S (I2C2 primary, UART7 available)
+// Wire2: SDA2=25, SCL2=24 (Teensy 4.1 defaults)
+// Serial7: TX7=28, RX7=29
+#define PIN_GPS_PPS         30   // 1 Hz pulse — attach interrupt for time sync
+
+// Radio — RF4463PRO / Si4463 (SPI1)
+// SPI1: MOSI1=26, MISO1=1, SCK1=27
+#define PIN_RAD_CS          0
+#define PIN_RAD_INT1        2
+#define PIN_RAD_GPIO0       5    // Si4463 CTS / NIRQ
+#define PIN_RAD_GPIO1       4
+
+// ─── I2C Addresses ────────────────────────────────────────────────────────────
+#define BMP581_ADDR         0x46    // ADR tied to GND
+#define ADXL375_ADDR        0x53    // SDO tied to GND
+
+// ─── Sensor ODR / FSR ─────────────────────────────────────────────────────────
+#define IMU_ACCEL_ODR_HZ    800
+#define IMU_ACCEL_FSR_G     16
+#define IMU_GYRO_ODR_HZ     800
+#define IMU_GYRO_FSR_DPS    2000
+#define HIGHG_ODR_HZ        800
+
+// ─── Task Rates ───────────────────────────────────────────────────────────────
+#define RATE_FUSION_HZ      200
+#define RATE_STATE_HZ       100
+#define RATE_CONTROL_HZ     100
+#define RATE_BARO_HZ        50
+#define RATE_MAG_HZ         25
+
+// ─── Launch Detection ─────────────────────────────────────────────────────────
+#define LAUNCH_ACCEL_THRESH_MSS     19.62f   // 2g
+#define LAUNCH_CONFIRM_MS           150
+
+// ─── Burnout Detection ────────────────────────────────────────────────────────
+#define BURNOUT_CONFIRM_MS          200
+
+// ─── Airbrake Gates ───────────────────────────────────────────────────────────
+#define POST_BURNOUT_LOCKOUT_MS     2500
+#define MACH_GATE_MPS               240.0f   // 0.7 Mach
+#define MIN_DEPLOY_ALT_M            100.0f
+
+// ─── Apogee Detection ─────────────────────────────────────────────────────────
+#define APOGEE_VEL_THRESH_MPS       2.0f     // velocity below this = apogee
+#define APOGEE_CONFIRM_MS           500
+
+// ─── Landed Detection ─────────────────────────────────────────────────────────
+#define LANDED_ACCEL_THRESH_MSS     2.0f     // low accel variance
+#define LANDED_CONFIRM_MS           3000
+
+// ─── Control Law ──────────────────────────────────────────────────────────────
+#define TARGET_APOGEE_M             3048.0f  // 10,000 ft AGL
+
+// PID gains from MATLAB, rescaled ft → m (divide by 0.3048)
+// D-term uses velocity directly as proxy — matches sim, do not change.
+#define PID_KP                      (0.4f   / 0.3048f)
+#define PID_KI                      (-0.004f / 0.3048f)
+#define PID_KD                      -0.04f
+#define PID_U_MIN                   -15.0f
+#define PID_U_MAX                    30.0f
+
+// ─── Servo ────────────────────────────────────────────────────────────────────
+#define SERVO_PIN                   6
+#define SERVO_MIN_US                1000     // parameterized — measure from hardware
+#define SERVO_MAX_US                2000
+#define SERVO_MIN_DEG               0.0f
+#define SERVO_MAX_DEG               180.0f
+#define SERVO_MAX_RATE_DEG_PER_S    (180.0f / 0.24f)   // 0.24s full travel
+
+// ─── Physical Constants ───────────────────────────────────────────────────────
+#define ROCKET_MASS_KG              30.44f
+#define REF_AREA_M2                 0.019001f
+#define CD_CLEAN                    0.576f
+#define ISA_SEA_LEVEL_PA            101325.0f
+#define ISA_SEA_LEVEL_TEMP_K        288.15f
+#define ISA_LAPSE_RATE              0.0065f
+
+// ─── Pad Re-Zero ──────────────────────────────────────────────────────────────
+// Periodically refreshes the ground pressure reference while stationary on pad.
+// Only fires in IDLE or ARMED. Motion check must pass for REZERO_STABLE_MS
+// before a re-zero is allowed. Safe at launch edge — control loop activates
+// 2.5s+ post-burnout, well after the complementary filter reconverges.
+
+#define REZERO_INTERVAL_MS          30000   // attempt re-zero every 30s
+#define REZERO_STABLE_MS            10000   // must be stable for 10s before re-zero
+#define REZERO_ACCEL_MIN_MSS        9.3f    // 0.95g — lower bound of "stationary"
+#define REZERO_ACCEL_MAX_MSS        10.3f   // 1.05g — upper bound
+#define REZERO_GYRO_MAX_RADS        0.05f   // not rotating
+#define REZERO_BARO_SAMPLES         50      // rolling average depth (~1s at 50Hz)
+
+// ─── Logging ──────────────────────────────────────────────────────────────────
+#define LOG_RATE_IDLE_HZ            1
+#define LOG_RATE_ARMED_HZ           25
+#define LOG_RATE_BOOST_HZ           200
+#define LOG_RATE_COAST_HZ           100
+#define LOG_RATE_DESCENT_HZ         25
+#define LOG_RING_BUF_SECONDS        60      // pre-launch ring buffer depth
