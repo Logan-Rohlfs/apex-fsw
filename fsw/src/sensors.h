@@ -41,3 +41,17 @@ bool sensors_get_mag(MagData& out);
 #define SENSOR_OK_MAG    (1 << 3)
 
 uint8_t sensors_health();
+
+// ─── HIL (compile only when APEX_HIL is defined) ──────────────────────────────
+#ifdef APEX_HIL
+#include "hil.h"
+
+// Sets _health = 0x0F without touching hardware. Call instead of sensors_init().
+void sensors_init_hil();
+
+// Injects a SimPacket into the sensor staging buffers, exactly as hardware
+// ISRs would. Rate-divides baro (every 2nd call → 50 Hz) and mag (every 4th
+// call → 25 Hz) to match hardware ODR ratios at the 100 Hz HIL inject rate.
+void sensors_inject_hil(const SimPacket& pkt);
+
+#endif // APEX_HIL

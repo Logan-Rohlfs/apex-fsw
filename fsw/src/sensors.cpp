@@ -180,3 +180,71 @@ bool sensors_get_mag(MagData& out) {
 uint8_t sensors_health() {
     return _health;
 }
+
+// ─── HIL injection ────────────────────────────────────────────────────────────
+#ifdef APEX_HIL
+
+void sensors_init_hil() {
+    _health = SENSOR_OK_IMU | SENSOR_OK_HIGHG | SENSOR_OK_BARO | SENSOR_OK_MAG;
+}
+
+void sensors_inject_hil(const SimPacket& pkt) {
+    static uint8_t _tick = 0;
+    _tick++;
+
+    uint32_t ts = pkt.sim_time_ms;
+
+    noInterrupts();
+
+    // IMU — every tick (100 Hz)
+    _imu_buf.accel_x_mss  = pkt.accel_x_mss;
+    _imu_buf.accel_y_mss  = pkt.accel_y_mss;
+    _imu_buf.accel_z_mss  = pkt.accel_z_mss;
+    _imu_buf.gyro_x_rads  = pkt.gyro_x_rads;
+    _imu_buf.gyro_y_rads  = pkt.gyro_y_rads;
+    _imu_buf.gyro_z_rads  = pkt.gyro_z_rads;
+    _imu_buf.timestamp_ms = ts;
+    _imu_ready = true;
+
+    // High-G — every tick. Telemega replay mirrors ICM accel here;
+    // firmware switches to high-G only above 14g which barely occurs in
+    // this flight (peak 14.10g at t=1.12s — noted limitation).
+    _highg_buf.accel_x_mss  = pkt.highg_x_mss;
+    _highg_buf.accel_y_mss  = pkt.highg_y_mss;
+    _highg_buf.accel_z_mss  = pkt.highg_z_mss;
+    _highg_buf.timestamp_ms = ts;
+    _highg_ready = true;
+
+    interrupts();
+
+    // Baro — every 2nd tick → 50 Hz equivalent
+    if ((_tick & 0x01) == 0) {
+        noInterrupts();
+        _baro_buf.pressure_pa   = pkt.baro_pa;
+        _baro_buf.temperature_c = _baro_buf.temperature_c; // unchanged (not in SimPacket)
+        _baro_buf.timestamp_ms  = ts;
+        _baro_ready = true;
+        interrupts();
+    }
+
+    // Mag — every 4th tick → 25 Hz equivalent
+    if ((_tick & 0x03) == 0) {
+        noInterrupts();
+        _mag_buf.x_gauss      = pkt.mag_x_gauss;
+        _mag_buf.y_gauss      = pkt.mag_y_gauss;
+        _mag_buf.z_gauss      = pkt.mag_z_gauss;
+        _mag_buf.timestamp_ms = ts;
+        _mag_ready = true;
+        interrupts();
+    }
+
+    // GPS — write directly to g_state (bypasses staging path, async)
+    if (pkt.gps_valid) {
+        g_state.gps.altitude_msl_m = pkt.gps_alt_msl_m;
+        g_state.gps.valid          = true;
+        g_state.gps.fix_quality    = 3;
+        g_state.gps.timestamp_ms   = ts;
+    }
+}
+
+#endif // APEX_HIL

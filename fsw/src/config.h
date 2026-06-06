@@ -94,6 +94,27 @@
 #define ISA_SEA_LEVEL_TEMP_K        288.15f
 #define ISA_LAPSE_RATE              0.0065f
 
+// ─── Sensor Fusion ────────────────────────────────────────────────────────────
+// Mahony convergence guard — integrator is blocked until attitude is settled.
+// Requires FUSION_CONV_MIN_SAMPLES elapsed AND FUSION_CONV_CONFIRM_COUNT
+// consecutive samples with |vert_accel| < FUSION_CONV_VERT_ACCEL_MAX.
+#define FUSION_CONV_MIN_SAMPLES      300    // 1.5 s at 200 Hz
+#define FUSION_CONV_CONFIRM_COUNT    100    // 0.5 s of stable residual
+#define FUSION_CONV_VERT_ACCEL_MAX   0.3f  // m/s² residual threshold
+
+// Complementary filter gains.
+// alpha: altitude baro weight per tick (dimensionless).
+// beta:  velocity correction gain (1/s). Kept separate from alpha/dt to
+//        prevent the dt-cancellation that made the old gain 1.0–4.0×.
+// Validated against Seymour TX flight data (max coast baro spike: 101 Pa = 10.9 m).
+// CF_COAST_BETA=1.0 → 10.9 m spike injects 10.9 m/s; acceptable because the
+// clamp limits alt_err to CF_ALT_ERR_CLAMP_M before it reaches the gain.
+#define CF_BOOST_ALPHA               0.005f
+#define CF_COAST_ALPHA               0.02f
+#define CF_BOOST_BETA                0.10f  // mild — baro noisy under motor vibration
+#define CF_COAST_BETA                1.00f  // aggressive — baro reliable post-burnout
+#define CF_ALT_ERR_CLAMP_M           5.0f  // max baro correction before clamping spike
+
 // ─── Pad Re-Zero ──────────────────────────────────────────────────────────────
 // Periodically refreshes the ground pressure reference while stationary on pad.
 // Only fires in IDLE or ARMED. Motion check must pass for REZERO_STABLE_MS

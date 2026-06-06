@@ -50,8 +50,20 @@ struct __attribute__((packed)) TeensyPacket {
 };
 static_assert(sizeof(TeensyPacket) == 24, "TeensyPacket size mismatch");
 
+// HIL fusion rate — Mahony must be initialised at this rate, not RATE_FUSION_HZ.
+// Using begin(RATE_FUSION_HZ=200) but calling fusion_update() at 100 Hz
+// would make the quaternion integrate at half-speed (Supervisor Q2 HIGH issue).
+#define RATE_HIL_HZ  100
+
+// Timeout with no SimPacket received → halt (do not fall back to sensor mode).
+// Prevents accidental HIL binary from silently operating as a flight binary.
+#define HIL_NO_PACKET_TIMEOUT_MS  10000
+
+#ifdef APEX_HIL
+
 // ─── CRC-8 ────────────────────────────────────────────────────────────────────
-// Covers all bytes except the crc8 field itself.
+// Polynomial 0x07 (CRC-8/SMBUS). Covers all bytes except the crc8 field itself.
+// Table-driven for predictable latency.
 
 uint8_t hil_crc8(const uint8_t* data, size_t len);
 
@@ -62,3 +74,5 @@ void     hil_send(const TeensyPacket& pkt);
 
 // Populate a TeensyPacket from g_state.
 TeensyPacket hil_make_packet(uint32_t echo_time_ms);
+
+#endif // APEX_HIL
