@@ -221,7 +221,7 @@ void sensors_inject_hil(const SimPacket& pkt) {
     if ((_tick & 0x01) == 0) {
         noInterrupts();
         _baro_buf.pressure_pa   = pkt.baro_pa;
-        _baro_buf.temperature_c = _baro_buf.temperature_c; // unchanged (not in SimPacket)
+        // temperature_c not in SimPacket — leave previous value unchanged
         _baro_buf.timestamp_ms  = ts;
         _baro_ready = true;
         interrupts();

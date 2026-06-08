@@ -158,7 +158,8 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 
 **Chip:** Silicon Labs Si4463  
 **Interface:** SPI1 — MOSI=26, MISO=1, SCK=27, CS=PIN_RAD_CS(0)  
-**Pins:** RAD_INT1=2, RAD_GPIO0=5 (CTS), RAD_GPIO1=4  
+**Pins:** RAD_INT1=2 (nIRQ), RAD_GPIO0=5, RAD_GPIO1=4  
+**SDN:** RF4463PRO SDN is active-high shutdown. It must be held low for SPI access.  
 **Note:** Transmit-only downlink. **No antenna — do not enable TX PA.** SPI register reads are safe.  
 **Config:** Si4463 requires a WDS-generated `radio_config.h` init array. Do not hand-edit registers.
 
@@ -166,14 +167,15 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 // No turnkey Arduino library — Si4463 is configured via a WDS-generated
 // radio_config.h array loaded during init. Key points:
 //
-// 1. Poll GPIO0 (CTS) after every SPI command before sending the next one.
-//    Missing CTS polling silently drops commands.
-// 2. Do not call SET_TX_POWER or START_TX without an antenna connected.
-// 3. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
+// 1. After POR/shutdown release, send POWER_UP and wait for CTS.
+// 2. Poll READ_CMD_BUFF (0x44) for CTS after every SPI command before
+//    sending the next one. Missing CTS polling silently drops commands.
+// 3. Do not call SET_TX_POWER or START_TX without an antenna connected.
+// 4. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
 
 // Safe bench test — read chip part info (no TX involved):
-//   Send: 0x01 (PART_INFO command)
-//   Receive: CTS + chip ID bytes
+//   Send POWER_UP, wait CTS, then send 0x01 (PART_INFO command)
+//   Receive CTS + chip ID bytes
 //   Si4463 returns chip ID 0x4463.
 ```
 

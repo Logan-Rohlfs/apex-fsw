@@ -6,8 +6,8 @@
 #include <SPI.h>
 
 // Si4463 SPI commands used here
-#define SI_NOP           0x00
 #define SI_PART_INFO     0x01
+#define SI_POWER_UP      0x02
 #define SI_FUNC_INFO     0x10
 #define SI_READ_CMD_BUFF 0x44
 
@@ -37,11 +37,45 @@ static bool wait_cts(uint16_t timeout_ms = 20) {
 
 // Send a command buffer, then wait for CTS before returning.
 // Leaves CS low so caller can immediately read response bytes if any.
-static bool send_cmd(const uint8_t* buf, uint8_t len) {
+static bool send_cmd(const uint8_t* buf, uint8_t len, uint16_t timeout_ms = 20) {
     cs_low();
     for (uint8_t i = 0; i < len; i++) SPI1.transfer(buf[i]);
     cs_high();
-    return wait_cts();
+    return wait_cts(timeout_ms);
+}
+
+static uint8_t raw_cts_poll() {
+    cs_low();
+    SPI1.transfer(SI_READ_CMD_BUFF);
+    uint8_t raw = SPI1.transfer(0x00);
+    cs_high();
+    return raw;
+}
+
+static bool power_up() {
+    const uint8_t cmd[] = {
+        SI_POWER_UP, 0x01, 0x00,
+        (uint8_t)(RADIO_XTAL_HZ >> 24),
+        (uint8_t)(RADIO_XTAL_HZ >> 16),
+        (uint8_t)(RADIO_XTAL_HZ >>  8),
+        (uint8_t)(RADIO_XTAL_HZ      )
+    };
+    return send_cmd(cmd, sizeof(cmd), 100);
+}
+
+static void radio_log_sdo_bias_test() {
+    cs_high();
+    pinMode(PIN_RAD_MISO, INPUT_PULLUP);
+    delay(5);
+    uint8_t sdo_pullup = digitalRead(PIN_RAD_MISO);
+
+    pinMode(PIN_RAD_MISO, INPUT_PULLDOWN);
+    delay(5);
+    uint8_t sdo_pulldown = digitalRead(PIN_RAD_MISO);
+
+    pinMode(PIN_RAD_MISO, INPUT);
+    LOG_INFO("Radio SDO idle bias: pullup=%u pulldown=%u — expected 1/0 if SDO is not shorted",
+             sdo_pullup, sdo_pulldown);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -49,37 +83,45 @@ static bool send_cmd(const uint8_t* buf, uint8_t len) {
 bool radio_init() {
     pinMode(PIN_RAD_CS,    OUTPUT);
     pinMode(PIN_RAD_INT1,  INPUT);
-    pinMode(PIN_RAD_GPIO0, INPUT);   // CTS indicator (after GPIO config)
+    pinMode(PIN_RAD_GPIO0, INPUT);
     pinMode(PIN_RAD_GPIO1, INPUT);
     digitalWrite(PIN_RAD_CS, HIGH);
 
-    SPI1.setMOSI(26);
-    SPI1.setMISO(1);
-    SPI1.setSCK(27);
+#ifdef APEX_MONITOR
+    radio_log_sdo_bias_test();
+#endif
+
+    SPI1.setMOSI(PIN_RAD_MOSI);
+    SPI1.setMISO(PIN_RAD_MISO);
+    SPI1.setSCK(PIN_RAD_SCK);
     SPI1.begin();
     SPI1.beginTransaction(SPISettings(100000, MSBFIRST, SPI_MODE0)); // 100 kHz — diagnose signal integrity
 
-    // NOP clears any leftover state from a previous run
-    cs_low();
-    SPI1.transfer(SI_NOP);
+    // After POR or shutdown release, Si4463 requires POWER_UP before API reads.
+    if (!power_up()) {
+        uint8_t raw = raw_cts_poll();
+        SPI1.endTransaction();
+        LOG_ERROR("Radio: no CTS after POWER_UP (raw=0x%02X) — %s",
+                  raw,
+                  raw == 0x00 ? "no SPI access — check VCC, SDN low, nSEL/SCK/SDI/SDO solder joints" :
+                  raw == 0xFF ? "MISO shorted high or stale response — power cycle" :
+                                "unexpected — check SPI1 wiring");
+        _status = -1;
+        return false;
+    }
     cs_high();
-    delay(5);
 
     // ── PART_INFO ─────────────────────────────────────────────────────────────
-    // Safe to call before POWER_UP — Si4463 responds in Boot state.
     // Response (after CTS byte): chipRev, part[1], part[0], pbuild,
     //                             id[1], id[0], customer, romId
     const uint8_t cmd_part[] = { SI_PART_INFO };
     if (!send_cmd(cmd_part, sizeof(cmd_part))) {
         // Read one raw CTS poll byte to distinguish floating MISO from a stuck chip
-        cs_low();
-        SPI1.transfer(SI_READ_CMD_BUFF);
-        uint8_t raw = SPI1.transfer(0x00);
-        cs_high();
+        uint8_t raw = raw_cts_poll();
         SPI1.endTransaction();
         LOG_ERROR("Radio: no CTS after PART_INFO (raw=0x%02X) — %s",
                   raw,
-                  raw == 0x00 ? "chip busy but never ready — scope MOSI/SCK, check solder joints" :
+                  raw == 0x00 ? "chip busy but never ready — scope nSEL/SCK/SDI/SDO, check SDN and solder joints" :
                   raw == 0xFF ? "MISO shorted high or chip in bad state — power cycle" :
                                 "unexpected — check SPI1 wiring");
         _status = -1;
@@ -96,6 +138,10 @@ bool radio_init() {
     uint8_t customer = SPI1.transfer(0x00);
     uint8_t rom_id   = SPI1.transfer(0x00);
     cs_high();
+    (void)pbuild;
+    (void)id_hi;
+    (void)id_lo;
+    (void)customer;
 
     uint16_t part_id = ((uint16_t)part_hi << 8) | part_lo;
 
@@ -136,9 +182,59 @@ int8_t radio_status() {
     return _status;
 }
 
+void radio_dmm_pin_test() {
+    SPI1.end();
+
+    pinMode(PIN_RAD_MISO, INPUT);
+    pinMode(PIN_RAD_INT1, INPUT);
+    pinMode(PIN_RAD_GPIO0, INPUT);
+    pinMode(PIN_RAD_GPIO1, INPUT);
+    pinMode(PIN_RAD_CS, OUTPUT);
+    pinMode(PIN_RAD_MOSI, OUTPUT);
+    pinMode(PIN_RAD_SCK, OUTPUT);
+
+    digitalWrite(PIN_RAD_CS, HIGH);
+    digitalWrite(PIN_RAD_MOSI, LOW);
+    digitalWrite(PIN_RAD_SCK, LOW);
+
+    LOG_INFO("Radio DMM: measure RF4463PRO nSEL pin 9 now — HIGH for 3s");
+    digitalWrite(PIN_RAD_CS, HIGH);
+    delay(3000);
+    LOG_INFO("Radio DMM: measure RF4463PRO nSEL pin 9 now — LOW for 3s");
+    digitalWrite(PIN_RAD_CS, LOW);
+    delay(3000);
+    digitalWrite(PIN_RAD_CS, HIGH);
+
+    LOG_INFO("Radio DMM: measure RF4463PRO SDI pin 7 now — HIGH for 3s");
+    digitalWrite(PIN_RAD_MOSI, HIGH);
+    delay(3000);
+    LOG_INFO("Radio DMM: measure RF4463PRO SDI pin 7 now — LOW for 3s");
+    digitalWrite(PIN_RAD_MOSI, LOW);
+    delay(3000);
+
+    LOG_INFO("Radio DMM: measure RF4463PRO SCLK pin 8 now — HIGH for 3s");
+    digitalWrite(PIN_RAD_SCK, HIGH);
+    delay(3000);
+    LOG_INFO("Radio DMM: measure RF4463PRO SCLK pin 8 now — LOW for 3s");
+    digitalWrite(PIN_RAD_SCK, LOW);
+    delay(3000);
+
+    LOG_INFO("Radio DMM: nIRQ=%u GPIO0=%u GPIO1=%u",
+             digitalRead(PIN_RAD_INT1),
+             digitalRead(PIN_RAD_GPIO0),
+             digitalRead(PIN_RAD_GPIO1));
+    radio_log_sdo_bias_test();
+
+    SPI1.setMOSI(PIN_RAD_MOSI);
+    SPI1.setMISO(PIN_RAD_MISO);
+    SPI1.setSCK(PIN_RAD_SCK);
+    SPI1.begin();
+    LOG_INFO("Radio DMM: done");
+}
+
 // ─── Test TX ──────────────────────────────────────────────────────────────────
-// Boots the Si4463, configures a CW carrier at RADIO_FREQ_HZ, and starts TX.
-// Call once from setup() under APEX_DEBUG to verify the RF chain.
+// Configures a CW carrier at RADIO_FREQ_HZ and starts TX.
+// Call once from setup() under APEX_MONITOR to verify the RF chain.
 // The carrier stays on until the board is reset.
 //
 // Frequency math (OUTDIV=8 for 420-480 MHz, XTAL=26 MHz):
@@ -151,29 +247,6 @@ bool radio_test_tx() {
     }
 
     SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-
-    // POWER_UP: boot Si4463 from ROM with crystal oscillator
-    {
-        const uint8_t xtal = RADIO_XTAL_HZ;  // suppress unused warning
-        (void)xtal;
-        const uint8_t cmd[] = {
-            0x02, 0x01, 0x00,
-            (uint8_t)(RADIO_XTAL_HZ >> 24),
-            (uint8_t)(RADIO_XTAL_HZ >> 16),
-            (uint8_t)(RADIO_XTAL_HZ >>  8),
-            (uint8_t)(RADIO_XTAL_HZ      )
-        };
-        cs_low();
-        for (uint8_t i = 0; i < sizeof(cmd); i++) SPI1.transfer(cmd[i]);
-        cs_high();
-    }
-    delay(10); // Si4463 boot takes ~6 ms
-    if (!wait_cts(100)) {
-        SPI1.endTransaction();
-        LOG_ERROR("Radio: no CTS after POWER_UP — check 3V3_2 rail and crystal");
-        return false;
-    }
-    cs_high();
 
     // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-480 MHz, high-performance PLL
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }

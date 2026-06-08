@@ -165,10 +165,25 @@ Noise and bias parameters for each sensor are documented in `docs/sensors/`.
 
 ## HIL Mode
 
-> *Not yet implemented — serial protocol definition pending.*
+Two HIL modes exist:
 
-The HIL loop will be started with `scripts/run_hil.py` (not yet created).
-The serial protocol spec lives in `apex_sim/hil/` once defined.
+**Replay (implemented)** — plays a recorded Telemega CSV back to the Teensy:
+
+```bash
+python scripts/run_replay.py --port /dev/cu.usbmodem<N>
+python scripts/run_replay.py  # auto-detects Teensy
+```
+
+See `scripts/run_replay.py` for full options (`--csv`, `--pre-pad`, `--speed`, `--out`).
+Requires a Teensy flashed with the HIL build (`pio run -e teensy41_hil -t upload`).
+
+**Real-time HIL (not yet implemented)** — closes the loop between a live RocketPy
+simulation and the Teensy so `deployment_frac` feeds back into airbrake drag.
+Entry point will be `scripts/run_hil.py`. Python-side serial framing lives in
+`apex_sim/hil/` once built.
+
+The serial protocol (packet structs, CRC-8, magic bytes, baud) is fully defined on the
+Teensy side in `fsw/src/hil.h`.
 
 ---
 

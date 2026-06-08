@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Apex Flight Computer — Serial Monitor & Debug Visualizer
+Apex Flight Computer — Serial Monitor
 
-Accepts data from the Teensy over USB serial in three line formats:
+Unified interface for laptop-connected Teensy (APEX_MONITOR build).
+Accepts three line formats from firmware:
   >key:value    numeric — routed to live plots and values table
   !key:value    state   — routed to state panel (phase, health flags, etc.)
-  #message      log     — shown only in the serial log
-  (anything else is also shown in the serial log as-is)
+  #LEVEL: msg   log     — shown in the log panel with color coding
 
-Enable plot output from firmware with -DAPEX_PLOT build flag.
+Sends newline-terminated ASCII commands to the Teensy via the command
+input at the bottom of the log panel. Commands: ARM, DISARM (more once
+the state machine is implemented).
+
 Run: python scripts/monitor.py
 """
 
@@ -25,7 +28,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea,
     QFrame, QPlainTextEdit, QTextEdit, QSizePolicy, QGridLayout, QGroupBox,
-    QSpinBox, QCheckBox,
+    QSpinBox, QCheckBox, QLineEdit,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
 from PyQt5.QtGui import QFont, QColor
@@ -75,10 +78,20 @@ class SerialWorker(QThread):
         self._port     = ""
         self._baud     = 115200
         self._running  = False
+        self._ser: serial.Serial | None = None
 
     def configure(self, port: str, baud: int):
         self._port = port
         self._baud = baud
+
+    def send_bytes(self, data: bytes):
+        """Write bytes to the serial port. Thread-safe (pyserial acquires its own lock)."""
+        ser = self._ser
+        if ser is not None and ser.is_open:
+            try:
+                ser.write(data)
+            except serial.SerialException:
+                pass
 
     def _read_loop(self, ser):
         """Inner read loop. Returns True if we should reconnect, False to exit."""
@@ -106,12 +119,14 @@ class SerialWorker(QThread):
                 f"{'Connecting' if first_connect else 'Reconnecting'} to {self._port}…", False)
             try:
                 ser = serial.Serial(self._port, self._baud, timeout=0.05)
+                self._ser = ser
                 self.status_changed.emit(f"Connected  {self._port} @ {self._baud}", False)
                 if not first_connect:
                     self.reconnected.emit()
                 first_connect = False
 
                 should_reconnect = self._read_loop(ser)
+                self._ser = None
                 ser.close()
 
                 if should_reconnect and self._running:
@@ -123,16 +138,25 @@ class SerialWorker(QThread):
                         ports = [p.device for p in serial.tools.list_ports.comports()]
                         if self._port in ports:
                             break
-            except serial.SerialException as e:
+            except serial.SerialException:
                 if self._running:
                     # Port not available yet — keep polling
                     time.sleep(0.5)
 
+        self._ser = None
         self._running = False
 
     def stop(self):
         self._running = False
         self.wait(3000)
+
+# ─── Plot widget — passes wheel events up so the scroll area scrolls ─────────
+
+class PlotWidget(pg.PlotWidget):
+    """PlotWidget that ignores wheel events so the parent QScrollArea can scroll."""
+    def wheelEvent(self, ev):
+        ev.ignore()
+
 
 # ─── Plot group widget ────────────────────────────────────────────────────────
 
@@ -150,7 +174,7 @@ class PlotGroupWidget(QGroupBox):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        self.plot = pg.PlotWidget(background="#1a1a2e")
+        self.plot = PlotWidget(background="#1a1a2e")
         self.plot.setMinimumHeight(160)
         self.plot.showGrid(x=True, y=True, alpha=0.3)
         self.plot.getAxis("bottom").setLabel("t (s)")
@@ -421,15 +445,15 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(4)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # Toolbar
-        toolbar = self._build_toolbar()
-        root.addLayout(toolbar)
+        # Toolbar — fixed-height control bar with bottom separator
+        root.addWidget(self._build_toolbar())
 
         # Main splitter: plots | state+log
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setContentsMargins(6, 6, 6, 6)
         root.addWidget(splitter)
 
         splitter.addWidget(self._build_plot_panel())
@@ -438,8 +462,12 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
 
-    def _build_toolbar(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
+    def _build_toolbar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("toolbar")
+        bar.setFixedHeight(42)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(6)
 
         # Port selector
@@ -494,10 +522,9 @@ class MainWindow(QMainWindow):
 
         # Status indicator
         self.status_label = QLabel("Not connected")
-        self.status_label.setStyleSheet("color:#888888;")
         layout.addWidget(self.status_label)
 
-        return layout
+        return bar
 
     def _build_plot_panel(self) -> QScrollArea:
         scroll = QScrollArea()
@@ -559,6 +586,24 @@ class MainWindow(QMainWindow):
         self.log_view.setStyleSheet("background:#0a0a14; color:#cccccc; border:none;")
         self.log_view.document().setMaximumBlockCount(2000)
         log_layout.addWidget(self.log_view)
+
+        # Command input row
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(4)
+        self.cmd_input = QLineEdit()
+        self.cmd_input.setPlaceholderText("Command (e.g. ARM) — Enter to send")
+        self.cmd_input.setFont(QFont("Courier", 8))
+        self.cmd_input.setStyleSheet(
+            "background:#0a0a14; color:#ccffcc; border:1px solid #334433;"
+            " border-radius:3px; padding:2px 4px;")
+        self.cmd_input.returnPressed.connect(self._send_command)
+        cmd_row.addWidget(self.cmd_input)
+        send_btn = QPushButton("Send")
+        send_btn.setFixedWidth(48)
+        send_btn.clicked.connect(self._send_command)
+        cmd_row.addWidget(send_btn)
+        log_layout.addLayout(cmd_row)
+
         layout.addWidget(log_box, stretch=1)
 
         return panel
@@ -622,6 +667,14 @@ class MainWindow(QMainWindow):
             self._worker.start()
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet("background:#aa2222; color:#ffffff;")
+
+    def _send_command(self):
+        text = self.cmd_input.text().strip()
+        if not text:
+            return
+        self._worker.send_bytes(text.encode() + b"\n")
+        self._log(f"[TX] {text}")
+        self.cmd_input.clear()
 
     # ── Data routing ──────────────────────────────────────────────────────────
 
@@ -693,15 +746,11 @@ class MainWindow(QMainWindow):
                 sb.setValue(sb.maximum())
                 return
 
-        # [INFO  1234] style from APEX_DEBUG mode
-        for level, (c, b) in self._LOG_STYLES.items():
-            if f"[{level}" in text[:10]:
-                color, bold = c, b
-                break
-
-        # [monitor] internal messages
+        # [monitor] and [TX] internal messages
         if text.startswith("[monitor]"):
             color = "#446688"
+        elif text.startswith("[TX]"):
+            color = "#44ffaa"
 
         html = f'<span style="color:{color};font-weight:{"bold" if bold else "normal"};">{text}</span>'
         self.log_view.append(html)
@@ -792,17 +841,108 @@ class MainWindow(QMainWindow):
 
     def _apply_dark_theme(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget  { background: #0d0d1a; color: #ccccdd; }
-            QGroupBox             { border: 1px solid #333355; border-radius: 4px;
-                                    margin-top: 6px; padding-top: 6px; color: #8888aa; }
-            QGroupBox::title      { subcontrol-origin: margin; left: 8px; }
-            QComboBox, QSpinBox   { background: #1a1a2e; border: 1px solid #444466;
-                                    color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
-            QPushButton           { background: #1e1e3a; border: 1px solid #444466;
-                                    color: #ccccdd; padding: 3px 10px; border-radius: 3px; }
-            QPushButton:hover     { background: #2a2a4a; }
-            QScrollArea           { border: none; }
-            QLabel                { color: #ccccdd; }
+            /* ── Base ─────────────────────────────────────────────────────── */
+            QMainWindow, QWidget    { background: #0d0d1a; color: #ccccdd; }
+            QLabel                  { color: #ccccdd; background: transparent; }
+            QScrollArea             { border: none; }
+
+            /* ── Toolbar ──────────────────────────────────────────────────── */
+            QFrame#toolbar          { background: #111122;
+                                      border-bottom: 1px solid #2a2a44; }
+            QFrame#toolbar QLabel   { color: #9090b8; background: transparent; }
+
+            /* Toolbar controls: inset look — darker than toolbar surface */
+            QFrame#toolbar QComboBox,
+            QFrame#toolbar QSpinBox { background: #09091a; border: 1px solid #2e2e50;
+                                      color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
+            QFrame#toolbar QPushButton
+                                    { background: #09091a; border: 1px solid #2e2e50;
+                                      color: #aaaacc; padding: 3px 10px; border-radius: 3px; }
+            QFrame#toolbar QPushButton:hover
+                                    { background: #14142a; border-color: #4444aa;
+                                      color: #ddddff; }
+
+            /* ── Panel controls (outside toolbar) ────────────────────────── */
+            QGroupBox               { border: 1px solid #333355; border-radius: 4px;
+                                      margin-top: 6px; padding-top: 6px; color: #8888aa; }
+            QGroupBox::title        { subcontrol-origin: margin; left: 8px; }
+
+            QComboBox, QSpinBox     { background: #1a1a2e; border: 1px solid #444466;
+                                      color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
+            QPushButton             { background: #1e1e3a; border: 1px solid #444466;
+                                      color: #ccccdd; padding: 3px 10px; border-radius: 3px; }
+            QPushButton:hover       { background: #2a2a4a; }
+
+            /* ── ComboBox arrow + dropdown popup ─────────────────────────── */
+            QComboBox::drop-down    { subcontrol-origin: padding;
+                                      subcontrol-position: top right;
+                                      width: 18px;
+                                      border-left: 1px solid #303050;
+                                      border-radius: 0 3px 3px 0; }
+            QComboBox::down-arrow   { border-left:  4px solid transparent;
+                                      border-right: 4px solid transparent;
+                                      border-top:   5px solid #8888cc;
+                                      width: 0; height: 0; }
+            QComboBox::down-arrow:disabled
+                                    { border-top-color: #444455; }
+
+            QComboBox QAbstractItemView {
+                                      background: #1a1a2e;
+                                      border: 1px solid #444466;
+                                      color: #ccccdd;
+                                      selection-background-color: #2a2a50;
+                                      selection-color: #ffffff;
+                                      outline: none; }
+
+            /* ── SpinBox arrows ───────────────────────────────────────────── */
+            QSpinBox::up-button     { subcontrol-origin: border;
+                                      subcontrol-position: top right;
+                                      width: 16px;
+                                      border-left: 1px solid #303050;
+                                      border-bottom: 1px solid #303050;
+                                      background: transparent; }
+            QSpinBox::down-button   { subcontrol-origin: border;
+                                      subcontrol-position: bottom right;
+                                      width: 16px;
+                                      border-left: 1px solid #303050;
+                                      background: transparent; }
+            QSpinBox::up-arrow      { border-left:   3px solid transparent;
+                                      border-right:  3px solid transparent;
+                                      border-bottom: 4px solid #8888cc;
+                                      width: 0; height: 0; }
+            QSpinBox::down-arrow    { border-left:  3px solid transparent;
+                                      border-right: 3px solid transparent;
+                                      border-top:   4px solid #8888cc;
+                                      width: 0; height: 0; }
+            QSpinBox::up-arrow:disabled,
+            QSpinBox::down-arrow:disabled
+                                    { border-bottom-color: #444455;
+                                      border-top-color:    #444455; }
+
+            /* ── Scrollbars ───────────────────────────────────────────────── */
+            QScrollBar:vertical     { background: #0d0d1a; width: 8px;
+                                      margin: 0; border: none; }
+            QScrollBar::handle:vertical
+                                    { background: #2e2e50; border-radius: 4px;
+                                      min-height: 24px; }
+            QScrollBar::handle:vertical:hover
+                                    { background: #44447a; }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical  { height: 0; }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical  { background: none; }
+
+            QScrollBar:horizontal   { background: #0d0d1a; height: 8px;
+                                      margin: 0; border: none; }
+            QScrollBar::handle:horizontal
+                                    { background: #2e2e50; border-radius: 4px;
+                                      min-width: 24px; }
+            QScrollBar::handle:horizontal:hover
+                                    { background: #44447a; }
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal { width: 0; }
+            QScrollBar::add-page:horizontal,
+            QScrollBar::sub-page:horizontal { background: none; }
         """)
         pg.setConfigOption("background", "#0d0d1a")
         pg.setConfigOption("foreground", "#888899")

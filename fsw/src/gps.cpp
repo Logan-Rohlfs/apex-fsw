@@ -94,10 +94,19 @@ void gps_update() {
 
     gps.timestamp_ms = millis();
 
-#ifdef APEX_DEBUG
-    static uint8_t log_div = 0;
-    if (++log_div >= 10) {
-        log_div = 0;
+#ifdef APEX_MONITOR
+    static int8_t   last_logged_fix = -2;
+    static uint8_t  last_logged_sats = 0xFF;
+    static uint32_t last_summary_ms = 0;
+
+    bool fix_changed = (gps.fix_quality != last_logged_fix);
+    bool sats_changed = (gps.satellites != last_logged_sats);
+    bool periodic_summary = (millis() - last_summary_ms >= 30000);
+
+    if (fix_changed || periodic_summary) {
+        last_logged_fix = (int8_t)gps.fix_quality;
+        last_logged_sats = gps.satellites;
+        last_summary_ms = millis();
         if (gps.time_valid)
             LOG_INFO("GPS fix=%d sats=%d UTC=%04u-%02u-%02uT%02u:%02u:%02u",
                 gps.fix_quality, gps.satellites,
@@ -105,6 +114,8 @@ void gps_update() {
                 gps.utc_hour, gps.utc_minute, gps.utc_second);
         else
             LOG_INFO("GPS fix=%d sats=%d", gps.fix_quality, gps.satellites);
+    } else if (sats_changed && gps.fix_quality >= 3) {
+        last_logged_sats = gps.satellites;
     }
 #endif
 }

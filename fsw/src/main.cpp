@@ -9,10 +9,10 @@
 #include "led.h"
 #include "storage.h"
 
-// APEX_HIL is mutually exclusive with APEX_PLOT and APEX_DEBUG.
+// APEX_HIL and APEX_MONITOR are mutually exclusive.
 // Interleaved text output causes CRC false-failures in the Python parser.
-#if defined(APEX_HIL) && (defined(APEX_PLOT) || defined(APEX_DEBUG))
-#error "APEX_HIL cannot be combined with APEX_PLOT or APEX_DEBUG"
+#if defined(APEX_HIL) && defined(APEX_MONITOR)
+#error "APEX_HIL cannot be combined with APEX_MONITOR"
 #endif
 
 #ifdef APEX_HIL
@@ -59,9 +59,9 @@ void setup() {
     Serial.println("#HIL_READY");
 
 #else
-    // Normal flight / debug mode ─────────────────────────────────────────────
-#ifdef APEX_DEBUG
-    Serial.begin(115200);
+    // Normal flight / monitor mode ────────────────────────────────────────────
+#ifdef APEX_MONITOR
+    Serial.begin(921600);
     while (!Serial && millis() < 5000);
 #endif
 
@@ -88,7 +88,7 @@ void setup() {
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
 
-#ifdef APEX_DEBUG
+#ifdef APEX_MONITOR
     radio_test_tx();
 #endif
 
@@ -184,35 +184,36 @@ void loop() {
 
     static uint32_t last_print = 0;
 
-#if defined(APEX_PLOT)
+#ifdef APEX_MONITOR
+    // ── Data output at 50 Hz ──────────────────────────────────────────────────
     if (millis() - last_print >= 20) {
         last_print = millis();
 
-        Serial.printf(">alt_agl:%.2f\n",    g_state.fused.altitude_agl_m);
-        Serial.printf(">velocity:%.3f\n",   g_state.fused.velocity_mps);
-        Serial.printf(">pred_apogee:%.1f\n",g_state.fused.predicted_apogee_m);
-        Serial.printf(">vert_accel:%.3f\n", g_state.fused.accel_mps2);
-        Serial.printf(">accel_x:%.3f\n",  g_state.imu.accel_x_mss);
-        Serial.printf(">accel_y:%.3f\n",  g_state.imu.accel_y_mss);
-        Serial.printf(">accel_z:%.3f\n",  g_state.imu.accel_z_mss);
-        Serial.printf(">gyro_x:%.4f\n",   g_state.imu.gyro_x_rads);
-        Serial.printf(">gyro_y:%.4f\n",   g_state.imu.gyro_y_rads);
-        Serial.printf(">gyro_z:%.4f\n",   g_state.imu.gyro_z_rads);
-        Serial.printf(">highg_x:%.2f\n",  g_state.high_g.accel_x_mss);
-        Serial.printf(">highg_y:%.2f\n",  g_state.high_g.accel_y_mss);
-        Serial.printf(">highg_z:%.2f\n",  g_state.high_g.accel_z_mss);
-        Serial.printf(">baro_pa:%.2f\n",  g_state.baro.pressure_pa);
+        Serial.printf(">alt_agl:%.2f\n",     g_state.fused.altitude_agl_m);
+        Serial.printf(">velocity:%.3f\n",    g_state.fused.velocity_mps);
+        Serial.printf(">pred_apogee:%.1f\n", g_state.fused.predicted_apogee_m);
+        Serial.printf(">vert_accel:%.3f\n",  g_state.fused.accel_mps2);
+        Serial.printf(">accel_x:%.3f\n",     g_state.imu.accel_x_mss);
+        Serial.printf(">accel_y:%.3f\n",     g_state.imu.accel_y_mss);
+        Serial.printf(">accel_z:%.3f\n",     g_state.imu.accel_z_mss);
+        Serial.printf(">gyro_x:%.4f\n",      g_state.imu.gyro_x_rads);
+        Serial.printf(">gyro_y:%.4f\n",      g_state.imu.gyro_y_rads);
+        Serial.printf(">gyro_z:%.4f\n",      g_state.imu.gyro_z_rads);
+        Serial.printf(">highg_x:%.2f\n",     g_state.high_g.accel_x_mss);
+        Serial.printf(">highg_y:%.2f\n",     g_state.high_g.accel_y_mss);
+        Serial.printf(">highg_z:%.2f\n",     g_state.high_g.accel_z_mss);
+        Serial.printf(">baro_pa:%.2f\n",     g_state.baro.pressure_pa);
         Serial.printf(">baro_alt:%.1f\n",
             44330.0f * (1.0f - powf(g_state.baro.pressure_pa / ISA_SEA_LEVEL_PA, 1.0f / 5.255f)));
-        Serial.printf(">baro_temp:%.2f\n",g_state.baro.temperature_c);
-        Serial.printf(">mag_x:%.4f\n",    g_state.mag.x_gauss);
-        Serial.printf(">mag_y:%.4f\n",    g_state.mag.y_gauss);
-        Serial.printf(">mag_z:%.4f\n",    g_state.mag.z_gauss);
-        Serial.printf("!phase:%s\n",   phase_name(g_state.phase));
-        Serial.printf("!health:%d\n",  sensors_health());
-        Serial.printf("!gps_fix:%d\n",   gps_fix_state());
-        Serial.printf("!radio:%d\n",     radio_status());
-        Serial.printf("!gps_sats:%d\n",g_state.gps.satellites);
+        Serial.printf(">baro_temp:%.2f\n",   g_state.baro.temperature_c);
+        Serial.printf(">mag_x:%.4f\n",       g_state.mag.x_gauss);
+        Serial.printf(">mag_y:%.4f\n",       g_state.mag.y_gauss);
+        Serial.printf(">mag_z:%.4f\n",       g_state.mag.z_gauss);
+        Serial.printf("!phase:%s\n",         phase_name(g_state.phase));
+        Serial.printf("!health:%d\n",        sensors_health());
+        Serial.printf("!gps_fix:%d\n",       gps_fix_state());
+        Serial.printf("!radio:%d\n",         radio_status());
+        Serial.printf("!gps_sats:%d\n",      g_state.gps.satellites);
         if (g_state.gps.time_valid) {
             char utc[32];
             gps_utc_string(utc, sizeof(utc));
@@ -220,22 +221,26 @@ void loop() {
         }
     }
 
-#elif defined(APEX_DEBUG)
-    if (millis() - last_print >= 250) {
-        last_print = millis();
-        float alt = 44330.0f * (1.0f - powf(g_state.baro.pressure_pa / ISA_SEA_LEVEL_PA, 1.0f / 5.255f));
-        LOG_RAW("[IMU]  A: %6.2f %6.2f %6.2f m/s²  G: %6.3f %6.3f %6.3f rad/s\n",
-            g_state.imu.accel_x_mss, g_state.imu.accel_y_mss, g_state.imu.accel_z_mss,
-            g_state.imu.gyro_x_rads, g_state.imu.gyro_y_rads, g_state.imu.gyro_z_rads);
-        LOG_RAW("[HG]   A: %6.2f %6.2f %6.2f m/s²\n",
-            g_state.high_g.accel_x_mss, g_state.high_g.accel_y_mss, g_state.high_g.accel_z_mss);
-        LOG_RAW("[BAR]  P: %.2f Pa  T: %.2f C  Alt: %.1f m\n",
-            g_state.baro.pressure_pa, g_state.baro.temperature_c, alt);
-        LOG_RAW("[MAG]  X: %.4f  Y: %.4f  Z: %.4f Gauss\n",
-            g_state.mag.x_gauss, g_state.mag.y_gauss, g_state.mag.z_gauss);
-        LOG_RAW("[FUS]  Alt: %7.1f m  Vel: %6.2f m/s  PredApo: %7.1f m  Phase: %s\n",
-            g_state.fused.altitude_agl_m, g_state.fused.velocity_mps,
-            g_state.fused.predicted_apogee_m, phase_name(g_state.phase));
+    // ── Command parser ────────────────────────────────────────────────────────
+    // Reads newline-terminated ASCII commands from the monitor app.
+    // Commands: ARM, DISARM (state machine hooks added in Phase 1).
+    static char    _cmd_buf[32];
+    static uint8_t _cmd_len = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (_cmd_len > 0) {
+                _cmd_buf[_cmd_len] = '\0';
+                LOG_INFO("CMD: %s", _cmd_buf);
+                if (strcmp(_cmd_buf, "RADIO_DMM") == 0) {
+                    radio_dmm_pin_test();
+                }
+                // TODO Phase 1: dispatch ARM / DISARM here
+                _cmd_len = 0;
+            }
+        } else if (_cmd_len < sizeof(_cmd_buf) - 1) {
+            _cmd_buf[_cmd_len++] = c;
+        }
     }
 #endif
 

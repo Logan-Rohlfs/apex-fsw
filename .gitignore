@@ -24,8 +24,8 @@ venv/
 .coverage
 htmlcov/
 
-# PlatformIO build artifacts — firmware/ uses PlatformIO, .pio/ is its build cache
-firmware/.pio/
+# PlatformIO build artifacts
+fsw/.pio/
 
 # HIL serial logs captured during test runs
 sim/data/hil_logs/
@@ -37,8 +37,9 @@ sim/output/
 sim/data/weather_cache/
 *.nc
 
-# OpenRocket autosave files
+# OpenRocket autosave files and JVM crash logs
 *.ork.bak
+hs_err_pid*.log
 
 # MATLAB generated figures and workspace dumps
 *.fig

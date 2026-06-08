@@ -24,10 +24,13 @@
 
 // Radio — RF4463PRO / Si4463 (SPI1)
 // SPI1: MOSI1=26, MISO1=1, SCK1=27
+#define PIN_RAD_MOSI        26
+#define PIN_RAD_MISO        1
+#define PIN_RAD_SCK         27
 #define PIN_RAD_CS          0
-#define PIN_RAD_INT1        2
-#define PIN_RAD_GPIO0       5    // Si4463 CTS / NIRQ
-#define PIN_RAD_GPIO1       4
+#define PIN_RAD_INT1        2    // RF4463PRO nIRQ
+#define PIN_RAD_GPIO0       5    // Si4463 GPIO0
+#define PIN_RAD_GPIO1       4    // Si4463 GPIO1
 
 // Power enables
 #define PIN_3V3_2_EN        23   // AP2112K-3.3 enable — drives radio 3.3V rail
@@ -35,6 +38,7 @@
 // ─── Radio ────────────────────────────────────────────────────────────────────
 // RF4463PRO-433 (NiceRF) uses a 26 MHz crystal — confirmed from module specs.
 // GPIO2 = RXEN, GPIO3 = TXEN (antenna TX/RX switch internal to module).
+// RF4463PRO SDN is active-high shutdown; hardware must hold it low for SPI.
 #define RADIO_XTAL_HZ       26000000UL
 #define RADIO_FREQ_HZ       433920000UL  // 433.920 MHz ISM center
 
