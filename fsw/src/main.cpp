@@ -6,6 +6,8 @@
 #include "fusion.h"
 #include "gps.h"
 #include "radio.h"
+#include "led.h"
+#include "storage.h"
 
 // APEX_HIL is mutually exclusive with APEX_PLOT and APEX_DEBUG.
 // Interleaved text output causes CRC false-failures in the Python parser.
@@ -37,8 +39,6 @@ static void timer_mag_cb()  { sensors_update_mag();  }
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
 void setup() {
-    pinMode(LED_BUILTIN, OUTPUT);
-
 #ifdef APEX_HIL
     // HIL mode — all sensor data arrives over USB serial as SimPackets.
     // Hardware sensors and timers are not initialised.
@@ -67,12 +67,30 @@ void setup() {
 
     LOG_INFO("Apex FSW starting");
 
+    pinMode(PIN_3V3_2_EN, OUTPUT);
+    digitalWrite(PIN_3V3_2_EN, HIGH);
+
+    led_init();
+    storage_init();
     bool all_ok = sensors_init();
     fusion_init();
     gps_init();
+
+    // Power-cycle the radio so the Si4463 always cold-boots into Boot state.
+    // Without this, the chip retains state across firmware uploads since the
+    // 3V3_2 rail stays live whenever the Teensy is powered.
+    digitalWrite(PIN_3V3_2_EN, LOW);
+    delay(50);
+    digitalWrite(PIN_3V3_2_EN, HIGH);
+    delay(200); // extended: allow Si4463 crystal to fully stabilise
+
     radio_init();
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
+
+#ifdef APEX_DEBUG
+    radio_test_tx();
+#endif
 
     _timer_fusion.begin(timer_fusion_cb, 1000000 / RATE_FUSION_HZ);
     _timer_baro.begin(timer_baro_cb,     1000000 / RATE_BARO_HZ);
@@ -200,7 +218,6 @@ void loop() {
             gps_utc_string(utc, sizeof(utc));
             Serial.printf("!utc:%s\n", utc);
         }
-        digitalToggle(LED_BUILTIN);
     }
 
 #elif defined(APEX_DEBUG)
@@ -219,9 +236,11 @@ void loop() {
         LOG_RAW("[FUS]  Alt: %7.1f m  Vel: %6.2f m/s  PredApo: %7.1f m  Phase: %s\n",
             g_state.fused.altitude_agl_m, g_state.fused.velocity_mps,
             g_state.fused.predicted_apogee_m, phase_name(g_state.phase));
-        digitalToggle(LED_BUILTIN);
     }
 #endif
+
+    storage_mtp_loop();
+    led_update();
 }
 
 #endif // APEX_HIL

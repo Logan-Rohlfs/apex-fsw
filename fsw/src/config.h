@@ -29,6 +29,15 @@
 #define PIN_RAD_GPIO0       5    // Si4463 CTS / NIRQ
 #define PIN_RAD_GPIO1       4
 
+// Power enables
+#define PIN_3V3_2_EN        23   // AP2112K-3.3 enable — drives radio 3.3V rail
+
+// ─── Radio ────────────────────────────────────────────────────────────────────
+// RF4463PRO-433 (NiceRF) uses a 26 MHz crystal — confirmed from module specs.
+// GPIO2 = RXEN, GPIO3 = TXEN (antenna TX/RX switch internal to module).
+#define RADIO_XTAL_HZ       26000000UL
+#define RADIO_FREQ_HZ       433920000UL  // 433.920 MHz ISM center
+
 // ─── I2C Addresses ────────────────────────────────────────────────────────────
 #define BMP581_ADDR         0x46    // ADR tied to GND
 #define ADXL375_ADDR        0x53    // SDO tied to GND
