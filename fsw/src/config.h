@@ -36,10 +36,12 @@
 #define PIN_3V3_2_EN        23   // AP2112K-3.3 enable — drives radio 3.3V rail
 
 // ─── Radio ────────────────────────────────────────────────────────────────────
-// RF4463PRO-433 (NiceRF) uses a 26 MHz crystal — confirmed from module specs.
+// RF4463PRO-433 / Si4463 crystal frequency used by POWER_UP and PLL math.
+// NiceRF material confirms a 10 ppm crystal but is inconsistent/sparse on the
+// frequency; 30 MHz matches Silicon Labs reference configs and the SDR marker.
 // GPIO2 = RXEN, GPIO3 = TXEN (antenna TX/RX switch internal to module).
 // RF4463PRO SDN is active-high shutdown; hardware must hold it low for SPI.
-#define RADIO_XTAL_HZ       26000000UL
+#define RADIO_XTAL_HZ       30000000UL
 #define RADIO_FREQ_HZ       433920000UL  // 433.920 MHz ISM center
 
 // ─── I2C Addresses ────────────────────────────────────────────────────────────

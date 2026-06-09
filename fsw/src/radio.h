@@ -15,7 +15,11 @@ int8_t radio_status();
 // Only call this for bench testing — not part of the flight sequence.
 bool radio_test_tx();
 
-// Monitor-only bench aid: holds radio SPI output pins at DC levels long enough
-// to verify the nets with a multimeter, then checks whether SDO follows the
-// Teensy's internal pullup/pulldown while nSEL is high.
+// Bench aid: wiggle radio pins slowly so they can be checked with a DMM.
 void radio_dmm_pin_test();
+
+// Bench aid: sweep a CW marker across the likely frequency range.
+bool radio_sweep_tx();
+
+// Bench aid: blink a CW carrier on/off at a single frequency.
+bool radio_marker_tx(uint32_t freq_hz);

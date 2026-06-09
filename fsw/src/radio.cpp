@@ -9,9 +9,15 @@
 #define SI_PART_INFO     0x01
 #define SI_POWER_UP      0x02
 #define SI_FUNC_INFO     0x10
+#define SI_REQUEST_STATE 0x33
 #define SI_READ_CMD_BUFF 0x44
 
 static int8_t _status = -1;
+
+// Si4463 frequency formula for 420-480 MHz:
+//   fRF = XTAL * (INTE + FRAC / 2^19) * 2 / OUTDIV
+#define RADIO_OUTDIV            8UL
+#define RADIO_PLL_FRAC_SCALE    (1UL << 19)
 
 // ─── Low-level SPI helpers ────────────────────────────────────────────────────
 
@@ -76,6 +82,89 @@ static void radio_log_sdo_bias_test() {
     pinMode(PIN_RAD_MISO, INPUT);
     LOG_INFO("Radio SDO idle bias: pullup=%u pulldown=%u — expected 1/0 if SDO is not shorted",
              sdo_pullup, sdo_pulldown);
+}
+
+static void calc_pll(uint32_t freq_hz, uint8_t& inte, uint32_t& frac) {
+    uint32_t n_scaled = (uint32_t)(
+        (((uint64_t)freq_hz * RADIO_OUTDIV * RADIO_PLL_FRAC_SCALE) + RADIO_XTAL_HZ) /
+        (2ULL * RADIO_XTAL_HZ)
+    );
+    inte = (uint8_t)(n_scaled >> 19);
+    frac = n_scaled & (RADIO_PLL_FRAC_SCALE - 1UL);
+}
+
+static bool radio_set_frequency(uint32_t freq_hz) {
+    uint8_t inte;
+    uint32_t frac;
+    calc_pll(freq_hz, inte, frac);
+
+    const uint8_t c[] = {
+        0x11, 0x40, 0x04, 0x00,
+        inte,
+        (uint8_t)(frac >> 16),
+        (uint8_t)(frac >> 8),
+        (uint8_t)(frac)
+    };
+    LOG_INFO("Radio: PLL target=%lu Hz xtal=%lu Hz outdiv=%lu inte=0x%02X frac=0x%06lX",
+             freq_hz, RADIO_XTAL_HZ, RADIO_OUTDIV, inte, (unsigned long)frac);
+    return send_cmd(c, sizeof(c));
+}
+
+static bool radio_start_tx() {
+    const uint8_t c[] = { 0x31, 0x00, 0x00, 0x00, 0x00 };
+    return send_cmd(c, sizeof(c));
+}
+
+static bool radio_change_state_ready() {
+    const uint8_t c[] = { 0x34, 0x03 };
+    return send_cmd(c, sizeof(c));
+}
+
+static bool radio_request_state(uint8_t& state, uint8_t& channel) {
+    const uint8_t c[] = { SI_REQUEST_STATE };
+    if (!send_cmd(c, sizeof(c))) return false;
+    state = SPI1.transfer(0x00);
+    channel = SPI1.transfer(0x00);
+    return true;
+}
+
+static void radio_log_state(const char* label) {
+    uint8_t state = 0;
+    uint8_t channel = 0;
+    if (!radio_request_state(state, channel)) {
+        cs_high();
+        LOG_WARN("Radio state %s: REQUEST_STATE timeout", label);
+        return;
+    }
+    cs_high();
+
+    const char* name = "UNKNOWN";
+    if (state == 0) name = "NOCHANGE";
+    else if (state == 1) name = "SLEEP";
+    else if (state == 2) name = "SPI_ACTIVE";
+    else if (state == 3) name = "READY";
+    else if (state == 5) name = "RX";
+    else if (state == 7) name = "TX";
+
+    LOG_INFO("Radio state %s: state=%u (%s) channel=%u", label, state, name, channel);
+}
+
+static bool radio_configure_cw() {
+    // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-480 MHz, high-performance PLL.
+    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // MODEM_MOD_TYPE (0x2000): CW — pure carrier, no modulation.
+    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // GPIO_PIN_CFG (0x13): GPIO2=RX_STATE (RXEN), GPIO3=TX_STATE (TXEN).
+    // RF4463PRO routes these internal Si4463 GPIOs to its antenna switch.
+    { const uint8_t c[] = { 0x13, 0x00, 0x00, 0x21, 0x20, 0x00, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // PA_MODE..PA_TC: configure the Si4463 PA block explicitly instead of
+    // relying on post-POWER_UP defaults. PA_PWR_LVL=0x20 is still bench-moderate.
+    { const uint8_t c[] = { 0x11, 0x22, 0x04, 0x00, 0x08, 0x20, 0x00, 0x3D }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    return true;
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -237,9 +326,7 @@ void radio_dmm_pin_test() {
 // Call once from setup() under APEX_MONITOR to verify the RF chain.
 // The carrier stays on until the board is reset.
 //
-// Frequency math (OUTDIV=8 for 420-480 MHz, XTAL=26 MHz):
-//   fRF = XTAL × (INTE + FRAC/2^19) × 2 / OUTDIV
-//   433.920 MHz → INTE=66 (0x42), FRAC=396754 (0x060DD2)
+// Frequency math uses RADIO_XTAL_HZ and RADIO_FREQ_HZ above.
 bool radio_test_tx() {
     if (_status < 0) {
         LOG_ERROR("Radio: test TX skipped — chip not verified (run radio_init first)");
@@ -248,27 +335,87 @@ bool radio_test_tx() {
 
     SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
 
-    // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-480 MHz, high-performance PLL
-    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
-
-    // FREQ_CONTROL (0x4000-0x4003): 433.920 MHz with 26 MHz XTAL → INTE=0x42, FRAC=0x060DD2
-    { const uint8_t c[] = { 0x11, 0x40, 0x04, 0x00, 0x42, 0x06, 0x0D, 0xD2 }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
-
-    // MODEM_MOD_TYPE (0x2000): CW — pure carrier, no modulation
-    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
-
-    // GPIO_PIN_CFG (0x13): GPIO2=RX_STATE (RXEN), GPIO3=TX_STATE (TXEN)
-    // RF4463PRO antenna switch requires these to be driven or PA output is blocked.
-    { const uint8_t c[] = { 0x13, 0x00, 0x00, 0x12, 0x11, 0x00, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
-
-    // PA_PWR_LVL (0x2201): 0x08 ≈ 5 dBm — safe for bench, SDR will hear it at 1 m
-    { const uint8_t c[] = { 0x11, 0x22, 0x01, 0x01, 0x08 }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
-
-    // START_TX: channel 0, start immediately, tx_len=0 (CW stays on until reset)
-    { const uint8_t c[] = { 0x31, 0x00, 0x00, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) { cs_high(); SPI1.endTransaction(); return false; } cs_high(); }
+    if (!radio_configure_cw()) { cs_high(); SPI1.endTransaction(); return false; }
+    if (!radio_set_frequency(RADIO_FREQ_HZ)) { cs_high(); SPI1.endTransaction(); return false; }
+    cs_high();
+    if (!radio_start_tx()) { cs_high(); SPI1.endTransaction(); return false; }
+    cs_high();
+    radio_log_state("test after START_TX");
 
     SPI1.endTransaction();
     LOG_INFO("Radio: CW carrier ON at %lu Hz — tune SDR to %.3f MHz",
              RADIO_FREQ_HZ, RADIO_FREQ_HZ / 1e6f);
+    return true;
+}
+
+bool radio_sweep_tx() {
+    const uint32_t freqs[] = {
+        420400000UL,
+        430000000UL,
+        433920000UL,
+        440000000UL,
+        450000000UL,
+    };
+
+    if (_status < 0) {
+        LOG_ERROR("Radio: sweep skipped — chip not verified (run radio_init first)");
+        return false;
+    }
+
+    for (uint8_t i = 0; i < sizeof(freqs) / sizeof(freqs[0]); i++) {
+        LOG_INFO("Radio sweep: marker %u/%u", i + 1, (unsigned)(sizeof(freqs) / sizeof(freqs[0])));
+        if (!radio_marker_tx(freqs[i])) return false;
+        delay(500);
+    }
+    LOG_INFO("Radio sweep: done");
+    return true;
+}
+
+bool radio_marker_tx(uint32_t freq_hz) {
+    if (_status < 0) {
+        LOG_ERROR("Radio: marker skipped — chip not verified (run radio_init first)");
+        return false;
+    }
+
+    SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+
+    if (!radio_configure_cw()) {
+        cs_high();
+        SPI1.endTransaction();
+        return false;
+    }
+    if (!radio_set_frequency(freq_hz)) {
+        cs_high();
+        SPI1.endTransaction();
+        return false;
+    }
+    cs_high();
+
+    LOG_INFO("Radio marker: %.3f MHz, 1s ON / 1s OFF, 5 cycles",
+             freq_hz / 1e6f);
+
+    for (uint8_t i = 1; i <= 5; i++) {
+        if (!radio_start_tx()) {
+            cs_high();
+            SPI1.endTransaction();
+            return false;
+        }
+        cs_high();
+        radio_log_state("marker after START_TX");
+        LOG_INFO("Radio marker: ON %u/5", i);
+        delay(1000);
+
+        if (!radio_change_state_ready()) {
+            cs_high();
+            SPI1.endTransaction();
+            return false;
+        }
+        cs_high();
+        LOG_INFO("Radio marker: OFF %u/5", i);
+        delay(1000);
+    }
+
+    SPI1.endTransaction();
+    LOG_INFO("Radio marker: done");
     return true;
 }

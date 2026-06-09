@@ -160,8 +160,9 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 **Interface:** SPI1 — MOSI=26, MISO=1, SCK=27, CS=PIN_RAD_CS(0)  
 **Pins:** RAD_INT1=2 (nIRQ), RAD_GPIO0=5, RAD_GPIO1=4  
 **SDN:** RF4463PRO SDN is active-high shutdown. It must be held low for SPI access.  
+**Crystal:** Firmware uses 30 MHz. NiceRF confirms 10 ppm but the public module page is sparse on frequency; verify against the can marking or WDS/vendor sample.  
 **Note:** Transmit-only downlink. **No antenna — do not enable TX PA.** SPI register reads are safe.  
-**Config:** Si4463 requires a WDS-generated `radio_config.h` init array. Do not hand-edit registers.
+**Config:** Si4463 normally uses a WDS-generated `radio_config.h` init array. Keep any hand-written command subset small and documented.
 
 ```cpp
 // No turnkey Arduino library — Si4463 is configured via a WDS-generated
@@ -170,8 +171,12 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 // 1. After POR/shutdown release, send POWER_UP and wait for CTS.
 // 2. Poll READ_CMD_BUFF (0x44) for CTS after every SPI command before
 //    sending the next one. Missing CTS polling silently drops commands.
-// 3. Do not call SET_TX_POWER or START_TX without an antenna connected.
-// 4. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
+// 3. RF4463PRO uses Si4463 GPIO2/GPIO3 for the internal antenna switch:
+//    GPIO2=RX_STATE (0x21), GPIO3=TX_STATE (0x20).
+// 4. Do not call SET_TX_POWER or START_TX without an antenna connected.
+// 5. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
+// 6. Bench marker commands in monitor builds:
+//    RADIO_MARKER = 433.920 MHz, RADIO_MARKER_420 = 420.400 MHz.
 
 // Safe bench test — read chip part info (no TX involved):
 //   Send POWER_UP, wait CTS, then send 0x01 (PART_INFO command)

@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea,
     QFrame, QPlainTextEdit, QTextEdit, QSizePolicy, QGridLayout, QGroupBox,
-    QSpinBox, QCheckBox, QLineEdit,
+    QSpinBox, QCheckBox, QLineEdit, QCompleter,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
 from PyQt5.QtGui import QFont, QColor
@@ -65,6 +65,16 @@ PHASE_COLORS = {
 MAX_POINTS   = 6000   # rolling buffer depth per series (~60s at 100 Hz)
 PLOT_UPDATE_HZ = 25   # UI repaint rate
 DEFAULT_WINDOW_S = 30
+
+KNOWN_COMMANDS = [
+    "ARM",
+    "DISARM",
+    "RADIO_DMM",
+    "RADIO_MARKER",
+    "RADIO_MARKER_433",
+    "RADIO_MARKER_420",
+    "RADIO_SWEEP",
+]
 
 # ─── Serial worker ────────────────────────────────────────────────────────────
 
@@ -156,6 +166,89 @@ class PlotWidget(pg.PlotWidget):
     """PlotWidget that ignores wheel events so the parent QScrollArea can scroll."""
     def wheelEvent(self, ev):
         ev.ignore()
+
+
+class CommandInput(QLineEdit):
+    """Line edit with terminal-style command history and Tab completion."""
+    def __init__(self, commands: list[str], parent=None):
+        super().__init__(parent)
+        self._commands = sorted(commands)
+        self._history: list[str] = []
+        self._history_index: int | None = None
+        self._draft = ""
+
+        completer = QCompleter(self._commands, self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.setCompleter(completer)
+
+    def remember(self, command: str):
+        command = command.strip()
+        if not command:
+            return
+        if self._history and self._history[-1] == command:
+            self._history_index = None
+            return
+        self._history.append(command)
+        if len(self._history) > 100:
+            self._history = self._history[-100:]
+        self._history_index = None
+
+    def keyPressEvent(self, ev):
+        key = ev.key()
+
+        if key == Qt.Key_Up:
+            self._show_history(-1)
+            return
+        if key == Qt.Key_Down:
+            self._show_history(1)
+            return
+        if key == Qt.Key_Tab:
+            self._complete_inline()
+            return
+
+        self._history_index = None
+        super().keyPressEvent(ev)
+
+    def _show_history(self, step: int):
+        if not self._history:
+            return
+
+        if self._history_index is None:
+            self._draft = self.text()
+            self._history_index = len(self._history)
+
+        self._history_index += step
+        if self._history_index < 0:
+            self._history_index = 0
+        if self._history_index > len(self._history):
+            self._history_index = len(self._history)
+
+        if self._history_index == len(self._history):
+            self.setText(self._draft)
+        else:
+            self.setText(self._history[self._history_index])
+        self.setCursorPosition(len(self.text()))
+
+    def _complete_inline(self):
+        prefix = self.text().strip().upper()
+        if not prefix:
+            return
+
+        matches = [cmd for cmd in self._commands if cmd.startswith(prefix)]
+        if len(matches) == 1:
+            self.setText(matches[0])
+            self.setCursorPosition(len(matches[0]))
+        elif len(matches) > 1:
+            common = matches[0]
+            for match in matches[1:]:
+                while not match.startswith(common):
+                    common = common[:-1]
+            if len(common) > len(prefix):
+                self.setText(common)
+                self.setCursorPosition(len(common))
+            self.completer().setCompletionPrefix(prefix)
+            self.completer().complete()
 
 
 # ─── Plot group widget ────────────────────────────────────────────────────────
@@ -590,8 +683,8 @@ class MainWindow(QMainWindow):
         # Command input row
         cmd_row = QHBoxLayout()
         cmd_row.setSpacing(4)
-        self.cmd_input = QLineEdit()
-        self.cmd_input.setPlaceholderText("Command (e.g. ARM) — Enter to send")
+        self.cmd_input = CommandInput(KNOWN_COMMANDS)
+        self.cmd_input.setPlaceholderText("Command (Tab completes, Up/Down history)")
         self.cmd_input.setFont(QFont("Courier", 8))
         self.cmd_input.setStyleSheet(
             "background:#0a0a14; color:#ccffcc; border:1px solid #334433;"
@@ -674,6 +767,7 @@ class MainWindow(QMainWindow):
             return
         self._worker.send_bytes(text.encode() + b"\n")
         self._log(f"[TX] {text}")
+        self.cmd_input.remember(text)
         self.cmd_input.clear()
 
     # ── Data routing ──────────────────────────────────────────────────────────

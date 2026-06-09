@@ -88,10 +88,6 @@ void setup() {
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
 
-#ifdef APEX_MONITOR
-    radio_test_tx();
-#endif
-
     _timer_fusion.begin(timer_fusion_cb, 1000000 / RATE_FUSION_HZ);
     _timer_baro.begin(timer_baro_cb,     1000000 / RATE_BARO_HZ);
     _timer_mag.begin(timer_mag_cb,       1000000 / RATE_MAG_HZ);
@@ -234,6 +230,13 @@ void loop() {
                 LOG_INFO("CMD: %s", _cmd_buf);
                 if (strcmp(_cmd_buf, "RADIO_DMM") == 0) {
                     radio_dmm_pin_test();
+                } else if (strcmp(_cmd_buf, "RADIO_SWEEP") == 0) {
+                    radio_sweep_tx();
+                } else if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
+                           strcmp(_cmd_buf, "RADIO_MARKER_433") == 0) {
+                    radio_marker_tx(RADIO_FREQ_HZ);
+                } else if (strcmp(_cmd_buf, "RADIO_MARKER_420") == 0) {
+                    radio_marker_tx(420400000UL);
                 }
                 // TODO Phase 1: dispatch ARM / DISARM here
                 _cmd_len = 0;
