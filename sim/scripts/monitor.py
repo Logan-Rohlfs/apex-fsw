@@ -69,11 +69,9 @@ DEFAULT_WINDOW_S = 30
 KNOWN_COMMANDS = [
     "ARM",
     "DISARM",
-    "RADIO_DMM",
     "RADIO_MARKER",
     "RADIO_MARKER_433",
     "RADIO_MARKER_420",
-    "RADIO_SWEEP",
 ]
 
 # ─── Serial worker ────────────────────────────────────────────────────────────

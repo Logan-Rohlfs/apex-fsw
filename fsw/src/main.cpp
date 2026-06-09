@@ -228,11 +228,7 @@ void loop() {
             if (_cmd_len > 0) {
                 _cmd_buf[_cmd_len] = '\0';
                 LOG_INFO("CMD: %s", _cmd_buf);
-                if (strcmp(_cmd_buf, "RADIO_DMM") == 0) {
-                    radio_dmm_pin_test();
-                } else if (strcmp(_cmd_buf, "RADIO_SWEEP") == 0) {
-                    radio_sweep_tx();
-                } else if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
+                if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
                            strcmp(_cmd_buf, "RADIO_MARKER_433") == 0) {
                     radio_marker_tx(RADIO_FREQ_HZ);
                 } else if (strcmp(_cmd_buf, "RADIO_MARKER_420") == 0) {

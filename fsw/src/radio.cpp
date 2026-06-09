@@ -9,7 +9,6 @@
 #define SI_PART_INFO     0x01
 #define SI_POWER_UP      0x02
 #define SI_FUNC_INFO     0x10
-#define SI_REQUEST_STATE 0x33
 #define SI_READ_CMD_BUFF 0x44
 
 static int8_t _status = -1;
@@ -69,19 +68,15 @@ static bool power_up() {
     return send_cmd(cmd, sizeof(cmd), 100);
 }
 
-static void radio_log_sdo_bias_test() {
+static void radio_condition_sdo_pad() {
     cs_high();
     pinMode(PIN_RAD_MISO, INPUT_PULLUP);
     delay(5);
-    uint8_t sdo_pullup = digitalRead(PIN_RAD_MISO);
 
     pinMode(PIN_RAD_MISO, INPUT_PULLDOWN);
     delay(5);
-    uint8_t sdo_pulldown = digitalRead(PIN_RAD_MISO);
 
     pinMode(PIN_RAD_MISO, INPUT);
-    LOG_INFO("Radio SDO idle bias: pullup=%u pulldown=%u — expected 1/0 if SDO is not shorted",
-             sdo_pullup, sdo_pulldown);
 }
 
 static void calc_pll(uint32_t freq_hz, uint8_t& inte, uint32_t& frac) {
@@ -120,35 +115,6 @@ static bool radio_change_state_ready() {
     return send_cmd(c, sizeof(c));
 }
 
-static bool radio_request_state(uint8_t& state, uint8_t& channel) {
-    const uint8_t c[] = { SI_REQUEST_STATE };
-    if (!send_cmd(c, sizeof(c))) return false;
-    state = SPI1.transfer(0x00);
-    channel = SPI1.transfer(0x00);
-    return true;
-}
-
-static void radio_log_state(const char* label) {
-    uint8_t state = 0;
-    uint8_t channel = 0;
-    if (!radio_request_state(state, channel)) {
-        cs_high();
-        LOG_WARN("Radio state %s: REQUEST_STATE timeout", label);
-        return;
-    }
-    cs_high();
-
-    const char* name = "UNKNOWN";
-    if (state == 0) name = "NOCHANGE";
-    else if (state == 1) name = "SLEEP";
-    else if (state == 2) name = "SPI_ACTIVE";
-    else if (state == 3) name = "READY";
-    else if (state == 5) name = "RX";
-    else if (state == 7) name = "TX";
-
-    LOG_INFO("Radio state %s: state=%u (%s) channel=%u", label, state, name, channel);
-}
-
 static bool radio_configure_cw() {
     // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-480 MHz, high-performance PLL.
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
@@ -176,9 +142,10 @@ bool radio_init() {
     pinMode(PIN_RAD_GPIO1, INPUT);
     digitalWrite(PIN_RAD_CS, HIGH);
 
-#ifdef APEX_MONITOR
-    radio_log_sdo_bias_test();
-#endif
+    // RF4463PRO SDO/MISO can power up in a bad bus state on this board unless
+    // the Teensy pad is biased before SPI1 takes ownership. This was confirmed
+    // by removing the sequence and seeing POWER_UP CTS fail with raw=0x00.
+    radio_condition_sdo_pad();
 
     SPI1.setMOSI(PIN_RAD_MOSI);
     SPI1.setMISO(PIN_RAD_MISO);
@@ -271,106 +238,6 @@ int8_t radio_status() {
     return _status;
 }
 
-void radio_dmm_pin_test() {
-    SPI1.end();
-
-    pinMode(PIN_RAD_MISO, INPUT);
-    pinMode(PIN_RAD_INT1, INPUT);
-    pinMode(PIN_RAD_GPIO0, INPUT);
-    pinMode(PIN_RAD_GPIO1, INPUT);
-    pinMode(PIN_RAD_CS, OUTPUT);
-    pinMode(PIN_RAD_MOSI, OUTPUT);
-    pinMode(PIN_RAD_SCK, OUTPUT);
-
-    digitalWrite(PIN_RAD_CS, HIGH);
-    digitalWrite(PIN_RAD_MOSI, LOW);
-    digitalWrite(PIN_RAD_SCK, LOW);
-
-    LOG_INFO("Radio DMM: measure RF4463PRO nSEL pin 9 now — HIGH for 3s");
-    digitalWrite(PIN_RAD_CS, HIGH);
-    delay(3000);
-    LOG_INFO("Radio DMM: measure RF4463PRO nSEL pin 9 now — LOW for 3s");
-    digitalWrite(PIN_RAD_CS, LOW);
-    delay(3000);
-    digitalWrite(PIN_RAD_CS, HIGH);
-
-    LOG_INFO("Radio DMM: measure RF4463PRO SDI pin 7 now — HIGH for 3s");
-    digitalWrite(PIN_RAD_MOSI, HIGH);
-    delay(3000);
-    LOG_INFO("Radio DMM: measure RF4463PRO SDI pin 7 now — LOW for 3s");
-    digitalWrite(PIN_RAD_MOSI, LOW);
-    delay(3000);
-
-    LOG_INFO("Radio DMM: measure RF4463PRO SCLK pin 8 now — HIGH for 3s");
-    digitalWrite(PIN_RAD_SCK, HIGH);
-    delay(3000);
-    LOG_INFO("Radio DMM: measure RF4463PRO SCLK pin 8 now — LOW for 3s");
-    digitalWrite(PIN_RAD_SCK, LOW);
-    delay(3000);
-
-    LOG_INFO("Radio DMM: nIRQ=%u GPIO0=%u GPIO1=%u",
-             digitalRead(PIN_RAD_INT1),
-             digitalRead(PIN_RAD_GPIO0),
-             digitalRead(PIN_RAD_GPIO1));
-    radio_log_sdo_bias_test();
-
-    SPI1.setMOSI(PIN_RAD_MOSI);
-    SPI1.setMISO(PIN_RAD_MISO);
-    SPI1.setSCK(PIN_RAD_SCK);
-    SPI1.begin();
-    LOG_INFO("Radio DMM: done");
-}
-
-// ─── Test TX ──────────────────────────────────────────────────────────────────
-// Configures a CW carrier at RADIO_FREQ_HZ and starts TX.
-// Call once from setup() under APEX_MONITOR to verify the RF chain.
-// The carrier stays on until the board is reset.
-//
-// Frequency math uses RADIO_XTAL_HZ and RADIO_FREQ_HZ above.
-bool radio_test_tx() {
-    if (_status < 0) {
-        LOG_ERROR("Radio: test TX skipped — chip not verified (run radio_init first)");
-        return false;
-    }
-
-    SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-
-    if (!radio_configure_cw()) { cs_high(); SPI1.endTransaction(); return false; }
-    if (!radio_set_frequency(RADIO_FREQ_HZ)) { cs_high(); SPI1.endTransaction(); return false; }
-    cs_high();
-    if (!radio_start_tx()) { cs_high(); SPI1.endTransaction(); return false; }
-    cs_high();
-    radio_log_state("test after START_TX");
-
-    SPI1.endTransaction();
-    LOG_INFO("Radio: CW carrier ON at %lu Hz — tune SDR to %.3f MHz",
-             RADIO_FREQ_HZ, RADIO_FREQ_HZ / 1e6f);
-    return true;
-}
-
-bool radio_sweep_tx() {
-    const uint32_t freqs[] = {
-        420400000UL,
-        430000000UL,
-        433920000UL,
-        440000000UL,
-        450000000UL,
-    };
-
-    if (_status < 0) {
-        LOG_ERROR("Radio: sweep skipped — chip not verified (run radio_init first)");
-        return false;
-    }
-
-    for (uint8_t i = 0; i < sizeof(freqs) / sizeof(freqs[0]); i++) {
-        LOG_INFO("Radio sweep: marker %u/%u", i + 1, (unsigned)(sizeof(freqs) / sizeof(freqs[0])));
-        if (!radio_marker_tx(freqs[i])) return false;
-        delay(500);
-    }
-    LOG_INFO("Radio sweep: done");
-    return true;
-}
-
 bool radio_marker_tx(uint32_t freq_hz) {
     if (_status < 0) {
         LOG_ERROR("Radio: marker skipped — chip not verified (run radio_init first)");
@@ -401,7 +268,6 @@ bool radio_marker_tx(uint32_t freq_hz) {
             return false;
         }
         cs_high();
-        radio_log_state("marker after START_TX");
         LOG_INFO("Radio marker: ON %u/5", i);
         delay(1000);
 
