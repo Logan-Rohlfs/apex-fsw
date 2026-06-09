@@ -17,6 +17,8 @@ Run: python scripts/monitor.py
 
 import sys
 import time
+import shutil
+import subprocess
 from collections import deque
 
 import numpy as np
@@ -28,10 +30,21 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea,
     QFrame, QPlainTextEdit, QTextEdit, QSizePolicy, QGridLayout, QGroupBox,
-    QSpinBox, QCheckBox, QLineEdit, QCompleter,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QCompleter,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
 from PyQt5.QtGui import QFont, QColor
+
+from radio_ook_rx import (
+    DEFAULT_BIT_MS,
+    DEFAULT_FREQ_HZ,
+    DEFAULT_PAYLOAD_LEN,
+    DEFAULT_SAMPLE_RATE_HZ,
+    envelope_bins,
+    find_best_frame,
+    is_valid_frame,
+    load_u8_iq,
+)
 
 # ─── Plot group definitions ───────────────────────────────────────────────────
 # (group_title, [keys...], [hex_colors...])
@@ -69,9 +82,9 @@ DEFAULT_WINDOW_S = 30
 KNOWN_COMMANDS = [
     "ARM",
     "DISARM",
+    "RADIO_DATA_TEST",
     "RADIO_MARKER",
-    "RADIO_MARKER_433",
-    "RADIO_MARKER_420",
+    "RADIO_MARKER_441",
 ]
 
 # ─── Serial worker ────────────────────────────────────────────────────────────
@@ -156,6 +169,155 @@ class SerialWorker(QThread):
 
     def stop(self):
         self._running = False
+        self.wait(3000)
+
+
+class RadioWorker(QThread):
+    line_received  = pyqtSignal(str)
+    status_changed = pyqtSignal(str, bool)
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._proc: subprocess.Popen | None = None
+        self._freq_hz = DEFAULT_FREQ_HZ
+        self._sample_rate = DEFAULT_SAMPLE_RATE_HZ
+        self._gain = "10"
+        self._ppm = 0
+        self._device = "0"
+        self._packet_count = 0
+        self._last_payload: bytes | None = None
+        self._last_emit_s = 0.0
+
+    def configure(self, freq_hz: int, sample_rate: int, gain: str, ppm: int, device: str):
+        self._freq_hz = freq_hz
+        self._sample_rate = sample_rate
+        self._gain = gain.strip() or "auto"
+        self._ppm = ppm
+        self._device = device.strip() or "0"
+
+    def run(self):
+        rtl_sdr = shutil.which("rtl_sdr")
+        if rtl_sdr is None:
+            self.status_changed.emit("rtl_sdr not found — install rtl-sdr or check PATH", True)
+            return
+
+        cmd = [
+            rtl_sdr,
+            "-d", self._device,
+            "-f", str(self._freq_hz),
+            "-s", str(self._sample_rate),
+            "-p", str(self._ppm),
+            "-",
+        ]
+        if self._gain.lower() != "auto":
+            cmd[1:1] = ["-g", self._gain]
+
+        self._running = True
+        self._packet_count = 0
+        self._last_payload = None
+        self._last_emit_s = 0.0
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            self.status_changed.emit(f"Failed to start rtl_sdr: {exc}", True)
+            self._running = False
+            return
+
+        self.status_changed.emit(
+            f"RTL-SDR RX {self._freq_hz / 1e6:.3f} MHz @ {self._sample_rate} S/s gain={self._gain}",
+            False,
+        )
+        self.line_received.emit("#INFO: radio rx waiting for RADIO_DATA_TEST frame")
+
+        raw = bytearray()
+        max_bytes = int(self._sample_rate * 2 * 14)  # unsigned 8-bit IQ, ~14 s rolling window
+        min_bytes = int(self._sample_rate * 2 * 11)  # one 10 s OOK frame plus margin
+        read_size = 131072
+        last_decode_s = 0.0
+
+        try:
+            while self._running:
+                if self._proc.stdout is None:
+                    break
+                chunk = self._proc.stdout.read(read_size)
+                if not chunk:
+                    if self._proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+
+                raw.extend(chunk)
+                if len(raw) > max_bytes:
+                    del raw[:len(raw) - max_bytes]
+
+                now = time.monotonic()
+                if len(raw) >= min_bytes and now - last_decode_s >= 0.75:
+                    last_decode_s = now
+                    self._try_decode(bytes(raw), now)
+        finally:
+            self._terminate_proc()
+            self._running = False
+
+    def _try_decode(self, raw: bytes, now_s: float):
+        try:
+            samples = load_u8_iq(raw)
+            values = envelope_bins(samples, self._sample_rate)
+            samples_per_bit = max(1, int(round(DEFAULT_BIT_MS)))
+            result = find_best_frame(values, samples_per_bit, DEFAULT_PAYLOAD_LEN)
+        except Exception as exc:
+            self.line_received.emit(f"#WARN: radio rx decode error: {exc}")
+            return
+
+        if result is None:
+            return
+
+        if not is_valid_frame(result):
+            return
+
+        if result.payload == self._last_payload and now_s - self._last_emit_s < 8.0:
+            return
+
+        self._last_payload = result.payload
+        self._last_emit_s = now_s
+        self._packet_count += 1
+
+        try:
+            text = result.payload.decode("ascii")
+        except UnicodeDecodeError:
+            text = result.payload.hex(" ")
+
+        level = "INFO" if result.checksum_ok else "WARN"
+        status = "OK" if result.checksum_ok else "BAD"
+        self.line_received.emit(
+            f"#{level}: radio packet #{self._packet_count} payload=\"{text}\" "
+            f"checksum={status} preamble_errors={result.errors}"
+        )
+        self.line_received.emit(">radio_payload_seen:1")
+        self.line_received.emit(f">radio_packet_count:{self._packet_count}")
+        self.line_received.emit(f"!radio_rx:{1 if result.checksum_ok else -1}")
+
+    def _terminate_proc(self):
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1.0)
+
+    def stop(self):
+        self._running = False
+        self._terminate_proc()
         self.wait(3000)
 
 # ─── Plot widget — passes wheel events up so the scroll area scrolls ─────────
@@ -515,7 +677,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self._apply_dark_theme()
 
-        self._worker  = SerialWorker()
+        self._worker = SerialWorker()
+        self._radio_worker = RadioWorker()
         self._t_start = None
         self._window_s = DEFAULT_WINDOW_S
 
@@ -561,25 +724,79 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(6)
 
+        # Source selector
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("USB Serial", "serial")
+        self.source_combo.addItem("RTL-SDR Radio", "radio")
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        layout.addWidget(QLabel("Source:"))
+        layout.addWidget(self.source_combo)
+
+        layout.addSpacing(8)
+
         # Port selector
+        self.port_label = QLabel("Port:")
         self.port_combo = QComboBox()
         self.port_combo.setMinimumWidth(160)
         self._refresh_ports()
-        layout.addWidget(QLabel("Port:"))
+        layout.addWidget(self.port_label)
         layout.addWidget(self.port_combo)
 
-        refresh_btn = QPushButton("⟳")
-        refresh_btn.setFixedWidth(28)
-        refresh_btn.clicked.connect(self._refresh_ports)
-        layout.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton("⟳")
+        self.refresh_btn.setFixedWidth(28)
+        self.refresh_btn.clicked.connect(self._refresh_ports)
+        layout.addWidget(self.refresh_btn)
 
         # Baud selector
+        self.baud_label = QLabel("Baud:")
         self.baud_combo = QComboBox()
         for b in ["9600", "57600", "115200", "230400", "460800", "921600"]:
             self.baud_combo.addItem(b)
         self.baud_combo.setCurrentText("921600")
-        layout.addWidget(QLabel("Baud:"))
+        layout.addWidget(self.baud_label)
         layout.addWidget(self.baud_combo)
+
+        # RTL-SDR controls
+        self.radio_freq_label = QLabel("Freq:")
+        self.radio_freq_spin = QDoubleSpinBox()
+        self.radio_freq_spin.setRange(100.0, 1000.0)
+        self.radio_freq_spin.setDecimals(3)
+        self.radio_freq_spin.setSingleStep(0.001)
+        self.radio_freq_spin.setValue(DEFAULT_FREQ_HZ / 1e6)
+        self.radio_freq_spin.setSuffix(" MHz")
+        self.radio_freq_spin.setFixedWidth(104)
+        layout.addWidget(self.radio_freq_label)
+        layout.addWidget(self.radio_freq_spin)
+
+        self.radio_gain_label = QLabel("Gain:")
+        self.radio_gain_input = QLineEdit("10")
+        self.radio_gain_input.setFixedWidth(46)
+        self.radio_gain_input.setToolTip('RTL gain in dB, or "auto"')
+        layout.addWidget(self.radio_gain_label)
+        layout.addWidget(self.radio_gain_input)
+
+        self.radio_ppm_label = QLabel("PPM:")
+        self.radio_ppm_spin = QSpinBox()
+        self.radio_ppm_spin.setRange(-200, 200)
+        self.radio_ppm_spin.setValue(0)
+        self.radio_ppm_spin.setFixedWidth(62)
+        layout.addWidget(self.radio_ppm_label)
+        layout.addWidget(self.radio_ppm_spin)
+
+        self.radio_rate_label = QLabel("Rate:")
+        self.radio_rate_spin = QSpinBox()
+        self.radio_rate_spin.setRange(48000, 2400000)
+        self.radio_rate_spin.setSingleStep(48000)
+        self.radio_rate_spin.setValue(DEFAULT_SAMPLE_RATE_HZ)
+        self.radio_rate_spin.setFixedWidth(92)
+        layout.addWidget(self.radio_rate_label)
+        layout.addWidget(self.radio_rate_spin)
+
+        self.radio_device_label = QLabel("Dev:")
+        self.radio_device_input = QLineEdit("0")
+        self.radio_device_input.setFixedWidth(36)
+        layout.addWidget(self.radio_device_label)
+        layout.addWidget(self.radio_device_input)
 
         layout.addSpacing(12)
 
@@ -615,6 +832,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Not connected")
         layout.addWidget(self.status_label)
 
+        self._on_source_changed()
         return bar
 
     def _build_plot_panel(self) -> QScrollArea:
@@ -705,9 +923,40 @@ class MainWindow(QMainWindow):
         self._worker.line_received.connect(self._on_line)
         self._worker.status_changed.connect(self._on_status)
         self._worker.reconnected.connect(self._on_reconnect)
+        self._radio_worker.line_received.connect(self._on_line)
+        self._radio_worker.status_changed.connect(self._on_status)
+        self._radio_worker.finished.connect(self._on_worker_finished)
         self.state_panel.copy_requested.connect(self._copy_to_clipboard)
 
     # ── Serial control ────────────────────────────────────────────────────────
+
+    def _source_mode(self) -> str:
+        return self.source_combo.currentData() or "serial"
+
+    def _on_source_changed(self):
+        radio = self._source_mode() == "radio"
+        serial_widgets = [
+            self.port_label, self.port_combo, self.refresh_btn,
+            self.baud_label, self.baud_combo,
+        ]
+        radio_widgets = [
+            self.radio_freq_label, self.radio_freq_spin,
+            self.radio_gain_label, self.radio_gain_input,
+            self.radio_ppm_label, self.radio_ppm_spin,
+            self.radio_rate_label, self.radio_rate_spin,
+            self.radio_device_label, self.radio_device_input,
+        ]
+        for widget in serial_widgets:
+            widget.setVisible(not radio)
+        for widget in radio_widgets:
+            widget.setVisible(radio)
+
+        if hasattr(self, "cmd_input"):
+            self.cmd_input.setEnabled(not radio)
+            if radio:
+                self.cmd_input.setPlaceholderText("Radio RX is receive-only; send RADIO_DATA_TEST over USB")
+            else:
+                self.cmd_input.setPlaceholderText("Command (Tab completes, Up/Down history)")
 
     def _refresh_ports(self):
         self.port_combo.clear()
@@ -748,20 +997,45 @@ class MainWindow(QMainWindow):
     def _toggle_connection(self):
         if self._worker.isRunning():
             self._worker.stop()
-            self.connect_btn.setText("Connect")
-            self.connect_btn.setStyleSheet("")
+            self._set_disconnected()
+        elif self._radio_worker.isRunning():
+            self._radio_worker.stop()
+            self._set_disconnected()
         else:
-            idx  = self.port_combo.currentIndex()
-            port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
-            baud = int(self.baud_combo.currentText())
-            self._worker.configure(port, baud)
-            self._worker.start()
+            if self._source_mode() == "radio":
+                freq_hz = int(round(self.radio_freq_spin.value() * 1e6))
+                sample_rate = int(self.radio_rate_spin.value())
+                gain = self.radio_gain_input.text().strip() or "auto"
+                ppm = int(self.radio_ppm_spin.value())
+                device = self.radio_device_input.text().strip() or "0"
+                self._radio_worker.configure(freq_hz, sample_rate, gain, ppm, device)
+                self._radio_worker.start()
+            else:
+                idx  = self.port_combo.currentIndex()
+                port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
+                baud = int(self.baud_combo.currentText())
+                self._worker.configure(port, baud)
+                self._worker.start()
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet("background:#aa2222; color:#ffffff;")
+            self.source_combo.setEnabled(False)
+
+    def _set_disconnected(self):
+        self.connect_btn.setText("Connect")
+        self.connect_btn.setStyleSheet("")
+        self.source_combo.setEnabled(True)
+
+    def _on_worker_finished(self):
+        if not self._worker.isRunning() and not self._radio_worker.isRunning():
+            self._set_disconnected()
 
     def _send_command(self):
         text = self.cmd_input.text().strip()
         if not text:
+            return
+        if self._source_mode() == "radio":
+            self._log("[monitor] Radio RX is receive-only; use USB serial to send commands")
+            self.cmd_input.clear()
             return
         self._worker.send_bytes(text.encode() + b"\n")
         self._log(f"[TX] {text}")
@@ -945,8 +1219,10 @@ class MainWindow(QMainWindow):
 
             /* Toolbar controls: inset look — darker than toolbar surface */
             QFrame#toolbar QComboBox,
-            QFrame#toolbar QSpinBox { background: #09091a; border: 1px solid #2e2e50;
-                                      color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
+            QFrame#toolbar QSpinBox,
+            QFrame#toolbar QDoubleSpinBox,
+            QFrame#toolbar QLineEdit { background: #09091a; border: 1px solid #2e2e50;
+                                       color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
             QFrame#toolbar QPushButton
                                     { background: #09091a; border: 1px solid #2e2e50;
                                       color: #aaaacc; padding: 3px 10px; border-radius: 3px; }
@@ -959,7 +1235,9 @@ class MainWindow(QMainWindow):
                                       margin-top: 6px; padding-top: 6px; color: #8888aa; }
             QGroupBox::title        { subcontrol-origin: margin; left: 8px; }
 
-            QComboBox, QSpinBox     { background: #1a1a2e; border: 1px solid #444466;
+            QComboBox, QSpinBox,
+            QDoubleSpinBox, QLineEdit
+                                    { background: #1a1a2e; border: 1px solid #444466;
                                       color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
             QPushButton             { background: #1e1e3a; border: 1px solid #444466;
                                       color: #ccccdd; padding: 3px 10px; border-radius: 3px; }
@@ -1041,6 +1319,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._worker.stop()
+        self._radio_worker.stop()
         event.accept()
 
 

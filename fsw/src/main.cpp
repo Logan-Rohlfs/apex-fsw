@@ -229,10 +229,10 @@ void loop() {
                 _cmd_buf[_cmd_len] = '\0';
                 LOG_INFO("CMD: %s", _cmd_buf);
                 if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
-                           strcmp(_cmd_buf, "RADIO_MARKER_433") == 0) {
+                           strcmp(_cmd_buf, "RADIO_MARKER_441") == 0) {
                     radio_marker_tx(RADIO_FREQ_HZ);
-                } else if (strcmp(_cmd_buf, "RADIO_MARKER_420") == 0) {
-                    radio_marker_tx(420400000UL);
+                } else if (strcmp(_cmd_buf, "RADIO_DATA_TEST") == 0) {
+                    radio_data_test_tx();
                 }
                 // TODO Phase 1: dispatch ARM / DISARM here
                 _cmd_len = 0;

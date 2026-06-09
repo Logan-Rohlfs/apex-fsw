@@ -12,3 +12,6 @@ int8_t radio_status();
 
 // Bench aid: blink a CW carrier on/off at a single frequency.
 bool radio_marker_tx(uint32_t freq_hz);
+
+// Bench aid: transmit a slow OOK-framed ASCII payload on the CW carrier.
+bool radio_data_test_tx();

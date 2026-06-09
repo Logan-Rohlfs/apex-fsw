@@ -13,10 +13,13 @@
 
 static int8_t _status = -1;
 
-// Si4463 frequency formula for 420-480 MHz:
-//   fRF = XTAL * (INTE + FRAC / 2^19) * 2 / OUTDIV
+// Si4463 frequency formula for 420-525 MHz:
+//   fRF = (INTE + FRAC / 2^19) * 2 * XTAL / OUTDIV
+// The Si4463 requires FRAC / 2^19 to be in [1, 2), so INTE is one less
+// than the integer part of the scaled PLL ratio and FRAC carries the +1.x term.
 #define RADIO_OUTDIV            8UL
 #define RADIO_PLL_FRAC_SCALE    (1UL << 19)
+#define RADIO_OOK_BIT_MS        50U
 
 // ─── Low-level SPI helpers ────────────────────────────────────────────────────
 
@@ -84,8 +87,8 @@ static void calc_pll(uint32_t freq_hz, uint8_t& inte, uint32_t& frac) {
         (((uint64_t)freq_hz * RADIO_OUTDIV * RADIO_PLL_FRAC_SCALE) + RADIO_XTAL_HZ) /
         (2ULL * RADIO_XTAL_HZ)
     );
-    inte = (uint8_t)(n_scaled >> 19);
-    frac = n_scaled & (RADIO_PLL_FRAC_SCALE - 1UL);
+    inte = (uint8_t)((n_scaled / RADIO_PLL_FRAC_SCALE) - 1UL);
+    frac = n_scaled - ((uint32_t)inte * RADIO_PLL_FRAC_SCALE);
 }
 
 static bool radio_set_frequency(uint32_t freq_hz) {
@@ -115,8 +118,27 @@ static bool radio_change_state_ready() {
     return send_cmd(c, sizeof(c));
 }
 
+static bool radio_set_carrier(bool on) {
+    bool ok = on ? radio_start_tx() : radio_change_state_ready();
+    cs_high();
+    return ok;
+}
+
+static bool radio_send_ook_bit(bool bit) {
+    if (!radio_set_carrier(bit)) return false;
+    delay(RADIO_OOK_BIT_MS);
+    return true;
+}
+
+static bool radio_send_ook_byte(uint8_t value) {
+    for (int8_t bit = 7; bit >= 0; bit--) {
+        if (!radio_send_ook_bit((value >> bit) & 0x01)) return false;
+    }
+    return true;
+}
+
 static bool radio_configure_cw() {
-    // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-480 MHz, high-performance PLL.
+    // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-525 MHz, high-performance PLL.
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
     // MODEM_MOD_TYPE (0x2000): CW — pure carrier, no modulation.
@@ -126,9 +148,9 @@ static bool radio_configure_cw() {
     // RF4463PRO routes these internal Si4463 GPIOs to its antenna switch.
     { const uint8_t c[] = { 0x13, 0x00, 0x00, 0x21, 0x20, 0x00, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
-    // PA_MODE..PA_TC: configure the Si4463 PA block explicitly instead of
-    // relying on post-POWER_UP defaults. PA_PWR_LVL=0x20 is still bench-moderate.
-    { const uint8_t c[] = { 0x11, 0x22, 0x04, 0x00, 0x08, 0x20, 0x00, 0x3D }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+    // PA_MODE..PA_TC: configure the Si4463 PA block explicitly. Keep marker
+    // power low on the bench so a nearby RTL-SDR does not overload.
+    { const uint8_t c[] = { 0x11, 0x22, 0x04, 0x00, 0x08, RADIO_MARKER_PA_PWR, 0x00, 0x3D }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
     return true;
 }
@@ -258,8 +280,8 @@ bool radio_marker_tx(uint32_t freq_hz) {
     }
     cs_high();
 
-    LOG_INFO("Radio marker: %.3f MHz, 1s ON / 1s OFF, 5 cycles",
-             freq_hz / 1e6f);
+    LOG_INFO("Radio marker: %.3f MHz, PA=0x%02X, 1s ON / 1s OFF, 5 cycles",
+             freq_hz / 1e6f, RADIO_MARKER_PA_PWR);
 
     for (uint8_t i = 1; i <= 5; i++) {
         if (!radio_start_tx()) {
@@ -284,4 +306,59 @@ bool radio_marker_tx(uint32_t freq_hz) {
     SPI1.endTransaction();
     LOG_INFO("Radio marker: done");
     return true;
+}
+
+bool radio_data_test_tx() {
+    static const char payload[] = "APEX RADIO TEST";
+
+    if (_status < 0) {
+        LOG_ERROR("Radio: data test skipped — chip not verified (run radio_init first)");
+        return false;
+    }
+
+    SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+
+    if (!radio_configure_cw()) {
+        cs_high();
+        SPI1.endTransaction();
+        return false;
+    }
+    if (!radio_set_frequency(RADIO_FREQ_HZ)) {
+        cs_high();
+        SPI1.endTransaction();
+        return false;
+    }
+    cs_high();
+
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < sizeof(payload) - 1; i++) {
+        checksum ^= (uint8_t)payload[i];
+    }
+
+    LOG_INFO("Radio data test: %.3f MHz, PA=0x%02X, bit=%ums, payload=\"%s\", xor=0x%02X",
+             RADIO_FREQ_HZ / 1e6f, RADIO_MARKER_PA_PWR, RADIO_OOK_BIT_MS, payload, checksum);
+
+    // OOK framing for SDR envelope tests:
+    //   0x55 x 8 preamble, 0xD5 sync, ASCII payload, XOR checksum.
+    for (uint8_t i = 0; i < 8; i++) {
+        if (!radio_send_ook_byte(0x55)) goto fail;
+    }
+    if (!radio_send_ook_byte(0xD5)) goto fail;
+    for (uint8_t i = 0; i < sizeof(payload) - 1; i++) {
+        if (!radio_send_ook_byte((uint8_t)payload[i])) goto fail;
+    }
+    if (!radio_send_ook_byte(checksum)) goto fail;
+    if (!radio_set_carrier(false)) goto fail;
+
+    SPI1.endTransaction();
+    LOG_INFO("Radio data test: done");
+    return true;
+
+fail:
+    cs_high();
+    radio_change_state_ready();
+    cs_high();
+    SPI1.endTransaction();
+    LOG_ERROR("Radio data test: failed");
+    return false;
 }

@@ -42,7 +42,9 @@
 // GPIO2 = RXEN, GPIO3 = TXEN (antenna TX/RX switch internal to module).
 // RF4463PRO SDN is active-high shutdown; hardware must hold it low for SPI.
 #define RADIO_XTAL_HZ       30000000UL
-#define RADIO_FREQ_HZ       433920000UL  // 433.920 MHz ISM center
+#define RADIO_FREQ_HZ       441480000UL  // allocated center frequency: 441.480 MHz
+#define RADIO_CHANNEL_BW_HZ 125000UL     // allocated channel bandwidth: 125 kHz
+#define RADIO_MARKER_PA_PWR 0x08         // low bench marker power to avoid SDR overload
 
 // ─── I2C Addresses ────────────────────────────────────────────────────────────
 #define BMP581_ADDR         0x46    // ADR tied to GND

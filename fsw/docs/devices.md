@@ -154,13 +154,16 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 
 ---
 
-## RF4463PRO-433 — 433 MHz Telemetry Radio
+## RF4463PRO-433 — UHF Telemetry Radio
 
 **Chip:** Silicon Labs Si4463  
 **Interface:** SPI1 — MOSI=26, MISO=1, SCK=27, CS=PIN_RAD_CS(0)  
 **Pins:** RAD_INT1=2 (nIRQ), RAD_GPIO0=5, RAD_GPIO1=4  
 **SDN:** RF4463PRO SDN is active-high shutdown. It must be held low for SPI access.  
 **Crystal:** Firmware uses 30 MHz. NiceRF confirms 10 ppm but the public module page is sparse on frequency; verify against the can marking or WDS/vendor sample.  
+**Allocated channel:** 441.480 MHz center, 125 kHz bandwidth.  
+**Firmware setting:** `RADIO_FREQ_HZ` in `src/config.h` sets the RF center frequency. `RADIO_CHANNEL_BW_HZ` records the allocated bandwidth for the future packet modem configuration.  
+**Marker power:** `RADIO_MARKER_PA_PWR` keeps the CW bench marker low enough for nearby RTL-SDR inspection; raise only after range testing with proper attenuation/antenna setup.  
 **Note:** Transmit-only downlink. **No antenna — do not enable TX PA.** SPI register reads are safe.  
 **Config:** Si4463 normally uses a WDS-generated `radio_config.h` init array. Keep any hand-written command subset small and documented.
 
@@ -173,10 +176,18 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 //    sending the next one. Missing CTS polling silently drops commands.
 // 3. RF4463PRO uses Si4463 GPIO2/GPIO3 for the internal antenna switch:
 //    GPIO2=RX_STATE (0x21), GPIO3=TX_STATE (0x20).
-// 4. Do not call SET_TX_POWER or START_TX without an antenna connected.
-// 5. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
-// 6. Bench marker commands in monitor builds:
-//    RADIO_MARKER = 433.920 MHz, RADIO_MARKER_420 = 420.400 MHz.
+// 4. On this board, bias the Teensy MISO/SDO pad before SPI1 takes ownership.
+//    Without that startup conditioning, POWER_UP CTS can fail with raw=0x00.
+// 5. FREQ_CONTROL uses fRF = (INTE + FRAC/2^19) * 2 * XTAL / OUTDIV.
+//    FRAC/2^19 must be in [1, 2), so use INTE=floor(N)-1 and FRAC=(N-INTE)*2^19.
+// 6. Do not call SET_TX_POWER or START_TX without an antenna connected.
+// 7. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
+// 8. Bench commands in monitor builds:
+//    RADIO_MARKER = RADIO_FREQ_HZ (currently 441.480 MHz).
+//    RADIO_DATA_TEST = slow OOK envelope frame for RTL-SDR verification:
+//    preamble 0x55 x 8, sync 0xD5, payload "APEX RADIO TEST", XOR checksum.
+//    Decode from a laptop/ground Pi with:
+//    python sim/scripts/radio_ook_rx.py --duration 14 --gain 10
 
 // Safe bench test — read chip part info (no TX involved):
 //   Send POWER_UP, wait CTS, then send 0x01 (PART_INFO command)
