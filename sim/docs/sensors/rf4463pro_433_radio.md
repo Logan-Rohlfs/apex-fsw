@@ -35,6 +35,33 @@ The RF4463PRO is a 433 MHz SPI radio module built around the Silicon Labs Si4463
 
 ---
 
+## Downlink Modulation (bench-validated path)
+
+The test downlink uses **2-GFSK** — the Si4463's native, recommended modulation
+(cleanest spectrum; OOK was only used for early envelope tests and is retired).
+
+| Parameter | Value |
+|---|---|
+| Modulation | 2-GFSK (MSB-first, bit 1 = +deviation) |
+| Bit rate | 10 kbps |
+| Deviation | ±25 kHz (Carson BW ≈ 60 kHz, inside the 125 kHz allocation) |
+| Frame | `0xAA`×8 preamble, `0x2D 0xD4` sync, seq byte, payload, CRC-16-CCITT |
+| TX firmware | `fsw/src/radio.cpp` (`radio_data_test_tx`, TX-only modem properties) |
+| SDR decoder | `sim/scripts/radio_gfsk_rx.py` (quadrature discriminator, used by the monitor) |
+
+The Teensy side only needs the TX modem properties (mod type, data rate, NCO,
+deviation) — no WDS blob — because the receiver is an SDR. A second RF4463PRO
+ground station will need a proper WDS-generated RX config matching these
+parameters.
+
+**Bench validation (2026-06):** 10/10 frames decoded with CRC OK via RTL-SDR at
+240 kS/s. Measured carrier offset +10.4 kHz (≈24 ppm combined TX+SDR crystal
+error, stable to ~40 Hz across a burst) — well inside the ±25 kHz deviation, no
+AFC needed. Decoder quality 0.64 matched simulation, confirming the
+`MODEM_FREQ_DEV` programming.
+
+---
+
 ## HIL Simulation Notes
 
 The RF4463PRO is **not simulated** in the HIL loop — the Teensy transmits real radio packets over the real hardware during HIL testing, as it would in flight. The laptop receives telemetry on a second RF4463PRO connected to the ground station PC (or a USB SDR dongle).

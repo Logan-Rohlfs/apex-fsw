@@ -183,11 +183,12 @@ attachInterrupt(digitalPinToInterrupt(30), pps_isr, RISING);
 // 6. Do not call SET_TX_POWER or START_TX without an antenna connected.
 // 7. SPI1 on Teensy 4.1: use SPI1.begin(), pass SPI1 to your driver.
 // 8. Bench commands in monitor builds:
-//    RADIO_MARKER = RADIO_FREQ_HZ (currently 441.480 MHz).
-//    RADIO_DATA_TEST = slow OOK envelope frame for RTL-SDR verification:
-//    preamble 0x55 x 8, sync 0xD5, payload "APEX RADIO TEST", XOR checksum.
-//    Decode from a laptop/ground Pi with:
-//    python sim/scripts/radio_ook_rx.py --duration 14 --gain 10
+//    RADIO_MARKER = CW carrier at RADIO_FREQ_HZ (currently 441.480 MHz).
+//    RADIO_DATA_TEST = 10x 2-GFSK frames (10 kbps, ±25 kHz deviation):
+//    preamble 0xAA x 8, sync 0x2D 0xD4, seq byte, payload "APEX RADIO TEST",
+//    CRC-16-CCITT. Decode from a laptop/ground Pi with:
+//    python sim/scripts/radio_gfsk_rx.py --duration 4 --gain 10
+//    (or use the monitor's RTL-SDR source, which decodes live).
 
 // Safe bench test — read chip part info (no TX involved):
 //   Send POWER_UP, wait CTS, then send 0x01 (PART_INFO command)

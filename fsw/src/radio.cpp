@@ -19,7 +19,12 @@ static int8_t _status = -1;
 // than the integer part of the scaled PLL ratio and FRAC carries the +1.x term.
 #define RADIO_OUTDIV            8UL
 #define RADIO_PLL_FRAC_SCALE    (1UL << 19)
-#define RADIO_OOK_BIT_MS        50U
+
+// GFSK test frame: software-framed (preamble/sync/CRC built here, not by the
+// packet handler) so the SDR-side decoder fully defines the wire format.
+#define RADIO_GFSK_PREAMBLE_LEN 8U
+#define RADIO_GFSK_REPEATS      10U
+#define RADIO_GFSK_REPEAT_MS    100U
 
 // ─── Low-level SPI helpers ────────────────────────────────────────────────────
 
@@ -118,25 +123,6 @@ static bool radio_change_state_ready() {
     return send_cmd(c, sizeof(c));
 }
 
-static bool radio_set_carrier(bool on) {
-    bool ok = on ? radio_start_tx() : radio_change_state_ready();
-    cs_high();
-    return ok;
-}
-
-static bool radio_send_ook_bit(bool bit) {
-    if (!radio_set_carrier(bit)) return false;
-    delay(RADIO_OOK_BIT_MS);
-    return true;
-}
-
-static bool radio_send_ook_byte(uint8_t value) {
-    for (int8_t bit = 7; bit >= 0; bit--) {
-        if (!radio_send_ook_bit((value >> bit) & 0x01)) return false;
-    }
-    return true;
-}
-
 static bool radio_configure_cw() {
     // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-525 MHz, high-performance PLL.
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
@@ -153,6 +139,114 @@ static bool radio_configure_cw() {
     { const uint8_t c[] = { 0x11, 0x22, 0x04, 0x00, 0x08, RADIO_MARKER_PA_PWR, 0x00, 0x3D }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
     return true;
+}
+
+// ─── 2-GFSK packet TX ─────────────────────────────────────────────────────────
+
+static uint16_t crc16_ccitt(const uint8_t* data, uint8_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+// TX-only modem setup — the receiver is an SDR (or a second RF4463PRO with its
+// own WDS config), so none of the Si4463 RX modem properties are needed here.
+//   MODEM_DATA_RATE = bitrate * 10 with TXOSR=10x
+//   MODEM_TX_NCO_MODE = xtal frequency (TXOSR field 0 = 10x)
+//   MODEM_FREQ_DEV = (2^19 * outdiv * dev_hz) / (2 * xtal)   [peak, per datasheet]
+static bool radio_configure_gfsk(uint8_t frame_len) {
+    // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-525 MHz, high-performance PLL.
+    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // GPIO_PIN_CFG (0x13): GPIO2=RX_STATE (RXEN), GPIO3=TX_STATE (TXEN) — RF4463PRO antenna switch.
+    { const uint8_t c[] = { 0x13, 0x00, 0x00, 0x21, 0x20, 0x00, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // PA_MODE..PA_TC — bench power, same as marker.
+    { const uint8_t c[] = { 0x11, 0x22, 0x04, 0x00, 0x08, RADIO_MARKER_PA_PWR, 0x00, 0x3D }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // MODEM_MOD_TYPE (0x2000): 2GFSK, bits from the packet handler FIFO.
+    { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x00, 0x03 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // MODEM_DATA_RATE (0x2003, 3 bytes)
+    {
+        const uint32_t dr = RADIO_GFSK_BITRATE_BPS * 10UL;
+        const uint8_t c[] = { 0x11, 0x20, 0x03, 0x03,
+                              (uint8_t)(dr >> 16), (uint8_t)(dr >> 8), (uint8_t)dr };
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+
+    // MODEM_TX_NCO_MODE (0x2006, 4 bytes): TXOSR=10x, NCO = xtal.
+    {
+        const uint8_t c[] = { 0x11, 0x20, 0x04, 0x06,
+                              (uint8_t)((RADIO_XTAL_HZ >> 24) & 0x03),
+                              (uint8_t)(RADIO_XTAL_HZ >> 16),
+                              (uint8_t)(RADIO_XTAL_HZ >> 8),
+                              (uint8_t)RADIO_XTAL_HZ };
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+
+    // MODEM_FREQ_DEV (0x200A, 3 bytes)
+    {
+        const uint32_t dev = (uint32_t)(
+            ((uint64_t)RADIO_PLL_FRAC_SCALE * RADIO_OUTDIV * RADIO_GFSK_DEV_HZ + RADIO_XTAL_HZ) /
+            (2ULL * RADIO_XTAL_HZ));
+        const uint8_t c[] = { 0x11, 0x20, 0x03, 0x0A,
+                              (uint8_t)(dev >> 16), (uint8_t)(dev >> 8), (uint8_t)dev };
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+
+    // Packet handler: raw passthrough — frame bytes (preamble/sync/CRC included)
+    // come straight from the FIFO with no hardware framing added.
+    { const uint8_t c[] = { 0x11, 0x10, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // PREAMBLE_TX_LENGTH = 0
+    { const uint8_t c[] = { 0x11, 0x11, 0x01, 0x00, 0x80 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // SYNC_CONFIG: skip sync TX
+    { const uint8_t c[] = { 0x11, 0x12, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // PKT_CRC_CONFIG: none
+    {
+        const uint8_t c[] = { 0x11, 0x12, 0x02, 0x0C, 0x00, frame_len };                                              // PKT_FIELD_1_LENGTH
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+    { const uint8_t c[] = { 0x11, 0x12, 0x02, 0x0E, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); } // FIELD_1_CONFIG / FIELD_1_CRC_CONFIG
+
+    return true;
+}
+
+// Load one frame into the TX FIFO and transmit it, blocking until the chip
+// returns to READY (~frame_len * 8 / bitrate seconds; 28 bytes ≈ 22 ms).
+static bool radio_tx_frame(const uint8_t* frame, uint8_t len) {
+    // FIFO_INFO: reset TX FIFO
+    { const uint8_t c[] = { 0x15, 0x01 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
+    // WRITE_TX_FIFO
+    cs_low();
+    SPI1.transfer(0x66);
+    for (uint8_t i = 0; i < len; i++) SPI1.transfer(frame[i]);
+    cs_high();
+    if (!wait_cts()) return false;
+    cs_high();
+
+    // START_TX: channel 0, return to READY when done, TX_LEN = len
+    {
+        const uint8_t c[] = { 0x31, 0x00, 0x30, 0x00, len };
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+
+    // Poll REQUEST_DEVICE_STATE until READY (0x03)
+    const uint32_t deadline = millis() + 500;
+    while (millis() < deadline) {
+        const uint8_t c[] = { 0x33 };
+        if (!send_cmd(c, sizeof(c))) return false;
+        uint8_t state = SPI1.transfer(0x00);
+        SPI1.transfer(0x00);   // current channel — unused
+        cs_high();
+        if ((state & 0x0F) == 0x03) return true;
+        delay(2);
+    }
+    LOG_ERROR("Radio: TX did not complete (state poll timeout)");
+    return false;
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -310,6 +404,12 @@ bool radio_marker_tx(uint32_t freq_hz) {
 
 bool radio_data_test_tx() {
     static const char payload[] = "APEX RADIO TEST";
+    constexpr uint8_t payload_len = sizeof(payload) - 1;
+
+    // Frame: 0xAA preamble, 0x2D 0xD4 sync, seq byte, payload, CRC-16-CCITT
+    // over seq+payload (big-endian). Must match scripts/radio_gfsk_rx.py.
+    constexpr uint8_t frame_len = RADIO_GFSK_PREAMBLE_LEN + 2 + 1 + payload_len + 2;
+    static_assert(frame_len <= 64, "GFSK test frame must fit the TX FIFO");
 
     if (_status < 0) {
         LOG_ERROR("Radio: data test skipped — chip not verified (run radio_init first)");
@@ -318,47 +418,47 @@ bool radio_data_test_tx() {
 
     SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
 
-    if (!radio_configure_cw()) {
+    if (!radio_configure_gfsk(frame_len) || !radio_set_frequency(RADIO_FREQ_HZ)) {
         cs_high();
         SPI1.endTransaction();
-        return false;
-    }
-    if (!radio_set_frequency(RADIO_FREQ_HZ)) {
-        cs_high();
-        SPI1.endTransaction();
+        LOG_ERROR("Radio data test: GFSK config failed");
         return false;
     }
     cs_high();
 
-    uint8_t checksum = 0;
-    for (uint8_t i = 0; i < sizeof(payload) - 1; i++) {
-        checksum ^= (uint8_t)payload[i];
-    }
+    LOG_INFO("Radio data test: 2GFSK %.3f MHz, %lu bps, dev=%lu Hz, PA=0x%02X, %u frames",
+             RADIO_FREQ_HZ / 1e6f, RADIO_GFSK_BITRATE_BPS, RADIO_GFSK_DEV_HZ,
+             RADIO_MARKER_PA_PWR, RADIO_GFSK_REPEATS);
 
-    LOG_INFO("Radio data test: %.3f MHz, PA=0x%02X, bit=%ums, payload=\"%s\", xor=0x%02X",
-             RADIO_FREQ_HZ / 1e6f, RADIO_MARKER_PA_PWR, RADIO_OOK_BIT_MS, payload, checksum);
+    uint8_t frame[frame_len];
+    uint8_t* p = frame;
+    for (uint8_t i = 0; i < RADIO_GFSK_PREAMBLE_LEN; i++) *p++ = 0xAA;
+    *p++ = 0x2D;
+    *p++ = 0xD4;
+    uint8_t* body = p;            // seq + payload (CRC computed over this)
+    *p++ = 0;                     // seq — patched per frame
+    memcpy(p, payload, payload_len);
+    p += payload_len;
 
-    // OOK framing for SDR envelope tests:
-    //   0x55 x 8 preamble, 0xD5 sync, ASCII payload, XOR checksum.
-    for (uint8_t i = 0; i < 8; i++) {
-        if (!radio_send_ook_byte(0x55)) goto fail;
+    for (uint8_t seq = 1; seq <= RADIO_GFSK_REPEATS; seq++) {
+        body[0] = seq;
+        const uint16_t crc = crc16_ccitt(body, 1 + payload_len);
+        p[0] = (uint8_t)(crc >> 8);
+        p[1] = (uint8_t)crc;
+
+        if (!radio_tx_frame(frame, frame_len)) {
+            cs_high();
+            radio_change_state_ready();
+            cs_high();
+            SPI1.endTransaction();
+            LOG_ERROR("Radio data test: failed at frame %u/%u", seq, RADIO_GFSK_REPEATS);
+            return false;
+        }
+        LOG_INFO("Radio data test: frame %u/%u sent", seq, RADIO_GFSK_REPEATS);
+        delay(RADIO_GFSK_REPEAT_MS);
     }
-    if (!radio_send_ook_byte(0xD5)) goto fail;
-    for (uint8_t i = 0; i < sizeof(payload) - 1; i++) {
-        if (!radio_send_ook_byte((uint8_t)payload[i])) goto fail;
-    }
-    if (!radio_send_ook_byte(checksum)) goto fail;
-    if (!radio_set_carrier(false)) goto fail;
 
     SPI1.endTransaction();
     LOG_INFO("Radio data test: done");
     return true;
-
-fail:
-    cs_high();
-    radio_change_state_ready();
-    cs_high();
-    SPI1.endTransaction();
-    LOG_ERROR("Radio data test: failed");
-    return false;
 }

@@ -13,5 +13,7 @@ int8_t radio_status();
 // Bench aid: blink a CW carrier on/off at a single frequency.
 bool radio_marker_tx(uint32_t freq_hz);
 
-// Bench aid: transmit a slow OOK-framed ASCII payload on the CW carrier.
+// Bench aid: transmit a burst of 2-GFSK test frames (10 kbps, ±25 kHz dev).
+// Frame: 0xAA x8, sync 0x2DD4, seq, "APEX RADIO TEST", CRC-16-CCITT.
+// Decoded by sim/scripts/radio_gfsk_rx.py / the monitor's RTL-SDR source.
 bool radio_data_test_tx();

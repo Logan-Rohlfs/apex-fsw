@@ -46,6 +46,12 @@
 #define RADIO_CHANNEL_BW_HZ 125000UL     // allocated channel bandwidth: 125 kHz
 #define RADIO_MARKER_PA_PWR 0x08         // low bench marker power to avoid SDR overload
 
+// 2-GFSK downlink parameters. Carson bandwidth = 2*(dev + bitrate/2) = 60 kHz,
+// inside the 125 kHz allocation. Deviation is large vs. the ±4.4 kHz worst-case
+// crystal offset (10 ppm at 441 MHz) so the SDR can slice without AFC.
+#define RADIO_GFSK_BITRATE_BPS  10000UL
+#define RADIO_GFSK_DEV_HZ       25000UL
+
 // ─── I2C Addresses ────────────────────────────────────────────────────────────
 #define BMP581_ADDR         0x46    // ADR tied to GND
 #define ADXL375_ADDR        0x53    // SDO tied to GND

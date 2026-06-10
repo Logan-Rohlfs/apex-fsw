@@ -15,10 +15,12 @@ the state machine is implemented).
 Run: python scripts/monitor.py
 """
 
+import html
 import sys
 import time
 import shutil
 import subprocess
+import threading
 from collections import deque
 
 import numpy as np
@@ -32,19 +34,23 @@ from PyQt5.QtWidgets import (
     QFrame, QPlainTextEdit, QTextEdit, QSizePolicy, QGridLayout, QGroupBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QCompleter,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex, QRectF
 from PyQt5.QtGui import QFont, QColor
 
-from radio_ook_rx import (
-    DEFAULT_BIT_MS,
+from radio_gfsk_rx import (
+    BITRATE_BPS,
     DEFAULT_FREQ_HZ,
-    DEFAULT_PAYLOAD_LEN,
     DEFAULT_SAMPLE_RATE_HZ,
-    envelope_bins,
-    find_best_frame,
-    is_valid_frame,
+    DEVIATION_HZ,
+    find_frames,
     load_u8_iq,
 )
+
+# Expected flight-computer TX channel (matches fsw RADIO_FREQ_HZ / GFSK params).
+# Drawn as an overlay so RADIO_MARKER / RADIO_DATA_TEST energy can be compared
+# against where the firmware *should* be transmitting.
+EXPECTED_TX_HZ = DEFAULT_FREQ_HZ
+EXPECTED_TX_BW_HZ = 2 * (DEVIATION_HZ + BITRATE_BPS // 2)   # Carson bandwidth
 
 # ─── Plot group definitions ───────────────────────────────────────────────────
 # (group_title, [keys...], [hex_colors...])
@@ -78,6 +84,37 @@ PHASE_COLORS = {
 MAX_POINTS   = 6000   # rolling buffer depth per series (~60s at 100 Hz)
 PLOT_UPDATE_HZ = 25   # UI repaint rate
 DEFAULT_WINDOW_S = 30
+
+# ─── Spectrum / waterfall (RTL-SDR) ──────────────────────────────────────────
+FFT_BINS       = 1024   # spectrum resolution
+SPECTRUM_AVG   = 6      # FFTs averaged per displayed frame
+SPECTRUM_FPS   = 30     # spectrum frames emitted per second
+WATERFALL_ROWS = 100    # waterfall history depth (rows of FFT_BINS)
+
+# ─── Theme palette ────────────────────────────────────────────────────────────
+# One place for every surface/accent color so panels stay cohesive.
+
+ACCENT    = "#00d4ff"   # primary accent — matches the alt_agl trace
+BG        = "#0d0d1a"   # window background
+SURFACE   = "#13132a"   # raised panels, plot canvas
+INSET     = "#09091a"   # input fields, log background
+BORDER    = "#2a2a44"
+BORDER_HI = "#3a3a66"
+TEXT      = "#ccccdd"
+TEXT_DIM  = "#8888aa"
+GOOD      = "#22aa44"
+BAD       = "#aa2222"
+AMBER     = "#aa8800"
+
+
+def badge_style(bg: str, fg: str = "#ffffff", radius: int = 4) -> str:
+    return f"background:{bg}; color:{fg}; border-radius:{radius}px; padding:0 6px;"
+
+
+def mono_font(size: int, bold: bool = False) -> QFont:
+    f = QFont("Menlo", size, QFont.Bold if bold else QFont.Normal)
+    f.setStyleHint(QFont.Monospace)
+    return f
 
 KNOWN_COMMANDS = [
     "ARM",
@@ -175,6 +212,7 @@ class SerialWorker(QThread):
 class RadioWorker(QThread):
     line_received  = pyqtSignal(str)
     status_changed = pyqtSignal(str, bool)
+    spectrum_ready = pyqtSignal(object)   # float32 dB array, FFT_BINS long, DC-centered
 
     def __init__(self):
         super().__init__()
@@ -186,8 +224,12 @@ class RadioWorker(QThread):
         self._ppm = 0
         self._device = "0"
         self._packet_count = 0
-        self._last_payload: bytes | None = None
-        self._last_emit_s = 0.0
+        self._seen_frames: dict[tuple, float] = {}   # (seq, payload) → last-seen time
+        self._last_spec_s = 0.0
+        self._decode_busy = False
+        self._fft_window = np.hanning(FFT_BINS).astype(np.float32)
+        # Hann window power normalization (sum of squares)
+        self._win_norm = float(np.sum(self._fft_window ** 2))
 
     def configure(self, freq_hz: int, sample_rate: int, gain: str, ppm: int, device: str):
         self._freq_hz = freq_hz
@@ -208,6 +250,9 @@ class RadioWorker(QThread):
             "-f", str(self._freq_hz),
             "-s", str(self._sample_rate),
             "-p", str(self._ppm),
+            # Small output blocks — rtl_sdr's default is 256 KiB, which at low
+            # sample rates means one write every ~0.5 s and a ~2 fps spectrum.
+            "-b", "8192",
             "-",
         ]
         if self._gain.lower() != "auto":
@@ -215,8 +260,7 @@ class RadioWorker(QThread):
 
         self._running = True
         self._packet_count = 0
-        self._last_payload = None
-        self._last_emit_s = 0.0
+        self._seen_frames.clear()
 
         try:
             self._proc = subprocess.Popen(
@@ -233,19 +277,22 @@ class RadioWorker(QThread):
             f"RTL-SDR RX {self._freq_hz / 1e6:.3f} MHz @ {self._sample_rate} S/s gain={self._gain}",
             False,
         )
-        self.line_received.emit("#INFO: radio rx waiting for RADIO_DATA_TEST frame")
+        self.line_received.emit("#INFO: radio rx waiting for RADIO_DATA_TEST frames (2-GFSK)")
 
         raw = bytearray()
-        max_bytes = int(self._sample_rate * 2 * 14)  # unsigned 8-bit IQ, ~14 s rolling window
-        min_bytes = int(self._sample_rate * 2 * 11)  # one 10 s OOK frame plus margin
-        read_size = 131072
+        max_bytes = int(self._sample_rate * 2 * 4)   # unsigned 8-bit IQ, ~4 s rolling window
+        min_bytes = int(self._sample_rate * 2 * 1)   # GFSK frames are ~22 ms; 1 s is plenty
+        read_size = 65536
         last_decode_s = 0.0
 
         try:
             while self._running:
                 if self._proc.stdout is None:
                     break
-                chunk = self._proc.stdout.read(read_size)
+                # read1 returns as soon as any data is available — a plain
+                # read(n) would block until n bytes arrive, capping the
+                # spectrum rate at the pipe's block cadence.
+                chunk = self._proc.stdout.read1(read_size)
                 if not chunk:
                     if self._proc.poll() is not None:
                         break
@@ -257,50 +304,80 @@ class RadioWorker(QThread):
                     del raw[:len(raw) - max_bytes]
 
                 now = time.monotonic()
-                if len(raw) >= min_bytes and now - last_decode_s >= 0.75:
+
+                spec_bytes = FFT_BINS * 2 * SPECTRUM_AVG
+                if len(raw) >= spec_bytes and now - self._last_spec_s >= 1.0 / SPECTRUM_FPS:
+                    self._last_spec_s = now
+                    self._emit_spectrum(raw[-spec_bytes:])
+
+                # Decode runs on its own thread — it chews through the whole
+                # rolling buffer (~seconds of CPU) and must never stall reads,
+                # or the rtl_sdr pipe backs up and the spectrum stutters.
+                if (len(raw) >= min_bytes and now - last_decode_s >= 0.5
+                        and not self._decode_busy):
                     last_decode_s = now
-                    self._try_decode(bytes(raw), now)
+                    self._decode_busy = True
+                    threading.Thread(
+                        target=self._decode_job, args=(bytes(raw), now),
+                        daemon=True,
+                    ).start()
         finally:
             self._terminate_proc()
             self._running = False
 
+    def _decode_job(self, raw: bytes, now_s: float):
+        try:
+            self._try_decode(raw, now_s)
+        finally:
+            self._decode_busy = False
+
+    def _emit_spectrum(self, tail: bytearray):
+        """Averaged power spectrum of the newest IQ samples (runs in worker thread)."""
+        iq = np.frombuffer(tail, dtype=np.uint8).astype(np.float32)
+        iq = (iq - 127.5) * (1.0 / 127.5)
+        samples = iq[0::2] + 1j * iq[1::2]
+
+        segs = samples[: FFT_BINS * SPECTRUM_AVG].reshape(SPECTRUM_AVG, FFT_BINS)
+        spec = np.fft.fft(segs * self._fft_window, axis=1)
+        power = np.mean(np.abs(spec) ** 2, axis=0) / self._win_norm
+        db = 10.0 * np.log10(power + 1e-12)
+        self.spectrum_ready.emit(np.fft.fftshift(db).astype(np.float32))
+
     def _try_decode(self, raw: bytes, now_s: float):
         try:
             samples = load_u8_iq(raw)
-            values = envelope_bins(samples, self._sample_rate)
-            samples_per_bit = max(1, int(round(DEFAULT_BIT_MS)))
-            result = find_best_frame(values, samples_per_bit, DEFAULT_PAYLOAD_LEN)
+            frames = find_frames(samples, self._sample_rate)
         except Exception as exc:
             self.line_received.emit(f"#WARN: radio rx decode error: {exc}")
             return
 
-        if result is None:
-            return
+        # The rolling buffer re-decodes each frame for several seconds —
+        # report each (seq, payload) once, then age the dedupe entries out.
+        for key, seen_s in list(self._seen_frames.items()):
+            if now_s - seen_s > 30.0:
+                del self._seen_frames[key]
 
-        if not is_valid_frame(result):
-            return
+        for fr in frames:
+            key = (fr.seq, fr.payload)
+            if key in self._seen_frames:
+                self._seen_frames[key] = now_s
+                continue
+            self._seen_frames[key] = now_s
+            self._packet_count += 1
 
-        if result.payload == self._last_payload and now_s - self._last_emit_s < 8.0:
-            return
+            try:
+                text = fr.payload.decode("ascii")
+            except UnicodeDecodeError:
+                text = fr.payload.hex(" ")
 
-        self._last_payload = result.payload
-        self._last_emit_s = now_s
-        self._packet_count += 1
-
-        try:
-            text = result.payload.decode("ascii")
-        except UnicodeDecodeError:
-            text = result.payload.hex(" ")
-
-        level = "INFO" if result.checksum_ok else "WARN"
-        status = "OK" if result.checksum_ok else "BAD"
-        self.line_received.emit(
-            f"#{level}: radio packet #{self._packet_count} payload=\"{text}\" "
-            f"checksum={status} preamble_errors={result.errors}"
-        )
-        self.line_received.emit(">radio_payload_seen:1")
-        self.line_received.emit(f">radio_packet_count:{self._packet_count}")
-        self.line_received.emit(f"!radio_rx:{1 if result.checksum_ok else -1}")
+            self.line_received.emit(
+                f"#INFO: radio frame seq={fr.seq} payload=\"{text}\" crc=OK "
+                f"quality={fr.quality:.2f} offset={fr.freq_offset_hz / 1e3:+.2f} kHz"
+            )
+            self.line_received.emit(f">radio_packet_count:{self._packet_count}")
+            self.line_received.emit(f">radio_rx_quality:{fr.quality:.3f}")
+            self.line_received.emit(f">radio_freq_offset_khz:{fr.freq_offset_hz / 1e3:.3f}")
+            self.line_received.emit("!radio_rx:1")
 
     def _terminate_proc(self):
         proc = self._proc
@@ -411,6 +488,161 @@ class CommandInput(QLineEdit):
             self.completer().complete()
 
 
+# ─── Spectrum + waterfall panel (RTL-SDR) ────────────────────────────────────
+
+class SpectrumPanel(QGroupBox):
+    """SDR++-style live spectrum and scrolling waterfall for the RTL-SDR source.
+
+    Receives DC-centered dB arrays from RadioWorker.spectrum_ready. All FFT
+    work happens in the worker thread; this widget only draws.
+    """
+
+    def __init__(self):
+        super().__init__("Spectrum")
+        self._freqs = None          # x-axis in MHz, FFT_BINS long
+        self._ema = None            # smoothed spectrum
+        self._peak = None           # peak-hold trace
+        self._lo = -80.0            # display floor (dB), auto-tracked
+        self._hi = -30.0            # display ceiling (dB), auto-tracked
+        self._y_lo = None           # last applied y-range, to avoid churn
+        self._y_hi = None
+
+        self._wf = np.full((WATERFALL_ROWS, FFT_BINS), -120.0, dtype=np.float32)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        # Controls row
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+        self.peak_check = QCheckBox("Peak hold")
+        self.peak_check.toggled.connect(self._on_peak_toggled)
+        ctrl_row.addWidget(self.peak_check)
+        self.range_label = QLabel("")
+        self.range_label.setFont(mono_font(8))
+        self.range_label.setStyleSheet(f"color:{TEXT_DIM};")
+        ctrl_row.addWidget(self.range_label)
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        # Spectrum plot
+        self.spec_plot = PlotWidget(background=SURFACE)
+        self.spec_plot.setFixedHeight(170)
+        self.spec_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.spec_plot.setMouseEnabled(x=False, y=False)
+        self.spec_plot.hideButtons()
+        for side in ("bottom", "left"):
+            axis = self.spec_plot.getAxis(side)
+            axis.setPen(pg.mkPen(BORDER_HI))
+            axis.setTextPen(pg.mkPen(TEXT_DIM))
+        self.spec_plot.getAxis("left").setLabel("dBFS")
+        self.spec_curve = self.spec_plot.plot(pen=pg.mkPen(ACCENT, width=1.2))
+        self.peak_curve = self.spec_plot.plot(pen=pg.mkPen("#ff6b35", width=1.0))
+        layout.addWidget(self.spec_plot)
+
+        # Waterfall
+        self.wf_plot = PlotWidget(background=SURFACE)
+        self.wf_plot.setFixedHeight(220)
+        self.wf_plot.setMouseEnabled(x=False, y=False)
+        self.wf_plot.hideButtons()
+        self.wf_plot.hideAxis("left")
+        self.wf_plot.invertY(True)   # newest row at top, history flows downward
+        axis = self.wf_plot.getAxis("bottom")
+        axis.setPen(pg.mkPen(BORDER_HI))
+        axis.setTextPen(pg.mkPen(TEXT_DIM))
+        axis.setLabel("MHz")
+        self.wf_plot.setXLink(self.spec_plot)
+
+        self.wf_img = pg.ImageItem(axisOrder="row-major")
+        self.wf_img.setLookupTable(
+            pg.colormap.get("inferno").getLookupTable(nPts=256))
+        self.wf_plot.addItem(self.wf_img)
+        layout.addWidget(self.wf_plot)
+
+        # Expected TX channel overlay — shaded band + dashed center line on
+        # both plots, so actual RF energy can be compared against where the
+        # flight computer should be transmitting.
+        tx_c = EXPECTED_TX_HZ / 1e6
+        tx_half = EXPECTED_TX_BW_HZ / 2e6
+        for plot in (self.spec_plot, self.wf_plot):
+            region = pg.LinearRegionItem(
+                values=(tx_c - tx_half, tx_c + tx_half), movable=False,
+                brush=pg.mkBrush("#00d4ff20"), pen=pg.mkPen("#00d4ff50"))
+            region.setZValue(10)
+            plot.addItem(region)
+            line = pg.InfiniteLine(
+                pos=tx_c, angle=90, movable=False,
+                pen=pg.mkPen(ACCENT, width=1, style=Qt.DashLine))
+            line.setZValue(11)
+            plot.addItem(line)
+
+        tx_label = QLabel(
+            f"expected TX {tx_c:.3f} MHz ±{EXPECTED_TX_BW_HZ / 2e3:.0f} kHz")
+        tx_label.setFont(mono_font(8))
+        tx_label.setStyleSheet(f"color:{ACCENT};")
+        ctrl_row.insertWidget(ctrl_row.count() - 1, tx_label)
+
+        self.set_params(DEFAULT_FREQ_HZ, DEFAULT_SAMPLE_RATE_HZ)
+
+    def set_params(self, center_hz: int, sample_rate: int):
+        """Reset axes/history for a new tune. Call before starting the worker."""
+        center = center_hz / 1e6
+        span = sample_rate / 1e6
+        f_lo = center - span / 2
+        self._freqs = np.linspace(f_lo, f_lo + span, FFT_BINS)
+        self._ema = None
+        self._peak = None
+        self._wf.fill(-120.0)
+        self.wf_img.setImage(self._wf, autoLevels=False, levels=(self._lo, self._hi))
+        self.wf_img.setRect(QRectF(f_lo, 0.0, span, float(WATERFALL_ROWS)))
+        self.spec_plot.setXRange(f_lo, f_lo + span, padding=0)
+        self.wf_plot.setYRange(0, WATERFALL_ROWS, padding=0)
+
+    def _on_peak_toggled(self, on: bool):
+        self._peak = None
+        if not on:
+            self.peak_curve.setData([], [])
+
+    def update_spectrum(self, db: np.ndarray):
+        if not self.isVisible() or self._freqs is None:
+            return
+
+        # Smoothed trace
+        if self._ema is None:
+            self._ema = db.copy()
+        else:
+            self._ema += 0.35 * (db - self._ema)
+        self.spec_curve.setData(self._freqs, self._ema)
+
+        if self.peak_check.isChecked():
+            self._peak = db.copy() if self._peak is None else np.maximum(self._peak, db)
+            self.peak_curve.setData(self._freqs, self._peak)
+
+        # Waterfall: scroll down one row, newest at top
+        self._wf[1:] = self._wf[:-1]
+        self._wf[0] = db
+
+        # Auto levels: slow-tracking floor/ceiling from percentiles
+        lo = float(np.percentile(db, 10))
+        hi = float(np.max(db))
+        self._lo += 0.05 * (lo - self._lo)
+        self._hi += 0.05 * (hi - self._hi)
+        if self._hi - self._lo < 10.0:
+            self._hi = self._lo + 10.0
+
+        self.wf_img.setImage(self._wf, autoLevels=False,
+                             levels=(self._lo, self._hi + 5.0))
+
+        # Re-range the spectrum y-axis only when it drifts visibly
+        y_lo, y_hi = self._lo - 10.0, self._hi + 10.0
+        if (self._y_lo is None or abs(y_lo - self._y_lo) > 2.0
+                or abs(y_hi - self._y_hi) > 2.0):
+            self._y_lo, self._y_hi = y_lo, y_hi
+            self.spec_plot.setYRange(y_lo, y_hi, padding=0)
+            self.range_label.setText(f"{self._lo:.0f} … {self._hi:.0f} dB")
+
+
 # ─── Plot group widget ────────────────────────────────────────────────────────
 
 class PlotGroupWidget(QGroupBox):
@@ -423,28 +655,38 @@ class PlotGroupWidget(QGroupBox):
         self._t   = {k: deque(maxlen=MAX_POINTS) for k in keys}
         self._y   = {k: deque(maxlen=MAX_POINTS) for k in keys}
         self._t0  = None   # first timestamp seen
+        self._dirty: set[str] = set()      # keys with data since last refresh
+        self._last_window = window_s
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        self.plot = PlotWidget(background="#1a1a2e")
+        self.plot = PlotWidget(background=SURFACE)
         self.plot.setMinimumHeight(160)
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.showGrid(x=True, y=True, alpha=0.25)
+        for side in ("bottom", "left"):
+            axis = self.plot.getAxis(side)
+            axis.setPen(pg.mkPen(BORDER_HI))
+            axis.setTextPen(pg.mkPen(TEXT_DIM))
         self.plot.getAxis("bottom").setLabel("t (s)")
-        self.plot.addLegend(offset=(-10, 10))
+        self.plot.enableAutoRange(axis="xy")
+        self.plot.addLegend(
+            offset=(-10, 10),
+            brush=pg.mkBrush("#13132ad0"),
+            pen=pg.mkPen(BORDER),
+            labelTextColor=TEXT,
+        )
 
         self.curves = {}
         for i, key in enumerate(keys):
-            color = colors[i % len(colors)]
-            self.curves[key] = self.plot.plot(
-                pen=pg.mkPen(color, width=1.5),
-                name=key,
-            )
+            self._make_curve(key, colors[i % len(colors)])
 
         layout.addWidget(self.plot)
 
-        # Enable key if data arrives (dim unused keys in legend)
-        self._seen = set()
+    def _make_curve(self, key: str, color: str):
+        curve = self.plot.plot(pen=pg.mkPen(color, width=1.5), name=key)
+        curve.setDownsampling(auto=True, method="peak")
+        self.curves[key] = curve
 
     def push(self, key: str, t: float, value: float):
         if key not in self._t:
@@ -453,23 +695,28 @@ class PlotGroupWidget(QGroupBox):
             self._t0 = t
         self._t[key].append(t - self._t0)
         self._y[key].append(value)
-        self._seen.add(key)
+        self._dirty.add(key)
 
     def refresh(self, window_s: int):
-        for key in self.keys:
-            if not self._t[key]:
-                continue
+        if window_s != self._last_window:
+            self._last_window = window_s
+            self._dirty.update(k for k in self.keys if self._t[k])
+        if not self._dirty:
+            return
+        for key in self._dirty:
             t_arr = np.array(self._t[key])
             y_arr = np.array(self._y[key])
-            t_max = t_arr[-1]
-            t_min = t_max - window_s
-            mask  = t_arr >= t_min
-            self.curves[key].setData(t_arr[mask], y_arr[mask])
-        # Roll the x-axis view
-        if self._t0 is not None:
-            elapsed = time.monotonic()
-            # just let pyqtgraph auto-range; user can lock axes manually
-            self.plot.enableAutoRange(axis="x")
+            i0 = np.searchsorted(t_arr, t_arr[-1] - window_s)
+            self.curves[key].setData(t_arr[i0:], y_arr[i0:])
+        self._dirty.clear()
+
+    def clear(self):
+        for key in self.keys:
+            self._t[key].clear()
+            self._y[key].clear()
+            self.curves[key].setData([], [])
+        self._t0 = None
+        self._dirty.clear()
 
     def add_key(self, key: str, color: str = "#ffffff"):
         """Dynamically add a key not in the original definition."""
@@ -479,10 +726,7 @@ class PlotGroupWidget(QGroupBox):
         self.colors.append(color)
         self._t[key] = deque(maxlen=MAX_POINTS)
         self._y[key] = deque(maxlen=MAX_POINTS)
-        self.curves[key] = self.plot.plot(
-            pen=pg.mkPen(color, width=1.5),
-            name=key,
-        )
+        self._make_curve(key, color)
 
 # ─── State panel ─────────────────────────────────────────────────────────────
 
@@ -499,11 +743,9 @@ class StatePanel(QWidget):
         # Phase badge
         self.phase_label = QLabel("IDLE")
         self.phase_label.setAlignment(Qt.AlignCenter)
-        self.phase_label.setFont(QFont("Courier", 22, QFont.Bold))
+        self.phase_label.setFont(mono_font(22, bold=True))
         self.phase_label.setFixedHeight(54)
-        self.phase_label.setStyleSheet(
-            f"background:{PHASE_COLORS['IDLE']}; color:#ffffff; border-radius:6px;"
-        )
+        self.phase_label.setStyleSheet(badge_style(PHASE_COLORS["IDLE"], radius=6))
         layout.addWidget(self.phase_label)
 
         # Sensor health row
@@ -514,9 +756,9 @@ class StatePanel(QWidget):
         for name in SENSOR_BITS:
             dot = QLabel(name)
             dot.setAlignment(Qt.AlignCenter)
-            dot.setFont(QFont("Courier", 9, QFont.Bold))
+            dot.setFont(mono_font(9, bold=True))
             dot.setFixedSize(52, 22)
-            dot.setStyleSheet("background:#444; color:#888; border-radius:4px;")
+            dot.setStyleSheet(badge_style("#444", TEXT_DIM))
             self.sensor_dots[name] = dot
             health_layout.addWidget(dot)
         layout.addWidget(health_box)
@@ -527,9 +769,9 @@ class StatePanel(QWidget):
         radio_layout.setContentsMargins(6, 4, 6, 4)
         self.radio_label = QLabel("OFFLINE")
         self.radio_label.setAlignment(Qt.AlignCenter)
-        self.radio_label.setFont(QFont("Courier", 9, QFont.Bold))
+        self.radio_label.setFont(mono_font(9, bold=True))
         self.radio_label.setFixedHeight(20)
-        self.radio_label.setStyleSheet("background:#aa2222; color:#fff; border-radius:3px; padding:0 4px;")
+        self.radio_label.setStyleSheet(badge_style(BAD, radius=3))
         radio_layout.addWidget(self.radio_label)
         layout.addWidget(radio_box)
 
@@ -539,18 +781,18 @@ class StatePanel(QWidget):
         gps_layout.setContentsMargins(6, 4, 6, 4)
 
         self.gps_fix_label = QLabel("NO FIX")
-        self.gps_fix_label.setFont(QFont("Courier", 9, QFont.Bold))
+        self.gps_fix_label.setFont(mono_font(9, bold=True))
         self.gps_fix_label.setAlignment(Qt.AlignCenter)
         self.gps_fix_label.setFixedHeight(20)
-        self.gps_fix_label.setStyleSheet("background:#444; color:#888; border-radius:3px; padding:0 4px;")
+        self.gps_fix_label.setStyleSheet(badge_style("#444", TEXT_DIM, radius=3))
 
         self.gps_sats_label = QLabel("0 sats")
-        self.gps_sats_label.setFont(QFont("Courier", 9))
-        self.gps_sats_label.setStyleSheet("color:#888;")
+        self.gps_sats_label.setFont(mono_font(9))
+        self.gps_sats_label.setStyleSheet(f"color:{TEXT_DIM};")
 
         self.gps_utc_label = QLabel("—")
-        self.gps_utc_label.setFont(QFont("Courier", 8))
-        self.gps_utc_label.setStyleSheet("color:#888;")
+        self.gps_utc_label.setFont(mono_font(8))
+        self.gps_utc_label.setStyleSheet(f"color:{TEXT_DIM};")
 
         gps_layout.addWidget(self.gps_fix_label)
         gps_layout.addWidget(self.gps_sats_label)
@@ -586,6 +828,7 @@ class StatePanel(QWidget):
         self._values_layout.setContentsMargins(0, 0, 0, 0)
         self._values_layout.setVerticalSpacing(2)
         self._value_rows: dict[str, QLabel] = {}
+        self._pending_values: dict[str, float] = {}
         values_outer.addWidget(self._values_grid)
         layout.addWidget(values_box)
         layout.addStretch()
@@ -596,34 +839,37 @@ class StatePanel(QWidget):
         phase = phase.strip().upper()
         color = PHASE_COLORS.get(phase, PHASE_COLORS["UNKNOWN"])
         self.phase_label.setText(phase)
-        self.phase_label.setStyleSheet(
-            f"background:{color}; color:#ffffff; border-radius:6px;"
-        )
+        self.phase_label.setStyleSheet(badge_style(color, radius=6))
         self._phase = phase
 
     def update_health(self, bitmask: int):
         for name, bit in SENSOR_BITS.items():
             ok = bool(bitmask & (1 << bit))
-            dot = self.sensor_dots[name]
-            if ok:
-                dot.setStyleSheet("background:#22aa44; color:#ffffff; border-radius:4px;")
-            else:
-                dot.setStyleSheet("background:#aa2222; color:#ffffff; border-radius:4px;")
+            self.sensor_dots[name].setStyleSheet(badge_style(GOOD if ok else BAD))
 
     def update_value(self, key: str, value: float):
-        if key not in self._value_rows:
-            row = self._values_layout.rowCount()
-            key_label = QLabel(key)
-            key_label.setFont(QFont("Courier", 9))
-            key_label.setStyleSheet("color:#aaaacc;")
-            val_label = QLabel("—")
-            val_label.setFont(QFont("Courier", 9, QFont.Bold))
-            val_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val_label.setStyleSheet("color:#ffffff;")
-            self._values_layout.addWidget(key_label, row, 0)
-            self._values_layout.addWidget(val_label, row, 1)
-            self._value_rows[key] = val_label
-        self._value_rows[key].setText(f"{value:.4g}")
+        # Buffered — labels repaint on the UI tick via flush_values(), not at
+        # the incoming serial rate.
+        self._pending_values[key] = value
+
+    def flush_values(self):
+        if not self._pending_values:
+            return
+        for key, value in self._pending_values.items():
+            if key not in self._value_rows:
+                row = self._values_layout.rowCount()
+                key_label = QLabel(key)
+                key_label.setFont(mono_font(9))
+                key_label.setStyleSheet("color:#aaaacc;")
+                val_label = QLabel("—")
+                val_label.setFont(mono_font(9, bold=True))
+                val_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                val_label.setStyleSheet("color:#ffffff;")
+                self._values_layout.addWidget(key_label, row, 0)
+                self._values_layout.addWidget(val_label, row, 1)
+                self._value_rows[key] = val_label
+            self._value_rows[key].setText(f"{value:.4g}")
+        self._pending_values.clear()
 
     def update_state(self, key: str, value: str):
         """Handle arbitrary !key:value state lines."""
@@ -640,13 +886,12 @@ class StatePanel(QWidget):
                 label = GPS_FIX_LABELS.get(fix, str(fix))
                 self.gps_fix_label.setText(label)
                 if fix >= 3:
-                    style = "background:#22aa44; color:#fff;"    # green — 3D fix
+                    bg = GOOD       # green — 3D fix
                 elif fix >= 0:
-                    style = "background:#aa8800; color:#fff;"    # amber — online, searching/2D
+                    bg = AMBER      # amber — online, searching/2D
                 else:
-                    style = "background:#aa2222; color:#fff;"    # red — offline / init failed
-                self.gps_fix_label.setStyleSheet(
-                    style + " border-radius:3px; padding:0 4px;")
+                    bg = BAD        # red — offline / init failed
+                self.gps_fix_label.setStyleSheet(badge_style(bg, radius=3))
             except ValueError:
                 pass
         elif key == "gps_sats":
@@ -659,12 +904,17 @@ class StatePanel(QWidget):
                 s = int(value)
                 if s >= 0:
                     self.radio_label.setText("Si4463 OK")
-                    self.radio_label.setStyleSheet(
-                        "background:#22aa44; color:#fff; border-radius:3px; padding:0 4px;")
+                    self.radio_label.setStyleSheet(badge_style(GOOD, radius=3))
                 else:
                     self.radio_label.setText("OFFLINE")
-                    self.radio_label.setStyleSheet(
-                        "background:#aa2222; color:#fff; border-radius:3px; padding:0 4px;")
+                    self.radio_label.setStyleSheet(badge_style(BAD, radius=3))
+            except ValueError:
+                pass
+        elif key == "radio_rx":
+            try:
+                ok = int(value) >= 0
+                self.radio_label.setText("RX OK" if ok else "RX BAD")
+                self.radio_label.setStyleSheet(badge_style(GOOD if ok else AMBER, radius=3))
             except ValueError:
                 pass
 
@@ -685,6 +935,12 @@ class MainWindow(QMainWindow):
         # Key → PlotGroupWidget mapping for routing
         self._key_to_group: dict[str, PlotGroupWidget] = {}
         self._overflow_group: PlotGroupWidget | None = None
+
+        # Debounced restart so gain/freq/ppm changes apply while connected
+        self._retune_timer = QTimer(self)
+        self._retune_timer.setSingleShot(True)
+        self._retune_timer.setInterval(500)
+        self._retune_timer.timeout.connect(self._apply_radio_retune)
 
         self._build_ui()
         self._connect_signals()
@@ -771,7 +1027,9 @@ class MainWindow(QMainWindow):
         self.radio_gain_label = QLabel("Gain:")
         self.radio_gain_input = QLineEdit("10")
         self.radio_gain_input.setFixedWidth(46)
-        self.radio_gain_input.setToolTip('RTL gain in dB, or "auto"')
+        self.radio_gain_input.setToolTip(
+            'RTL tuner gain in dB, or "auto".\n'
+            'Note: rtl_sdr treats 0 as "enable tuner AGC" (≈ max gain), not 0 dB.')
         layout.addWidget(self.radio_gain_label)
         layout.addWidget(self.radio_gain_input)
 
@@ -797,6 +1055,13 @@ class MainWindow(QMainWindow):
         self.radio_device_input.setFixedWidth(36)
         layout.addWidget(self.radio_device_label)
         layout.addWidget(self.radio_device_input)
+
+        # Retune live: any radio setting change restarts rtl_sdr (debounced)
+        self.radio_freq_spin.valueChanged.connect(self._schedule_radio_retune)
+        self.radio_ppm_spin.valueChanged.connect(self._schedule_radio_retune)
+        self.radio_rate_spin.valueChanged.connect(self._schedule_radio_retune)
+        self.radio_gain_input.editingFinished.connect(self._schedule_radio_retune)
+        self.radio_device_input.editingFinished.connect(self._schedule_radio_retune)
 
         layout.addSpacing(12)
 
@@ -830,6 +1095,8 @@ class MainWindow(QMainWindow):
 
         # Status indicator
         self.status_label = QLabel("Not connected")
+        self.status_label.setFont(mono_font(9))
+        self.status_label.setStyleSheet(f"color:{TEXT_DIM};")
         layout.addWidget(self.status_label)
 
         self._on_source_changed()
@@ -846,6 +1113,11 @@ class MainWindow(QMainWindow):
         self._plot_layout.setSpacing(4)
 
         self._plot_groups: list[PlotGroupWidget] = []
+
+        # Spectrum + waterfall — only visible when the RTL-SDR source is active
+        self.spectrum_panel = SpectrumPanel()
+        self.spectrum_panel.setVisible(self._source_mode() == "radio")
+        self._plot_layout.addWidget(self.spectrum_panel)
 
         for title, keys, colors in PLOT_GROUPS:
             group = PlotGroupWidget(title, keys, colors)
@@ -891,8 +1163,8 @@ class MainWindow(QMainWindow):
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Courier", 8))
-        self.log_view.setStyleSheet("background:#0a0a14; color:#cccccc; border:none;")
+        self.log_view.setFont(mono_font(8))
+        self.log_view.setStyleSheet(f"background:{INSET}; color:#cccccc; border:none;")
         self.log_view.document().setMaximumBlockCount(2000)
         log_layout.addWidget(self.log_view)
 
@@ -901,9 +1173,9 @@ class MainWindow(QMainWindow):
         cmd_row.setSpacing(4)
         self.cmd_input = CommandInput(KNOWN_COMMANDS)
         self.cmd_input.setPlaceholderText("Command (Tab completes, Up/Down history)")
-        self.cmd_input.setFont(QFont("Courier", 8))
+        self.cmd_input.setFont(mono_font(8))
         self.cmd_input.setStyleSheet(
-            "background:#0a0a14; color:#ccffcc; border:1px solid #334433;"
+            f"background:{INSET}; color:#ccffcc; border:1px solid {BORDER};"
             " border-radius:3px; padding:2px 4px;")
         self.cmd_input.returnPressed.connect(self._send_command)
         cmd_row.addWidget(self.cmd_input)
@@ -925,6 +1197,7 @@ class MainWindow(QMainWindow):
         self._worker.reconnected.connect(self._on_reconnect)
         self._radio_worker.line_received.connect(self._on_line)
         self._radio_worker.status_changed.connect(self._on_status)
+        self._radio_worker.spectrum_ready.connect(self.spectrum_panel.update_spectrum)
         self._radio_worker.finished.connect(self._on_worker_finished)
         self.state_panel.copy_requested.connect(self._copy_to_clipboard)
 
@@ -950,6 +1223,9 @@ class MainWindow(QMainWindow):
             widget.setVisible(not radio)
         for widget in radio_widgets:
             widget.setVisible(radio)
+
+        if hasattr(self, "spectrum_panel"):
+            self.spectrum_panel.setVisible(radio)
 
         if hasattr(self, "cmd_input"):
             self.cmd_input.setEnabled(not radio)
@@ -1003,13 +1279,7 @@ class MainWindow(QMainWindow):
             self._set_disconnected()
         else:
             if self._source_mode() == "radio":
-                freq_hz = int(round(self.radio_freq_spin.value() * 1e6))
-                sample_rate = int(self.radio_rate_spin.value())
-                gain = self.radio_gain_input.text().strip() or "auto"
-                ppm = int(self.radio_ppm_spin.value())
-                device = self.radio_device_input.text().strip() or "0"
-                self._radio_worker.configure(freq_hz, sample_rate, gain, ppm, device)
-                self._radio_worker.start()
+                self._start_radio()
             else:
                 idx  = self.port_combo.currentIndex()
                 port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
@@ -1017,8 +1287,30 @@ class MainWindow(QMainWindow):
                 self._worker.configure(port, baud)
                 self._worker.start()
             self.connect_btn.setText("Disconnect")
-            self.connect_btn.setStyleSheet("background:#aa2222; color:#ffffff;")
+            self.connect_btn.setStyleSheet(
+                f"background:{BAD}; color:#ffffff; border:1px solid #cc4444;")
             self.source_combo.setEnabled(False)
+
+    def _start_radio(self):
+        freq_hz = int(round(self.radio_freq_spin.value() * 1e6))
+        sample_rate = int(self.radio_rate_spin.value())
+        gain = self.radio_gain_input.text().strip() or "auto"
+        ppm = int(self.radio_ppm_spin.value())
+        device = self.radio_device_input.text().strip() or "0"
+        self._radio_worker.configure(freq_hz, sample_rate, gain, ppm, device)
+        self.spectrum_panel.set_params(freq_hz, sample_rate)
+        self._radio_worker.start()
+
+    def _schedule_radio_retune(self):
+        if self._radio_worker.isRunning():
+            self._retune_timer.start()
+
+    def _apply_radio_retune(self):
+        if not self._radio_worker.isRunning():
+            return
+        self._log("[monitor] Radio settings changed — retuning…")
+        self._radio_worker.stop()
+        self._start_radio()
 
     def _set_disconnected(self):
         self.connect_btn.setText("Connect")
@@ -1099,27 +1391,29 @@ class MainWindow(QMainWindow):
             return
 
         color, bold = "#aaaaaa", False
+        prefix = ""
 
         # Firmware plot-mode prefix: #ERROR: / #WARN: / #INFO:
         for level, (c, b) in self._LOG_STYLES.items():
             if text.startswith(level + ":"):
                 color, bold = c, b
                 text = text[len(level) + 1:].lstrip()
-                prefix = f'<span style="color:{c};font-weight:{"bold" if b else "normal"};">[{level}]</span> '
-                ts = f'<span style="color:#444466;">{time.strftime("%H:%M:%S")}</span> '
-                self.log_view.append(ts + prefix + f'<span style="color:{color};">{text}</span>')
-                sb = self.log_view.verticalScrollBar()
-                sb.setValue(sb.maximum())
-                return
+                ts = time.strftime("%H:%M:%S")
+                prefix = (
+                    f'<span style="color:#444466;">{ts}</span> '
+                    f'<span style="color:{c};font-weight:{"bold" if b else "normal"};">[{level}]</span> '
+                )
+                break
+        else:
+            # [monitor] and [TX] internal messages
+            if text.startswith("[monitor]"):
+                color = "#446688"
+            elif text.startswith("[TX]"):
+                color = "#44ffaa"
 
-        # [monitor] and [TX] internal messages
-        if text.startswith("[monitor]"):
-            color = "#446688"
-        elif text.startswith("[TX]"):
-            color = "#44ffaa"
-
-        html = f'<span style="color:{color};font-weight:{"bold" if bold else "normal"};">{text}</span>'
-        self.log_view.append(html)
+        weight = "bold" if bold else "normal"
+        body = f'<span style="color:{color};font-weight:{weight};">{html.escape(text)}</span>'
+        self.log_view.append(prefix + body)
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -1128,6 +1422,7 @@ class MainWindow(QMainWindow):
     def _refresh_plots(self):
         for group in self._plot_groups:
             group.refresh(self._window_s)
+        self.state_panel.flush_values()
 
     # ── Status ────────────────────────────────────────────────────────────────
 
@@ -1199,122 +1494,129 @@ class MainWindow(QMainWindow):
     def _clear_data(self):
         self._t_start = None
         for group in self._plot_groups:
-            for key in group._t:
-                group._t[key].clear()
-                group._y[key].clear()
-            group._t0 = None
+            group.clear()
         self.log_view.clear()   # QTextEdit.clear()
 
     def _apply_dark_theme(self):
-        self.setStyleSheet("""
+        self.setStyleSheet(f"""
             /* ── Base ─────────────────────────────────────────────────────── */
-            QMainWindow, QWidget    { background: #0d0d1a; color: #ccccdd; }
-            QLabel                  { color: #ccccdd; background: transparent; }
-            QScrollArea             { border: none; }
+            QMainWindow, QWidget    {{ background: {BG}; color: {TEXT}; }}
+            QLabel                  {{ color: {TEXT}; background: transparent; }}
+            QScrollArea             {{ border: none; }}
+            QSplitter::handle       {{ background: {BORDER}; width: 2px; }}
+            QSplitter::handle:hover {{ background: {ACCENT}; }}
+            QToolTip                {{ background: {SURFACE}; color: {TEXT};
+                                       border: 1px solid {BORDER_HI}; padding: 3px 6px; }}
 
             /* ── Toolbar ──────────────────────────────────────────────────── */
-            QFrame#toolbar          { background: #111122;
-                                      border-bottom: 1px solid #2a2a44; }
-            QFrame#toolbar QLabel   { color: #9090b8; background: transparent; }
+            QFrame#toolbar          {{ background: #111122;
+                                       border-bottom: 1px solid {BORDER}; }}
+            QFrame#toolbar QLabel   {{ color: #9090b8; background: transparent; }}
 
             /* Toolbar controls: inset look — darker than toolbar surface */
             QFrame#toolbar QComboBox,
             QFrame#toolbar QSpinBox,
             QFrame#toolbar QDoubleSpinBox,
-            QFrame#toolbar QLineEdit { background: #09091a; border: 1px solid #2e2e50;
-                                       color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
+            QFrame#toolbar QLineEdit {{ background: {INSET}; border: 1px solid #2e2e50;
+                                        color: {TEXT}; padding: 2px 6px; border-radius: 3px; }}
             QFrame#toolbar QPushButton
-                                    { background: #09091a; border: 1px solid #2e2e50;
-                                      color: #aaaacc; padding: 3px 10px; border-radius: 3px; }
+                                    {{ background: {INSET}; border: 1px solid #2e2e50;
+                                       color: #aaaacc; padding: 3px 10px; border-radius: 3px; }}
             QFrame#toolbar QPushButton:hover
-                                    { background: #14142a; border-color: #4444aa;
-                                      color: #ddddff; }
+                                    {{ background: #14142a; border-color: {ACCENT};
+                                       color: #ddddff; }}
 
             /* ── Panel controls (outside toolbar) ────────────────────────── */
-            QGroupBox               { border: 1px solid #333355; border-radius: 4px;
-                                      margin-top: 6px; padding-top: 6px; color: #8888aa; }
-            QGroupBox::title        { subcontrol-origin: margin; left: 8px; }
+            QGroupBox               {{ border: 1px solid {BORDER}; border-radius: 6px;
+                                       margin-top: 7px; padding-top: 7px;
+                                       color: {TEXT_DIM}; }}
+            QGroupBox::title        {{ subcontrol-origin: margin; left: 10px;
+                                       padding: 0 4px; color: {ACCENT}; }}
 
             QComboBox, QSpinBox,
             QDoubleSpinBox, QLineEdit
-                                    { background: #1a1a2e; border: 1px solid #444466;
-                                      color: #ccccdd; padding: 2px 6px; border-radius: 3px; }
-            QPushButton             { background: #1e1e3a; border: 1px solid #444466;
-                                      color: #ccccdd; padding: 3px 10px; border-radius: 3px; }
-            QPushButton:hover       { background: #2a2a4a; }
+                                    {{ background: {INSET}; border: 1px solid {BORDER_HI};
+                                       color: {TEXT}; padding: 2px 6px; border-radius: 3px; }}
+            QComboBox:focus, QSpinBox:focus,
+            QDoubleSpinBox:focus, QLineEdit:focus
+                                    {{ border-color: {ACCENT}; }}
+            QPushButton             {{ background: #1e1e3a; border: 1px solid {BORDER_HI};
+                                       color: {TEXT}; padding: 3px 10px; border-radius: 3px; }}
+            QPushButton:hover       {{ background: #2a2a4a; border-color: {ACCENT}; }}
+            QPushButton:pressed     {{ background: #16162e; }}
 
             /* ── ComboBox arrow + dropdown popup ─────────────────────────── */
-            QComboBox::drop-down    { subcontrol-origin: padding;
-                                      subcontrol-position: top right;
-                                      width: 18px;
-                                      border-left: 1px solid #303050;
-                                      border-radius: 0 3px 3px 0; }
-            QComboBox::down-arrow   { border-left:  4px solid transparent;
-                                      border-right: 4px solid transparent;
-                                      border-top:   5px solid #8888cc;
-                                      width: 0; height: 0; }
+            QComboBox::drop-down    {{ subcontrol-origin: padding;
+                                       subcontrol-position: top right;
+                                       width: 18px;
+                                       border-left: 1px solid #303050;
+                                       border-radius: 0 3px 3px 0; }}
+            QComboBox::down-arrow   {{ border-left:  4px solid transparent;
+                                       border-right: 4px solid transparent;
+                                       border-top:   5px solid #8888cc;
+                                       width: 0; height: 0; }}
             QComboBox::down-arrow:disabled
-                                    { border-top-color: #444455; }
+                                    {{ border-top-color: #444455; }}
 
-            QComboBox QAbstractItemView {
-                                      background: #1a1a2e;
-                                      border: 1px solid #444466;
-                                      color: #ccccdd;
-                                      selection-background-color: #2a2a50;
-                                      selection-color: #ffffff;
-                                      outline: none; }
+            QComboBox QAbstractItemView {{
+                                       background: {SURFACE};
+                                       border: 1px solid {BORDER_HI};
+                                       color: {TEXT};
+                                       selection-background-color: #2a2a50;
+                                       selection-color: #ffffff;
+                                       outline: none; }}
 
             /* ── SpinBox arrows ───────────────────────────────────────────── */
-            QSpinBox::up-button     { subcontrol-origin: border;
-                                      subcontrol-position: top right;
-                                      width: 16px;
-                                      border-left: 1px solid #303050;
-                                      border-bottom: 1px solid #303050;
-                                      background: transparent; }
-            QSpinBox::down-button   { subcontrol-origin: border;
-                                      subcontrol-position: bottom right;
-                                      width: 16px;
-                                      border-left: 1px solid #303050;
-                                      background: transparent; }
-            QSpinBox::up-arrow      { border-left:   3px solid transparent;
-                                      border-right:  3px solid transparent;
-                                      border-bottom: 4px solid #8888cc;
-                                      width: 0; height: 0; }
-            QSpinBox::down-arrow    { border-left:  3px solid transparent;
-                                      border-right: 3px solid transparent;
-                                      border-top:   4px solid #8888cc;
-                                      width: 0; height: 0; }
+            QSpinBox::up-button     {{ subcontrol-origin: border;
+                                       subcontrol-position: top right;
+                                       width: 16px;
+                                       border-left: 1px solid #303050;
+                                       border-bottom: 1px solid #303050;
+                                       background: transparent; }}
+            QSpinBox::down-button   {{ subcontrol-origin: border;
+                                       subcontrol-position: bottom right;
+                                       width: 16px;
+                                       border-left: 1px solid #303050;
+                                       background: transparent; }}
+            QSpinBox::up-arrow      {{ border-left:   3px solid transparent;
+                                       border-right:  3px solid transparent;
+                                       border-bottom: 4px solid #8888cc;
+                                       width: 0; height: 0; }}
+            QSpinBox::down-arrow    {{ border-left:  3px solid transparent;
+                                       border-right: 3px solid transparent;
+                                       border-top:   4px solid #8888cc;
+                                       width: 0; height: 0; }}
             QSpinBox::up-arrow:disabled,
             QSpinBox::down-arrow:disabled
-                                    { border-bottom-color: #444455;
-                                      border-top-color:    #444455; }
+                                    {{ border-bottom-color: #444455;
+                                       border-top-color:    #444455; }}
 
             /* ── Scrollbars ───────────────────────────────────────────────── */
-            QScrollBar:vertical     { background: #0d0d1a; width: 8px;
-                                      margin: 0; border: none; }
+            QScrollBar:vertical     {{ background: {BG}; width: 8px;
+                                       margin: 0; border: none; }}
             QScrollBar::handle:vertical
-                                    { background: #2e2e50; border-radius: 4px;
-                                      min-height: 24px; }
+                                    {{ background: #2e2e50; border-radius: 4px;
+                                       min-height: 24px; }}
             QScrollBar::handle:vertical:hover
-                                    { background: #44447a; }
+                                    {{ background: #44447a; }}
             QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical  { height: 0; }
+            QScrollBar::sub-line:vertical  {{ height: 0; }}
             QScrollBar::add-page:vertical,
-            QScrollBar::sub-page:vertical  { background: none; }
+            QScrollBar::sub-page:vertical  {{ background: none; }}
 
-            QScrollBar:horizontal   { background: #0d0d1a; height: 8px;
-                                      margin: 0; border: none; }
+            QScrollBar:horizontal   {{ background: {BG}; height: 8px;
+                                       margin: 0; border: none; }}
             QScrollBar::handle:horizontal
-                                    { background: #2e2e50; border-radius: 4px;
-                                      min-width: 24px; }
+                                    {{ background: #2e2e50; border-radius: 4px;
+                                       min-width: 24px; }}
             QScrollBar::handle:horizontal:hover
-                                    { background: #44447a; }
+                                    {{ background: #44447a; }}
             QScrollBar::add-line:horizontal,
-            QScrollBar::sub-line:horizontal { width: 0; }
+            QScrollBar::sub-line:horizontal {{ width: 0; }}
             QScrollBar::add-page:horizontal,
-            QScrollBar::sub-page:horizontal { background: none; }
+            QScrollBar::sub-page:horizontal {{ background: none; }}
         """)
-        pg.setConfigOption("background", "#0d0d1a")
+        pg.setConfigOption("background", BG)
         pg.setConfigOption("foreground", "#888899")
 
     def closeEvent(self, event):
