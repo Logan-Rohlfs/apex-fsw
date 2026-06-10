@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Decode the Apex RADIO_DATA_TEST 2-GFSK frames from RTL-SDR IQ samples.
+Decode Apex 2-GFSK downlink frames from RTL-SDR IQ samples.
 
-Wire format (must match fsw/src/radio.cpp radio_data_test_tx):
+Wire format (must match fsw/src/radio.cpp):
   preamble: 0xAA x 8
   sync:     0x2D 0xD4
-  seq:      1 byte (1..N within a test burst)
-  payload:  "APEX RADIO TEST"
-  crc:      CRC-16-CCITT (poly 0x1021, init 0xFFFF) over seq+payload, big-endian
+  type:     0x01 = RADIO_DATA_TEST (seq byte + "APEX RADIO TEST")
+            0x02 = telemetry (TelemetryBody, little-endian, callsign first)
+  crc:      CRC-16-CCITT (poly 0x1021, init 0xFFFF) over type+body, big-endian
 
 Modulation: 2-GFSK, 10 kbps, ±25 kHz deviation, MSB-first, bit 1 = +deviation.
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -43,21 +44,76 @@ PREAMBLE = bytes([0xAA] * 8)
 SYNC = bytes([0x2D, 0xD4])
 PAYLOAD = b"APEX RADIO TEST"
 PAYLOAD_LEN = len(PAYLOAD)
-BODY_LEN = 1 + PAYLOAD_LEN          # seq + payload
-FRAME_BITS_AFTER_SYNC = (BODY_LEN + 2) * 8
+
+FRAME_TYPE_TEST = 0x01
+FRAME_TYPE_FLIGHT = 0x02
+FRAME_TYPE_HK = 0x03
+
+# fsw/src/radio.cpp TelemFlight / TelemHousekeeping (packed, little-endian).
+# Scaled-int fields are converted back to SI here — keep in sync with the
+# scale comments in radio.cpp.
+FLIGHT_STRUCT = struct.Struct("<6sHBBbBff7hBHb")   # 38 bytes
+HK_STRUCT = struct.Struct("<H3h3h2hH")             # 20 bytes
+PHASE_NAMES = ("IDLE", "ARMED", "BOOST", "COAST", "DESCENT", "LANDED")
+
+BODY_LEN_BY_TYPE = {
+    FRAME_TYPE_TEST: 1 + PAYLOAD_LEN,        # seq + ASCII payload
+    FRAME_TYPE_FLIGHT: FLIGHT_STRUCT.size,
+    FRAME_TYPE_HK: HK_STRUCT.size,
+}
+MIN_BODY_LEN = min(BODY_LEN_BY_TYPE.values())
+
+
+def parse_flight(body: bytes) -> dict:
+    (callsign, seq, phase, health, gps_fix, gps_sats, lat, lon,
+     gps_alt, alt, vel, apogee, vacc, accel_z, roll, deploy,
+     baro2, btemp) = FLIGHT_STRUCT.unpack(body)
+    return {
+        "callsign": callsign.decode("ascii", "replace").strip("\x00 "),
+        "seq": seq,
+        "phase": phase,
+        "phase_name": PHASE_NAMES[phase] if phase < len(PHASE_NAMES) else "UNKNOWN",
+        "health": health,
+        "gps_fix": gps_fix,
+        "gps_sats": gps_sats,
+        "gps_lat_deg": lat,
+        "gps_lon_deg": lon,
+        "gps_alt_msl_m": gps_alt * 0.5,
+        "alt_agl_m": alt * 0.1,
+        "velocity_mps": vel * 0.02,
+        "pred_apogee_m": apogee * 0.1,
+        "vert_accel_mps2": vacc * 0.01,
+        "accel_z_mss": accel_z * 0.01,
+        "roll_rate_rads": roll * 0.002,
+        "deployment_frac": deploy / 255.0,
+        "baro_pa": baro2 * 2.0,
+        "baro_temp_c": float(btemp),
+    }
+
+
+def parse_housekeeping(body: bytes) -> dict:
+    (seq, mx, my, mz, hx, hy, hz, gx, gy, up) = HK_STRUCT.unpack(body)
+    return {
+        "seq": seq,
+        "mag_x_gauss": mx * 1e-4, "mag_y_gauss": my * 1e-4, "mag_z_gauss": mz * 1e-4,
+        "highg_x_mss": hx * 0.1, "highg_y_mss": hy * 0.1, "highg_z_mss": hz * 0.1,
+        "gyro_x_rads": gx * 0.002, "gyro_y_rads": gy * 0.002,
+        "uptime_s": up,
+    }
 
 # Correlation template: last 4 preamble bytes + sync (48 bits). 0x2DD4 is
 # DC-balanced, so the template mean doubles as the slicer threshold.
 _TEMPLATE_BYTES = PREAMBLE[-4:] + SYNC
 
 MIN_CORR_QUALITY = 0.45   # normalized correlation acceptance threshold
-MAX_CANDIDATES = 2000     # bound on decode attempts per capture
+MAX_CANDIDATES = 4000     # bound on decode attempts per capture
 
 
 @dataclass
 class FrameResult:
+    ftype: int              # FRAME_TYPE_TEST or FRAME_TYPE_TELEM
     seq: int
-    payload: bytes
+    payload: bytes          # body without the seq byte (test) / full body (telem)
     crc_rx: int
     crc_calc: int
     quality: float          # normalized preamble+sync correlation, 0..1
@@ -67,6 +123,14 @@ class FrameResult:
     @property
     def crc_ok(self) -> bool:
         return self.crc_rx == self.crc_calc
+
+    def parse(self) -> dict:
+        """Parse a FLIGHT or HOUSEKEEPING body into named SI-unit fields."""
+        if self.ftype == FRAME_TYPE_FLIGHT:
+            return parse_flight(self.payload)
+        if self.ftype == FRAME_TYPE_HK:
+            return parse_housekeeping(self.payload)
+        raise ValueError(f"frame type 0x{self.ftype:02X} has no parser")
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -101,14 +165,15 @@ def quadrature_demod(samples: np.ndarray) -> np.ndarray:
 
 def find_frames(samples: np.ndarray, sample_rate: int,
                 bitrate: int = BITRATE_BPS,
-                max_frames: int = 32) -> list[FrameResult]:
+                max_frames: int = 128) -> list[FrameResult]:
     """Demodulate and return every decodable frame in the capture, in order."""
     sps = sample_rate // bitrate
     if sps < 2:
         raise ValueError("sample rate too low for bitrate")
 
     freq = quadrature_demod(samples)
-    if len(freq) < sps * (len(_TEMPLATE_BYTES) * 8 + FRAME_BITS_AFTER_SYNC):
+    min_frame_bits = (1 + MIN_BODY_LEN + 2) * 8
+    if len(freq) < sps * (len(_TEMPLATE_BYTES) * 8 + min_frame_bits):
         return []
 
     # Bit matched filter: boxcar average over one bit period.
@@ -132,7 +197,6 @@ def find_frames(samples: np.ndarray, sample_rate: int,
     quality = corr / (tbits * dev_rad)
 
     results: list[FrameResult] = []
-    frame_span = (tbits + FRAME_BITS_AFTER_SYNC) * sps
     blocked = np.zeros(n_pos, dtype=bool)
 
     order = np.argsort(quality)[::-1][:MAX_CANDIDATES]
@@ -143,25 +207,44 @@ def find_frames(samples: np.ndarray, sample_rate: int,
             break          # order is quality-descending — nothing better left
         if blocked[n0]:
             continue
-        if n0 + frame_span > len(smoothed):
-            continue
 
         # Slicer threshold = mean over the (DC-balanced) template region —
         # this is exactly the carrier frequency offset.
         tpl_idx = n0 + np.arange(tbits) * sps
         center = float(np.mean(smoothed[tpl_idx]))
 
-        bit_idx = n0 + (tbits + np.arange(FRAME_BITS_AFTER_SYNC)) * sps
-        bits = (smoothed[bit_idx] > center).astype(np.uint8)
-        data = np.packbits(bits).tobytes()
+        # Type byte first — it sets the frame length.
+        type_idx = n0 + (tbits + np.arange(8)) * sps
+        if type_idx[-1] >= len(smoothed):
+            continue
+        ftype = int(np.packbits((smoothed[type_idx] > center).astype(np.uint8))[0])
+        body_len = BODY_LEN_BY_TYPE.get(ftype)
+        if body_len is None:
+            continue
 
-        body, crc_bytes = data[:BODY_LEN], data[BODY_LEN:BODY_LEN + 2]
-        crc_rx = (crc_bytes[0] << 8) | crc_bytes[1]
-        crc_calc = crc16_ccitt(body)
+        frame_bits = (1 + body_len + 2) * 8
+        if n0 + (tbits + frame_bits) * sps > len(smoothed):
+            continue
+
+        bit_idx = n0 + (tbits + np.arange(frame_bits)) * sps
+        bits = (smoothed[bit_idx] > center).astype(np.uint8)
+        data = np.packbits(bits).tobytes()   # type + body + crc
+
+        body = data[1:1 + body_len]
+        crc_rx = (data[-2] << 8) | data[-1]
+        crc_calc = crc16_ccitt(data[:1 + body_len])
+
+        if ftype == FRAME_TYPE_TEST:
+            seq, payload = body[0], body[1:]
+        elif ftype == FRAME_TYPE_FLIGHT:
+            seq, payload = struct.unpack_from("<H", body, 6)[0], body
+        else:   # FRAME_TYPE_HK — seq leads the body
+            seq, payload = struct.unpack_from("<H", body, 0)[0], body
 
         result = FrameResult(
-            seq=body[0],
-            payload=body[1:],
+            ftype=ftype,
+            seq=seq,
+            payload=payload,
             crc_rx=crc_rx,
             crc_calc=crc_calc,
             quality=float(quality[n0]),
@@ -170,6 +253,7 @@ def find_frames(samples: np.ndarray, sample_rate: int,
         )
         if result.crc_ok:
             results.append(result)
+            frame_span = (tbits + frame_bits) * sps
             lo = max(0, n0 - frame_span)
             blocked[lo: min(n_pos, n0 + frame_span)] = True
 
@@ -238,12 +322,31 @@ def main() -> int:
         return 2
 
     for fr in frames:
+        if fr.ftype == FRAME_TYPE_FLIGHT:
+            t = fr.parse()
+            print(
+                f"[rx] FLIGHT {t['callsign']} seq={t['seq']} phase={t['phase_name']} "
+                f"alt={t['alt_agl_m']:.1f}m vel={t['velocity_mps']:.1f}m/s "
+                f"apogee={t['pred_apogee_m']:.0f}m brake={t['deployment_frac']:.0%} "
+                f"gps={t['gps_fix']}/{t['gps_sats']}sats "
+                f"({t['gps_lat_deg']:.5f},{t['gps_lon_deg']:.5f}) "
+                f"q={fr.quality:.2f} off={fr.freq_offset_hz / 1e3:+.2f}kHz"
+            )
+            continue
+        if fr.ftype == FRAME_TYPE_HK:
+            t = fr.parse()
+            print(
+                f"[rx] HK seq={t['seq']} mag=({t['mag_x_gauss']:.4f},{t['mag_y_gauss']:.4f},"
+                f"{t['mag_z_gauss']:.4f})G highg=({t['highg_x_mss']:.1f},{t['highg_y_mss']:.1f},"
+                f"{t['highg_z_mss']:.1f}) up={t['uptime_s']}s q={fr.quality:.2f}"
+            )
+            continue
         try:
             text = fr.payload.decode("ascii")
         except UnicodeDecodeError:
             text = fr.payload.hex(" ")
         print(
-            f"[rx] seq={fr.seq} payload={text!r} quality={fr.quality:.2f} "
+            f"[rx] TEST seq={fr.seq} payload={text!r} quality={fr.quality:.2f} "
             f"offset={fr.freq_offset_hz / 1e3:+.2f} kHz crc=OK"
         )
 

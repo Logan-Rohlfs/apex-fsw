@@ -52,6 +52,15 @@
 #define RADIO_GFSK_BITRATE_BPS  10000UL
 #define RADIO_GFSK_DEV_HZ       25000UL
 
+// FCC Part 97 station identification (§97.119): the callsign is embedded in
+// ASCII in every telemetry frame, satisfying the 10-minute ID requirement.
+#define RADIO_CALLSIGN          "KG5LDI"
+
+// Telemetry beacon rates by phase. FLIGHT frame = 51 B / ~41 ms airtime at
+// 10 kbps; one beat per second is replaced by the HOUSEKEEPING frame (33 B).
+#define RADIO_TELEM_IDLE_HZ     30   // IDLE / LANDED
+#define RADIO_TELEM_FLIGHT_HZ   10   // ARMED / BOOST / COAST / DESCENT
+
 // ─── I2C Addresses ────────────────────────────────────────────────────────────
 #define BMP581_ADDR         0x46    // ADR tied to GND
 #define ADXL375_ADDR        0x53    // SDO tied to GND

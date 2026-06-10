@@ -171,11 +171,34 @@ void loop() {
 
 #else // ── Normal / debug loop ──────────────────────────────────────────────────
 
+// Telemetry beacon: off by default on the bench (monitor builds), always on
+// in flight builds. Toggled with TELEM_ON / TELEM_OFF over USB.
+#ifdef APEX_MONITOR
+static bool _telem_enabled = false;
+#else
+static bool _telem_enabled = true;
+#endif
+
 void loop() {
     static uint32_t last_gps_ms = 0;
     if (millis() - last_gps_ms >= 100) {
         last_gps_ms = millis();
         gps_update();
+    }
+
+    // ── Telemetry downlink ────────────────────────────────────────────────────
+    // 1 Hz on the pad / after landing, RADIO_TELEM_FLIGHT_HZ once armed.
+    // radio_telemetry_tx is non-blocking (~1 ms of SPI; ~42 ms airtime).
+    static uint32_t last_telem_ms = 0;
+    if (_telem_enabled) {
+        const bool quiescent = (g_state.phase == FlightPhase::IDLE ||
+                                g_state.phase == FlightPhase::LANDED);
+        const uint32_t period_ms =
+            1000U / (quiescent ? RADIO_TELEM_IDLE_HZ : RADIO_TELEM_FLIGHT_HZ);
+        if (millis() - last_telem_ms >= period_ms) {
+            last_telem_ms = millis();
+            radio_telemetry_tx();
+        }
     }
 
     static uint32_t last_print = 0;
@@ -210,6 +233,19 @@ void loop() {
         Serial.printf("!gps_fix:%d\n",       gps_fix_state());
         Serial.printf("!radio:%d\n",         radio_status());
         Serial.printf("!gps_sats:%d\n",      g_state.gps.satellites);
+
+        // Telemetry TX stats for the monitor's Link panel (2 Hz)
+        static uint32_t _last_link_ms = 0;
+        if (millis() - _last_link_ms >= 500) {
+            _last_link_ms = millis();
+            uint16_t seq; uint32_t sent, skipped;
+            radio_telemetry_stats(&seq, &sent, &skipped);
+            Serial.printf("!telem:%d\n", _telem_enabled ? 1 : 0);
+            Serial.printf("!tx_seq:%u\n", seq);
+            Serial.printf("!tx_sent:%lu\n", (unsigned long)sent);
+            Serial.printf("!tx_skipped:%lu\n", (unsigned long)skipped);
+        }
+
         if (g_state.gps.time_valid) {
             char utc[32];
             gps_utc_string(utc, sizeof(utc));
@@ -233,6 +269,13 @@ void loop() {
                     radio_marker_tx(RADIO_FREQ_HZ);
                 } else if (strcmp(_cmd_buf, "RADIO_DATA_TEST") == 0) {
                     radio_data_test_tx();
+                } else if (strcmp(_cmd_buf, "TELEM_ON") == 0) {
+                    _telem_enabled = true;
+                    LOG_INFO("Telemetry beacon ON (%s, callsign in every frame)",
+                             RADIO_CALLSIGN);
+                } else if (strcmp(_cmd_buf, "TELEM_OFF") == 0) {
+                    _telem_enabled = false;
+                    LOG_INFO("Telemetry beacon OFF");
                 }
                 // TODO Phase 1: dispatch ARM / DISARM here
                 _cmd_len = 0;

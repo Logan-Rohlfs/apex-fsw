@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Apex Flight Computer — Serial Monitor
+Apex Flight Computer — Ground Monitor
 
-Unified interface for laptop-connected Teensy (APEX_MONITOR build).
-Accepts three line formats from firmware:
+Two data sources, switched in the toolbar:
+  USB Serial   — laptop-connected Teensy (APEX_MONITOR build), full sensor set
+  RTL-SDR      — 2-GFSK telemetry downlink (441.480 MHz) with live spectrum,
+                 waterfall, ground-station plot layout, and link stats
+
+Both sources speak the same line protocol:
   >key:value    numeric — routed to live plots and values table
-  !key:value    state   — routed to state panel (phase, health flags, etc.)
+  !key:value    state   — routed to state panel (phase, health, link, etc.)
   #LEVEL: msg   log     — shown in the log panel with color coding
 
-Sends newline-terminated ASCII commands to the Teensy via the command
-input at the bottom of the log panel. Commands: ARM, DISARM (more once
-the state machine is implemented).
+Commands (USB serial only): ARM, DISARM, TELEM_ON, TELEM_OFF,
+RADIO_DATA_TEST, RADIO_MARKER.
 
 Run: python scripts/monitor.py
 """
@@ -31,17 +34,19 @@ import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea,
-    QFrame, QPlainTextEdit, QTextEdit, QSizePolicy, QGridLayout, QGroupBox,
+    QFrame, QTextEdit, QGridLayout, QGroupBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QCompleter,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex, QRectF
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
+from PyQt5.QtGui import QFont
 
 from radio_gfsk_rx import (
     BITRATE_BPS,
     DEFAULT_FREQ_HZ,
     DEFAULT_SAMPLE_RATE_HZ,
     DEVIATION_HZ,
+    FRAME_TYPE_FLIGHT,
+    FRAME_TYPE_HK,
     find_frames,
     load_u8_iq,
 )
@@ -64,6 +69,19 @@ PLOT_GROUPS = [
     ("Baro Alt",  ["baro_alt"],                               ["#ffdd44"]),
     ("Baro Temp", ["baro_temp"],                             ["#ff9922"]),
     ("Mag",       ["mag_x",   "mag_y",   "mag_z"],          ["#ff9933", "#33ff99", "#9933ff"]),
+]
+
+# Ground-station layout for the RTL-SDR source — keys match the FLIGHT/HK
+# telemetry frames (radio_gfsk_rx.py), tuned for flight watching + HORIZON ops.
+RADIO_PLOT_GROUPS = [
+    ("Altitude",         ["alt_agl", "baro_alt", "pred_apogee", "gps_alt_msl"],
+                         ["#00d4ff", "#ffdd44", "#a8ff3e", "#ff44aa"]),
+    ("Velocity / Accel", ["velocity", "vert_accel", "accel_z"],
+                         ["#ff6b35", "#44ff44", "#4488ff"]),
+    ("Roll / Airbrake",  ["roll_rate", "deployment"],
+                         ["#ff8844", "#00d4ff"]),
+    ("Link",             ["packet_loss_pct", "radio_rx_quality", "radio_freq_offset_khz"],
+                         ["#ff4444", "#44ffaa", "#ffdd44"]),
 ]
 
 # Sensor health bitmask (must match config.h)
@@ -122,6 +140,8 @@ KNOWN_COMMANDS = [
     "RADIO_DATA_TEST",
     "RADIO_MARKER",
     "RADIO_MARKER_441",
+    "TELEM_ON",
+    "TELEM_OFF",
 ]
 
 # ─── Serial worker ────────────────────────────────────────────────────────────
@@ -211,6 +231,10 @@ class SerialWorker(QThread):
 
 class RadioWorker(QThread):
     line_received  = pyqtSignal(str)
+    # Telemetry data lines carry the frame's true reception time (monotonic s),
+    # back-computed from its sample position — frames are decoded in 0.5 s
+    # batches, and batch-time stamps would collapse 5 frames onto one plot x.
+    line_received_at = pyqtSignal(str, float)
     status_changed = pyqtSignal(str, bool)
     spectrum_ready = pyqtSignal(object)   # float32 dB array, FFT_BINS long, DC-centered
 
@@ -224,7 +248,10 @@ class RadioWorker(QThread):
         self._ppm = 0
         self._device = "0"
         self._packet_count = 0
-        self._seen_frames: dict[tuple, float] = {}   # (seq, payload) → last-seen time
+        self._seen_frames: dict[tuple, float] = {}   # (ftype, seq, payload) → last-seen
+        self._recent_seqs: deque = deque(maxlen=50)    # for packet-loss %
+        self._frame_times: deque = deque(maxlen=20)    # reception times, for rate
+        self._last_telem_log_s = 0.0
         self._last_spec_s = 0.0
         self._decode_busy = False
         self._fft_window = np.hanning(FFT_BINS).astype(np.float32)
@@ -261,6 +288,8 @@ class RadioWorker(QThread):
         self._running = True
         self._packet_count = 0
         self._seen_frames.clear()
+        self._recent_seqs.clear()
+        self._frame_times.clear()
 
         try:
             self._proc = subprocess.Popen(
@@ -313,7 +342,7 @@ class RadioWorker(QThread):
                 # Decode runs on its own thread — it chews through the whole
                 # rolling buffer (~seconds of CPU) and must never stall reads,
                 # or the rtl_sdr pipe backs up and the spectrum stutters.
-                if (len(raw) >= min_bytes and now - last_decode_s >= 0.5
+                if (len(raw) >= min_bytes and now - last_decode_s >= 0.25
                         and not self._decode_busy):
                     last_decode_s = now
                     self._decode_busy = True
@@ -357,27 +386,105 @@ class RadioWorker(QThread):
             if now_s - seen_s > 30.0:
                 del self._seen_frames[key]
 
+        n_samples = len(samples)
         for fr in frames:
-            key = (fr.seq, fr.payload)
+            key = (fr.ftype, fr.seq, fr.payload)
             if key in self._seen_frames:
                 self._seen_frames[key] = now_s
                 continue
             self._seen_frames[key] = now_s
             self._packet_count += 1
 
-            try:
-                text = fr.payload.decode("ascii")
-            except UnicodeDecodeError:
-                text = fr.payload.hex(" ")
+            # True reception time of this frame (monotonic): the buffer
+            # snapshot was taken at now_s and ends "now".
+            t_frame = now_s - (n_samples - fr.sample_index) / self._sample_rate
 
-            self.line_received.emit(
-                f"#INFO: radio frame seq={fr.seq} payload=\"{text}\" crc=OK "
+            if fr.ftype in (FRAME_TYPE_FLIGHT, FRAME_TYPE_HK):
+                self._emit_telemetry(fr, now_s, t_frame)
+            else:
+                try:
+                    text = fr.payload.decode("ascii")
+                except UnicodeDecodeError:
+                    text = fr.payload.hex(" ")
+                self.line_received.emit(
+                    f"#INFO: radio test frame seq={fr.seq} payload=\"{text}\" crc=OK "
+                    f"quality={fr.quality:.2f} offset={fr.freq_offset_hz / 1e3:+.2f} kHz"
+                )
+
+            self.line_received_at.emit(f">radio_packet_count:{self._packet_count}", t_frame)
+            self.line_received_at.emit(f">radio_rx_quality:{fr.quality:.3f}", t_frame)
+            self.line_received_at.emit(f">radio_freq_offset_khz:{fr.freq_offset_hz / 1e3:.3f}", t_frame)
+            self.line_received.emit("!radio_rx:1")
+
+    def _track_loss(self, seq: int) -> float:
+        """Packet-loss % over the last ~50 frames, from seq-number gaps."""
+        if self._recent_seqs and abs(seq - self._recent_seqs[-1]) > 1000:
+            self._recent_seqs.clear()   # counter reset (reboot / u16 wrap)
+        self._recent_seqs.append(seq)
+        if len(self._recent_seqs) < 2:
+            return 0.0
+        span = max(self._recent_seqs) - min(self._recent_seqs) + 1
+        return max(0.0, 100.0 * (1.0 - len(set(self._recent_seqs)) / span))
+
+    def _emit_telemetry(self, fr, now_s: float, t_frame: float):
+        """Route a FLIGHT/HK frame into the plot/state pipeline, stamped with
+        its true reception time so plot points land where the frame arrived."""
+        t = fr.parse()
+        emit = lambda line: self.line_received_at.emit(line, t_frame)
+        loss = self._track_loss(t['seq'])
+        emit(f">packet_loss_pct:{loss:.1f}")
+
+        # Link panel stats — measured packet rate from true reception times
+        self._frame_times.append(t_frame)
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            rate = (len(self._frame_times) - 1) / span if span > 0 else 0.0
+        else:
+            rate = 0.0
+        emit(f"!rx_seq:{t['seq']}")
+        emit(f"!rx_rate:{rate:.1f} Hz")
+        emit(f"!rx_loss:{loss:.1f} %")
+        emit(f"!rx_quality:{fr.quality:.2f}")
+        emit(f"!rx_offset:{fr.freq_offset_hz / 1e3:+.2f} kHz")
+        emit(f"!rx_count:{self._packet_count}")
+
+        if fr.ftype == FRAME_TYPE_HK:
+            for axis in "xyz":
+                emit(f">mag_{axis}:{t[f'mag_{axis}_gauss']:.4f}")
+                emit(f">highg_{axis}:{t[f'highg_{axis}_mss']:.2f}")
+            emit(f">gyro_x:{t['gyro_x_rads']:.4f}")
+            emit(f">gyro_y:{t['gyro_y_rads']:.4f}")
+            return
+
+        # FLIGHT frame — same keys the USB serial stream uses, plus extras
+        baro_alt = 44330.0 * (1.0 - (max(t['baro_pa'], 1.0) / 101325.0) ** (1.0 / 5.255))
+        emit(f">alt_agl:{t['alt_agl_m']:.2f}")
+        emit(f">baro_alt:{baro_alt:.1f}")
+        emit(f">baro_pa:{t['baro_pa']:.0f}")
+        emit(f">baro_temp:{t['baro_temp_c']:.1f}")
+        emit(f">velocity:{t['velocity_mps']:.3f}")
+        emit(f">pred_apogee:{t['pred_apogee_m']:.1f}")
+        emit(f">vert_accel:{t['vert_accel_mps2']:.3f}")
+        emit(f">accel_z:{t['accel_z_mss']:.3f}")
+        emit(f">roll_rate:{t['roll_rate_rads']:.4f}")
+        emit(f">deployment:{t['deployment_frac']:.3f}")
+        emit(f">gps_alt_msl:{t['gps_alt_msl_m']:.1f}")
+        emit(f">gps_lat:{t['gps_lat_deg']:.6f}")
+        emit(f">gps_lon:{t['gps_lon_deg']:.6f}")
+        emit(f"!phase:{t['phase_name']}")
+        emit(f"!health:{t['health']}")
+        emit(f"!gps_fix:{t['gps_fix']}")
+        emit(f"!gps_sats:{t['gps_sats']}")
+        emit("!radio:0")   # receiving telemetry proves the TX radio is alive
+
+        # Log line rate-limited — telemetry arrives continuously
+        if now_s - self._last_telem_log_s >= 5.0:
+            self._last_telem_log_s = now_s
+            emit(
+                f"#INFO: telemetry {t['callsign']} seq={t['seq']} phase={t['phase_name']} "
+                f"alt={t['alt_agl_m']:.1f}m gps={t['gps_sats']}sats "
                 f"quality={fr.quality:.2f} offset={fr.freq_offset_hz / 1e3:+.2f} kHz"
             )
-            self.line_received.emit(f">radio_packet_count:{self._packet_count}")
-            self.line_received.emit(f">radio_rx_quality:{fr.quality:.3f}")
-            self.line_received.emit(f">radio_freq_offset_khz:{fr.freq_offset_hz / 1e3:.3f}")
-            self.line_received.emit("!radio_rx:1")
 
     def _terminate_proc(self):
         proc = self._proc
@@ -650,7 +757,6 @@ class PlotGroupWidget(QGroupBox):
         super().__init__(title)
         self.keys    = keys
         self.colors  = colors
-        self.window_s = window_s
 
         self._t   = {k: deque(maxlen=MAX_POINTS) for k in keys}
         self._y   = {k: deque(maxlen=MAX_POINTS) for k in keys}
@@ -669,7 +775,10 @@ class PlotGroupWidget(QGroupBox):
             axis.setPen(pg.mkPen(BORDER_HI))
             axis.setTextPen(pg.mkPen(TEXT_DIM))
         self.plot.getAxis("bottom").setLabel("t (s)")
-        self.plot.enableAutoRange(axis="xy")
+        # y auto-ranges; x is scrolled by refresh() against wall-clock time so
+        # the view glides at the UI frame rate even when data arrives in bursts
+        self.plot.enableAutoRange(axis="y")
+        self._last_push = None   # monotonic time of newest sample
         self.plot.addLegend(
             offset=(-10, 10),
             brush=pg.mkBrush("#13132ad0"),
@@ -696,19 +805,26 @@ class PlotGroupWidget(QGroupBox):
         self._t[key].append(t - self._t0)
         self._y[key].append(value)
         self._dirty.add(key)
+        self._last_push = time.monotonic()
 
-    def refresh(self, window_s: int):
+    def refresh(self, window_s: int, t_now: float = None):
         if window_s != self._last_window:
             self._last_window = window_s
             self._dirty.update(k for k in self.keys if self._t[k])
-        if not self._dirty:
-            return
-        for key in self._dirty:
-            t_arr = np.array(self._t[key])
-            y_arr = np.array(self._y[key])
-            i0 = np.searchsorted(t_arr, t_arr[-1] - window_s)
-            self.curves[key].setData(t_arr[i0:], y_arr[i0:])
-        self._dirty.clear()
+        if self._dirty:
+            for key in self._dirty:
+                t_arr = np.array(self._t[key])
+                y_arr = np.array(self._y[key])
+                i0 = np.searchsorted(t_arr, t_arr[-1] - window_s)
+                self.curves[key].setData(t_arr[i0:], y_arr[i0:])
+            self._dirty.clear()
+
+        # Smooth scroll: glide the x-window with wall-clock time while data is
+        # live; freeze after 5 s of silence so a finished run stays inspectable.
+        if (t_now is not None and self._t0 is not None and self._last_push is not None
+                and time.monotonic() - self._last_push <= 5.0):
+            x_max = t_now - self._t0
+            self.plot.setXRange(x_max - window_s, x_max, padding=0)
 
     def clear(self):
         for key in self.keys:
@@ -716,6 +832,7 @@ class PlotGroupWidget(QGroupBox):
             self._y[key].clear()
             self.curves[key].setData([], [])
         self._t0 = None
+        self._last_push = None
         self._dirty.clear()
 
     def add_key(self, key: str, color: str = "#ffffff"):
@@ -775,6 +892,44 @@ class StatePanel(QWidget):
         radio_layout.addWidget(self.radio_label)
         layout.addWidget(radio_box)
 
+        # Link stats — TX side over USB serial, RX side over the SDR
+        link_box = QGroupBox("Link")
+        link_grid = QGridLayout(link_box)
+        link_grid.setContentsMargins(6, 4, 6, 4)
+        link_grid.setVerticalSpacing(2)
+        self._link_value_labels: dict[str, QLabel] = {}
+        self._link_serial_widgets: list[QLabel] = []
+        self._link_radio_widgets: list[QLabel] = []
+
+        def link_row(row: int, title: str, key: str, widgets: list):
+            k = QLabel(title)
+            k.setFont(mono_font(9))
+            k.setStyleSheet("color:#aaaacc;")
+            v = QLabel("—")
+            v.setFont(mono_font(9, bold=True))
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            v.setStyleSheet("color:#ffffff;")
+            link_grid.addWidget(k, row, 0)
+            link_grid.addWidget(v, row, 1)
+            widgets.extend((k, v))
+            self._link_value_labels[key] = v
+
+        # Serial mode: what the flight computer reports about its own TX
+        link_row(0, "Beacon",  "telem",      self._link_serial_widgets)
+        link_row(1, "TX seq",  "tx_seq",     self._link_serial_widgets)
+        link_row(2, "Sent",    "tx_sent",    self._link_serial_widgets)
+        link_row(3, "Skipped", "tx_skipped", self._link_serial_widgets)
+        # Radio mode: what the SDR receiver measures
+        link_row(4, "RX seq",  "rx_seq",     self._link_radio_widgets)
+        link_row(5, "Rate",    "rx_rate",    self._link_radio_widgets)
+        link_row(6, "Loss",    "rx_loss",    self._link_radio_widgets)
+        link_row(7, "Quality", "rx_quality", self._link_radio_widgets)
+        link_row(8, "Offset",  "rx_offset",  self._link_radio_widgets)
+        link_row(9, "Packets", "rx_count",   self._link_radio_widgets)
+
+        layout.addWidget(link_box)
+        self.set_link_mode(radio=False)
+
         # GPS status row
         gps_box = QGroupBox("GPS")
         gps_layout = QHBoxLayout(gps_box)
@@ -833,14 +988,18 @@ class StatePanel(QWidget):
         layout.addWidget(values_box)
         layout.addStretch()
 
-        self._phase = "IDLE"
+    def set_link_mode(self, radio: bool):
+        """Show TX stats (USB serial) or RX packet stats (SDR) in the Link box."""
+        for w in self._link_serial_widgets:
+            w.setVisible(not radio)
+        for w in self._link_radio_widgets:
+            w.setVisible(radio)
 
     def update_phase(self, phase: str):
         phase = phase.strip().upper()
         color = PHASE_COLORS.get(phase, PHASE_COLORS["UNKNOWN"])
         self.phase_label.setText(phase)
         self.phase_label.setStyleSheet(badge_style(color, radius=6))
-        self._phase = phase
 
     def update_health(self, bitmask: int):
         for name, bit in SENSOR_BITS.items():
@@ -917,6 +1076,13 @@ class StatePanel(QWidget):
                 self.radio_label.setStyleSheet(badge_style(GOOD if ok else AMBER, radius=3))
             except ValueError:
                 pass
+        elif key == "telem":
+            lbl = self._link_value_labels["telem"]
+            on = value.strip() == "1"
+            lbl.setText("ON" if on else "OFF")
+            lbl.setStyleSheet(f"color:{GOOD if on else TEXT_DIM};")
+        elif key in self._link_value_labels:
+            self._link_value_labels[key].setText(value)
 
 # ─── Main window ─────────────────────────────────────────────────────────────
 
@@ -932,8 +1098,9 @@ class MainWindow(QMainWindow):
         self._t_start = None
         self._window_s = DEFAULT_WINDOW_S
 
-        # Key → PlotGroupWidget mapping for routing
-        self._key_to_group: dict[str, PlotGroupWidget] = {}
+        # Key → PlotGroupWidget mapping for routing, per source
+        self._key_to_group_serial: dict[str, PlotGroupWidget] = {}
+        self._key_to_group_radio: dict[str, PlotGroupWidget] = {}
         self._overflow_group: PlotGroupWidget | None = None
 
         # Debounced restart so gain/freq/ppm changes apply while connected
@@ -1119,12 +1286,29 @@ class MainWindow(QMainWindow):
         self.spectrum_panel.setVisible(self._source_mode() == "radio")
         self._plot_layout.addWidget(self.spectrum_panel)
 
+        # Two layouts share the panel: full sensor groups for USB serial, a
+        # ground-station set for the radio source. Visibility tracks the source.
+        radio = self._source_mode() == "radio"
+
+        self._serial_groups: list[PlotGroupWidget] = []
         for title, keys, colors in PLOT_GROUPS:
             group = PlotGroupWidget(title, keys, colors)
+            group.setVisible(not radio)
+            self._serial_groups.append(group)
             self._plot_groups.append(group)
             self._plot_layout.addWidget(group)
             for key in keys:
-                self._key_to_group[key] = group
+                self._key_to_group_serial[key] = group
+
+        self._radio_groups: list[PlotGroupWidget] = []
+        for title, keys, colors in RADIO_PLOT_GROUPS:
+            group = PlotGroupWidget(title, keys, colors)
+            group.setVisible(radio)
+            self._radio_groups.append(group)
+            self._plot_groups.append(group)
+            self._plot_layout.addWidget(group)
+            for key in keys:
+                self._key_to_group_radio[key] = group
 
         self._plot_layout.addStretch()
         scroll.setWidget(container)
@@ -1196,6 +1380,7 @@ class MainWindow(QMainWindow):
         self._worker.status_changed.connect(self._on_status)
         self._worker.reconnected.connect(self._on_reconnect)
         self._radio_worker.line_received.connect(self._on_line)
+        self._radio_worker.line_received_at.connect(self._on_line)
         self._radio_worker.status_changed.connect(self._on_status)
         self._radio_worker.spectrum_ready.connect(self.spectrum_panel.update_spectrum)
         self._radio_worker.finished.connect(self._on_worker_finished)
@@ -1226,6 +1411,13 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "spectrum_panel"):
             self.spectrum_panel.setVisible(radio)
+            for group in self._serial_groups:
+                group.setVisible(not radio)
+            for group in self._radio_groups:
+                group.setVisible(radio)
+
+        if hasattr(self, "state_panel"):
+            self.state_panel.set_link_mode(radio)
 
         if hasattr(self, "cmd_input"):
             self.cmd_input.setEnabled(not radio)
@@ -1336,8 +1528,8 @@ class MainWindow(QMainWindow):
 
     # ── Data routing ──────────────────────────────────────────────────────────
 
-    def _on_line(self, line: str):
-        now = time.monotonic()
+    def _on_line(self, line: str, at: float = None):
+        now = time.monotonic() if at is None else at
         if self._t_start is None:
             self._t_start = now
         t = now - self._t_start
@@ -1347,10 +1539,12 @@ class MainWindow(QMainWindow):
             try:
                 key, val_str = line[1:].split(":", 1)
                 value = float(val_str)
-                group = self._key_to_group.get(key)
+                key_map = (self._key_to_group_radio if self._source_mode() == "radio"
+                           else self._key_to_group_serial)
+                group = key_map.get(key)
                 if group is None:
                     group = self._get_or_create_overflow()
-                    self._key_to_group[key] = group
+                    key_map[key] = group
                     group.add_key(key)
                 group.push(key, t, value)
                 self.state_panel.update_value(key, value)
@@ -1420,8 +1614,9 @@ class MainWindow(QMainWindow):
     # ── Plot refresh ──────────────────────────────────────────────────────────
 
     def _refresh_plots(self):
+        t_now = None if self._t_start is None else time.monotonic() - self._t_start
         for group in self._plot_groups:
-            group.refresh(self._window_s)
+            group.refresh(self._window_s, t_now)
         self.state_panel.flush_values()
 
     # ── Status ────────────────────────────────────────────────────────────────
@@ -1545,18 +1740,15 @@ class MainWindow(QMainWindow):
             QPushButton:hover       {{ background: #2a2a4a; border-color: {ACCENT}; }}
             QPushButton:pressed     {{ background: #16162e; }}
 
-            /* ── ComboBox arrow + dropdown popup ─────────────────────────── */
+            /* ── ComboBox dropdown + popup ─────────────────────────────────
+               Leave arrow glyphs to Qt's native style. Qt stylesheets do not
+               reliably support CSS border triangles on all platforms, which
+               can render as empty symbol boxes instead of arrows. */
             QComboBox::drop-down    {{ subcontrol-origin: padding;
                                        subcontrol-position: top right;
                                        width: 18px;
                                        border-left: 1px solid #303050;
                                        border-radius: 0 3px 3px 0; }}
-            QComboBox::down-arrow   {{ border-left:  4px solid transparent;
-                                       border-right: 4px solid transparent;
-                                       border-top:   5px solid #8888cc;
-                                       width: 0; height: 0; }}
-            QComboBox::down-arrow:disabled
-                                    {{ border-top-color: #444455; }}
 
             QComboBox QAbstractItemView {{
                                        background: {SURFACE};
@@ -1566,7 +1758,9 @@ class MainWindow(QMainWindow):
                                        selection-color: #ffffff;
                                        outline: none; }}
 
-            /* ── SpinBox arrows ───────────────────────────────────────────── */
+            /* ── SpinBox arrow button frames ────────────────────────────────
+               As with combo boxes, use native Qt arrow drawing for the glyphs
+               so no icon font or platform-specific symbol is required. */
             QSpinBox::up-button     {{ subcontrol-origin: border;
                                        subcontrol-position: top right;
                                        width: 16px;
@@ -1578,18 +1772,19 @@ class MainWindow(QMainWindow):
                                        width: 16px;
                                        border-left: 1px solid #303050;
                                        background: transparent; }}
-            QSpinBox::up-arrow      {{ border-left:   3px solid transparent;
-                                       border-right:  3px solid transparent;
-                                       border-bottom: 4px solid #8888cc;
-                                       width: 0; height: 0; }}
-            QSpinBox::down-arrow    {{ border-left:  3px solid transparent;
-                                       border-right: 3px solid transparent;
-                                       border-top:   4px solid #8888cc;
-                                       width: 0; height: 0; }}
-            QSpinBox::up-arrow:disabled,
-            QSpinBox::down-arrow:disabled
-                                    {{ border-bottom-color: #444455;
-                                       border-top-color:    #444455; }}
+            QDoubleSpinBox::up-button
+                                    {{ subcontrol-origin: border;
+                                       subcontrol-position: top right;
+                                       width: 16px;
+                                       border-left: 1px solid #303050;
+                                       border-bottom: 1px solid #303050;
+                                       background: transparent; }}
+            QDoubleSpinBox::down-button
+                                    {{ subcontrol-origin: border;
+                                       subcontrol-position: bottom right;
+                                       width: 16px;
+                                       border-left: 1px solid #303050;
+                                       background: transparent; }}
 
             /* ── Scrollbars ───────────────────────────────────────────────── */
             QScrollBar:vertical     {{ background: {BG}; width: 8px;

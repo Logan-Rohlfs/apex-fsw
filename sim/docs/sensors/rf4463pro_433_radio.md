@@ -45,9 +45,28 @@ The test downlink uses **2-GFSK** — the Si4463's native, recommended modulatio
 | Modulation | 2-GFSK (MSB-first, bit 1 = +deviation) |
 | Bit rate | 10 kbps |
 | Deviation | ±25 kHz (Carson BW ≈ 60 kHz, inside the 125 kHz allocation) |
-| Frame | `0xAA`×8 preamble, `0x2D 0xD4` sync, seq byte, payload, CRC-16-CCITT |
-| TX firmware | `fsw/src/radio.cpp` (`radio_data_test_tx`, TX-only modem properties) |
+| Frame | `0xAA`×8 preamble, `0x2D 0xD4` sync, type byte, body, CRC-16-CCITT |
+| Frame types | `0x01` test, `0x02` FLIGHT telemetry, `0x03` HOUSEKEEPING |
+| TX firmware | `fsw/src/radio.cpp` (`radio_data_test_tx` / `radio_telemetry_tx`) |
 | SDR decoder | `sim/scripts/radio_gfsk_rx.py` (quadrature discriminator, used by the monitor) |
+
+**FLIGHT frame (type `0x02`, 38-byte body, little-endian — `TelemFlight` in
+radio.cpp), every beat:** callsign `KG5LDI` (ASCII, FCC §97.119 ID in every
+frame), seq u16, phase, health, gps_fix, gps_sats, GPS lat/lon (f32), then
+scaled int16: gps_alt (0.5 m), alt_agl (0.1 m), velocity (0.02 m/s),
+pred_apogee (0.1 m), vert_accel + accel_z (0.01 m/s²), roll_rate
+(0.002 rad/s), deployment u8 (/255), baro u16 (2 Pa), temp i8 (°C).
+Carries everything HORIZON needs to track plus the live-plot set.
+
+**HOUSEKEEPING frame (type `0x03`, 20-byte body — `TelemHousekeeping`),
+replaces one beat per second:** seq, mag xyz (1e-4 G), high-g xyz (0.1 m/s²),
+off-axis gyro xy (0.002 rad/s), uptime.
+
+Beacon rates set in config.h (`RADIO_TELEM_IDLE_HZ` / `RADIO_TELEM_FLIGHT_HZ`);
+at 10 Hz flight rate duty is ~44 %. Toggled with `TELEM_ON` / `TELEM_OFF` in
+monitor builds (default off on the bench); flight builds beacon by default.
+The monitor's radio source shows a dedicated ground-station layout (altitude /
+velocity / roll & airbrake / link quality with packet-loss from seq gaps).
 
 The Teensy side only needs the TX modem properties (mod type, data rate, NCO,
 deviation) — no WDS blob — because the receiver is an SDR. A second RF4463PRO

@@ -1,9 +1,13 @@
 #include "radio.h"
 #include "config.h"
 #include "debug.h"
+#include "flight_state.h"
+#include "sensors.h"
+#include "gps.h"
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <string.h>
 
 // Si4463 SPI commands used here
 #define SI_PART_INFO     0x01
@@ -20,11 +24,68 @@ static int8_t _status = -1;
 #define RADIO_OUTDIV            8UL
 #define RADIO_PLL_FRAC_SCALE    (1UL << 19)
 
-// GFSK test frame: software-framed (preamble/sync/CRC built here, not by the
-// packet handler) so the SDR-side decoder fully defines the wire format.
+// GFSK frames are software-framed (preamble/sync/CRC built here, not by the
+// packet handler) so the SDR-side decoder fully defines the wire format:
+//   0xAA x8 preamble, 0x2D 0xD4 sync, type byte, body, CRC-16-CCITT(type+body)
 #define RADIO_GFSK_PREAMBLE_LEN 8U
 #define RADIO_GFSK_REPEATS      10U
 #define RADIO_GFSK_REPEAT_MS    100U
+
+#define RADIO_FRAME_TYPE_TEST   0x01
+#define RADIO_FRAME_TYPE_FLIGHT 0x02
+#define RADIO_FRAME_TYPE_HK     0x03
+
+// Downlink bodies — little-endian, mirrored by scripts/radio_gfsk_rx.py.
+// FLIGHT carries everything HORIZON needs to track plus the live-plot set,
+// every beat. HOUSEKEEPING carries slow diagnostic channels once per second.
+// Sensor channels are scaled int16 — classic telemetry practice, halves
+// airtime vs f32 at resolutions far below sensor noise.
+
+struct __attribute__((packed)) TelemFlight {
+    char     callsign[6];   // "KG5LDI" — Part 97 ID in every frame
+    uint16_t seq;
+    uint8_t  phase;         // FlightPhase enum value
+    uint8_t  health;        // sensor health bitmask
+    int8_t   gps_fix;       // gps_fix_state(): -1 offline … 4 3D+DR
+    uint8_t  gps_sats;
+    float    gps_lat_deg;   // f32 — int scaling would cost position precision
+    float    gps_lon_deg;
+    int16_t  gps_alt_msl;   // 0.5 m     (±16383 m)
+    int16_t  alt_agl;       // 0.1 m     (±3276 m)
+    int16_t  velocity;      // 0.02 m/s  (±655 m/s)
+    int16_t  pred_apogee;   // 0.1 m
+    int16_t  vert_accel;    // 0.01 m/s² (±327)
+    int16_t  accel_z;       // 0.01 m/s² — raw longitudinal IMU
+    int16_t  roll_rate;     // 0.002 rad/s (gyro_z, ±65.5)
+    uint8_t  deployment;    // airbrake 0..255 = 0..1
+    uint16_t baro_pa;       // 2 Pa units (0–131070 Pa)
+    int8_t   baro_temp;     // 1 °C
+};
+static_assert(sizeof(TelemFlight) == 38, "flight body layout drifted");
+
+struct __attribute__((packed)) TelemHousekeeping {
+    uint16_t seq;           // shares the telemetry seq counter
+    int16_t  mag[3];        // 1e-4 gauss
+    int16_t  highg[3];      // 0.1 m/s² (±3276 — ADXL375 200 g = 1962)
+    int16_t  gyro_xy[2];    // 0.002 rad/s — off-axis rates
+    uint16_t uptime_s;
+};
+static_assert(sizeof(TelemHousekeeping) == 20, "housekeeping body layout drifted");
+
+// Scale a float into a clamped int16 telemetry field.
+static inline int16_t tlm_s16(float v, float scale) {
+    const float s = v * scale;
+    if (s >=  32767.0f) return  32767;
+    if (s <= -32768.0f) return -32768;
+    return (int16_t)lroundf(s);
+}
+
+static bool _gfsk_ready = false;   // modem configured for GFSK packet TX
+
+// Telemetry TX statistics — reported over USB for the monitor's Link panel
+static uint16_t _telem_seq     = 0;
+static uint32_t _telem_sent    = 0;
+static uint32_t _telem_skipped = 0;   // beats dropped because TX was still on air
 
 // ─── Low-level SPI helpers ────────────────────────────────────────────────────
 
@@ -124,6 +185,7 @@ static bool radio_change_state_ready() {
 }
 
 static bool radio_configure_cw() {
+    _gfsk_ready = false;   // CW marker reprograms the modem — GFSK must reconfigure
     // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-525 MHz, high-performance PLL.
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
@@ -159,7 +221,11 @@ static uint16_t crc16_ccitt(const uint8_t* data, uint8_t len) {
 //   MODEM_DATA_RATE = bitrate * 10 with TXOSR=10x
 //   MODEM_TX_NCO_MODE = xtal frequency (TXOSR field 0 = 10x)
 //   MODEM_FREQ_DEV = (2^19 * outdiv * dev_hz) / (2 * xtal)   [peak, per datasheet]
-static bool radio_configure_gfsk(uint8_t frame_len) {
+static bool radio_configure_gfsk() {
+    // GLOBAL_CONFIG (0x0000): FIFO_MODE=1 — unified 129-byte TX FIFO (we never
+    // receive on this chip), needed for the 71-byte telemetry frame.
+    { const uint8_t c[] = { 0x11, 0x00, 0x01, 0x00, 0x30 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
+
     // MODEM_CLKGEN_BAND (0x2051): OUTDIV=8 for 420-525 MHz, high-performance PLL.
     { const uint8_t c[] = { 0x11, 0x20, 0x01, 0x51, 0x0C }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
@@ -205,18 +271,35 @@ static bool radio_configure_gfsk(uint8_t frame_len) {
     { const uint8_t c[] = { 0x11, 0x10, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // PREAMBLE_TX_LENGTH = 0
     { const uint8_t c[] = { 0x11, 0x11, 0x01, 0x00, 0x80 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // SYNC_CONFIG: skip sync TX
     { const uint8_t c[] = { 0x11, 0x12, 0x01, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }   // PKT_CRC_CONFIG: none
-    {
-        const uint8_t c[] = { 0x11, 0x12, 0x02, 0x0C, 0x00, frame_len };                                              // PKT_FIELD_1_LENGTH
-        if (!send_cmd(c, sizeof(c))) return false; cs_high();
-    }
     { const uint8_t c[] = { 0x11, 0x12, 0x02, 0x0E, 0x00, 0x00 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); } // FIELD_1_CONFIG / FIELD_1_CRC_CONFIG
+    // PKT_FIELD_1_LENGTH is set per-frame in radio_tx_frame (lengths vary by type)
 
+    _gfsk_ready = true;
     return true;
 }
 
-// Load one frame into the TX FIFO and transmit it, blocking until the chip
-// returns to READY (~frame_len * 8 / bitrate seconds; 28 bytes ≈ 22 ms).
-static bool radio_tx_frame(const uint8_t* frame, uint8_t len) {
+// Returns the Si4463 device state (low nibble of REQUEST_DEVICE_STATE), or
+// 0xFF on CTS timeout. READY = 0x03, TX = 0x07.
+static uint8_t radio_device_state() {
+    const uint8_t c[] = { 0x33 };
+    if (!send_cmd(c, sizeof(c))) return 0xFF;
+    uint8_t state = SPI1.transfer(0x00);
+    SPI1.transfer(0x00);   // current channel — unused
+    cs_high();
+    return state & 0x0F;
+}
+
+// Load one frame into the TX FIFO and start transmitting it. With wait=true,
+// blocks until the chip returns to READY (~len * 8 / bitrate; 53 B ≈ 42 ms).
+// With wait=false, returns as soon as TX starts (caller must check
+// radio_device_state() == READY before the next frame).
+static bool radio_tx_frame(const uint8_t* frame, uint8_t len, bool wait) {
+    // PKT_FIELD_1_LENGTH — frame lengths vary by type
+    {
+        const uint8_t c[] = { 0x11, 0x12, 0x02, 0x0C, 0x00, len };
+        if (!send_cmd(c, sizeof(c))) return false; cs_high();
+    }
+
     // FIFO_INFO: reset TX FIFO
     { const uint8_t c[] = { 0x15, 0x01 }; if (!send_cmd(c, sizeof(c))) return false; cs_high(); }
 
@@ -234,19 +317,35 @@ static bool radio_tx_frame(const uint8_t* frame, uint8_t len) {
         if (!send_cmd(c, sizeof(c))) return false; cs_high();
     }
 
+    if (!wait) return true;
+
     // Poll REQUEST_DEVICE_STATE until READY (0x03)
     const uint32_t deadline = millis() + 500;
     while (millis() < deadline) {
-        const uint8_t c[] = { 0x33 };
-        if (!send_cmd(c, sizeof(c))) return false;
-        uint8_t state = SPI1.transfer(0x00);
-        SPI1.transfer(0x00);   // current channel — unused
-        cs_high();
-        if ((state & 0x0F) == 0x03) return true;
+        uint8_t state = radio_device_state();
+        if (state == 0xFF) return false;
+        if (state == 0x03) return true;
         delay(2);
     }
     LOG_ERROR("Radio: TX did not complete (state poll timeout)");
     return false;
+}
+
+// Assemble preamble + sync + type + body + CRC into out (must hold body_len + 13).
+// Returns total frame length.
+static uint8_t radio_build_frame(uint8_t* out, uint8_t type,
+                                 const uint8_t* body, uint8_t body_len) {
+    uint8_t* p = out;
+    for (uint8_t i = 0; i < RADIO_GFSK_PREAMBLE_LEN; i++) *p++ = 0xAA;
+    *p++ = 0x2D;
+    *p++ = 0xD4;
+    *p++ = type;
+    memcpy(p, body, body_len);
+    p += body_len;
+    const uint16_t crc = crc16_ccitt(out + RADIO_GFSK_PREAMBLE_LEN + 2, 1 + body_len);
+    *p++ = (uint8_t)(crc >> 8);
+    *p++ = (uint8_t)crc;
+    return (uint8_t)(p - out);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -402,13 +501,23 @@ bool radio_marker_tx(uint32_t freq_hz) {
     return true;
 }
 
+// Configure GFSK + frequency if not already configured. Call inside an open
+// SPI transaction. Leaves CS high.
+static bool radio_ensure_gfsk() {
+    if (_gfsk_ready) return true;
+    if (!radio_configure_gfsk() || !radio_set_frequency(RADIO_FREQ_HZ)) {
+        cs_high();
+        _gfsk_ready = false;
+        return false;
+    }
+    cs_high();
+    return true;
+}
+
 bool radio_data_test_tx() {
     static const char payload[] = "APEX RADIO TEST";
-    constexpr uint8_t payload_len = sizeof(payload) - 1;
-
-    // Frame: 0xAA preamble, 0x2D 0xD4 sync, seq byte, payload, CRC-16-CCITT
-    // over seq+payload (big-endian). Must match scripts/radio_gfsk_rx.py.
-    constexpr uint8_t frame_len = RADIO_GFSK_PREAMBLE_LEN + 2 + 1 + payload_len + 2;
+    constexpr uint8_t body_len = 1 + sizeof(payload) - 1;   // seq + payload
+    constexpr uint8_t frame_len = RADIO_GFSK_PREAMBLE_LEN + 2 + 1 + body_len + 2;
     static_assert(frame_len <= 64, "GFSK test frame must fit the TX FIFO");
 
     if (_status < 0) {
@@ -417,36 +526,25 @@ bool radio_data_test_tx() {
     }
 
     SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-
-    if (!radio_configure_gfsk(frame_len) || !radio_set_frequency(RADIO_FREQ_HZ)) {
-        cs_high();
+    if (!radio_ensure_gfsk()) {
         SPI1.endTransaction();
         LOG_ERROR("Radio data test: GFSK config failed");
         return false;
     }
-    cs_high();
 
     LOG_INFO("Radio data test: 2GFSK %.3f MHz, %lu bps, dev=%lu Hz, PA=0x%02X, %u frames",
              RADIO_FREQ_HZ / 1e6f, RADIO_GFSK_BITRATE_BPS, RADIO_GFSK_DEV_HZ,
              RADIO_MARKER_PA_PWR, RADIO_GFSK_REPEATS);
 
-    uint8_t frame[frame_len];
-    uint8_t* p = frame;
-    for (uint8_t i = 0; i < RADIO_GFSK_PREAMBLE_LEN; i++) *p++ = 0xAA;
-    *p++ = 0x2D;
-    *p++ = 0xD4;
-    uint8_t* body = p;            // seq + payload (CRC computed over this)
-    *p++ = 0;                     // seq — patched per frame
-    memcpy(p, payload, payload_len);
-    p += payload_len;
+    uint8_t body[body_len];
+    memcpy(body + 1, payload, sizeof(payload) - 1);
 
     for (uint8_t seq = 1; seq <= RADIO_GFSK_REPEATS; seq++) {
         body[0] = seq;
-        const uint16_t crc = crc16_ccitt(body, 1 + payload_len);
-        p[0] = (uint8_t)(crc >> 8);
-        p[1] = (uint8_t)crc;
+        uint8_t frame[frame_len];
+        radio_build_frame(frame, RADIO_FRAME_TYPE_TEST, body, body_len);
 
-        if (!radio_tx_frame(frame, frame_len)) {
+        if (!radio_tx_frame(frame, frame_len, true)) {
             cs_high();
             radio_change_state_ready();
             cs_high();
@@ -461,4 +559,87 @@ bool radio_data_test_tx() {
     SPI1.endTransaction();
     LOG_INFO("Radio data test: done");
     return true;
+}
+
+bool radio_telemetry_tx() {
+    constexpr uint8_t flight_len = RADIO_GFSK_PREAMBLE_LEN + 2 + 1 + sizeof(TelemFlight) + 2;
+    constexpr uint8_t hk_len     = RADIO_GFSK_PREAMBLE_LEN + 2 + 1 + sizeof(TelemHousekeeping) + 2;
+    static_assert(flight_len <= 64 && hk_len <= 64, "telemetry frames must fit the TX FIFO");
+    static uint32_t _last_hk_ms = 0;
+
+    if (_status < 0) return false;
+
+    SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    if (!radio_ensure_gfsk()) {
+        SPI1.endTransaction();
+        return false;
+    }
+
+    // Non-blocking: if the previous frame is still on air, skip this beat
+    // rather than stall the loop or clobber the FIFO.
+    if (radio_device_state() != 0x03) {
+        SPI1.endTransaction();
+        _telem_skipped++;
+        return true;
+    }
+
+    uint8_t frame[64];
+    uint8_t frame_len;
+
+    // One beat per second carries housekeeping instead of flight data.
+    if (millis() - _last_hk_ms >= 1000) {
+        _last_hk_ms = millis();
+
+        TelemHousekeeping hk;
+        memset(&hk, 0, sizeof(hk));
+        hk.seq        = _telem_seq++;
+        hk.mag[0]     = tlm_s16(g_state.mag.x_gauss,      10000.0f);
+        hk.mag[1]     = tlm_s16(g_state.mag.y_gauss,      10000.0f);
+        hk.mag[2]     = tlm_s16(g_state.mag.z_gauss,      10000.0f);
+        hk.highg[0]   = tlm_s16(g_state.high_g.accel_x_mss,  10.0f);
+        hk.highg[1]   = tlm_s16(g_state.high_g.accel_y_mss,  10.0f);
+        hk.highg[2]   = tlm_s16(g_state.high_g.accel_z_mss,  10.0f);
+        hk.gyro_xy[0] = tlm_s16(g_state.imu.gyro_x_rads,    500.0f);
+        hk.gyro_xy[1] = tlm_s16(g_state.imu.gyro_y_rads,    500.0f);
+        hk.uptime_s   = (uint16_t)min(millis() / 1000UL, 65535UL);
+
+        frame_len = radio_build_frame(frame, RADIO_FRAME_TYPE_HK,
+                                      (const uint8_t*)&hk, sizeof(hk));
+    } else {
+        TelemFlight body;
+        memset(&body, 0, sizeof(body));
+        memcpy(body.callsign, RADIO_CALLSIGN, min(sizeof(body.callsign), strlen(RADIO_CALLSIGN)));
+        body.seq         = _telem_seq++;
+        body.phase       = (uint8_t)g_state.phase;
+        body.health      = sensors_health();
+        body.gps_fix     = gps_fix_state();
+        body.gps_sats    = g_state.gps.satellites;
+        body.gps_lat_deg = g_state.gps.lat_deg;
+        body.gps_lon_deg = g_state.gps.lon_deg;
+        body.gps_alt_msl = tlm_s16(g_state.gps.altitude_msl_m,       2.0f);
+        body.alt_agl     = tlm_s16(g_state.fused.altitude_agl_m,    10.0f);
+        body.velocity    = tlm_s16(g_state.fused.velocity_mps,      50.0f);
+        body.pred_apogee = tlm_s16(g_state.fused.predicted_apogee_m, 10.0f);
+        body.vert_accel  = tlm_s16(g_state.fused.accel_mps2,       100.0f);
+        body.accel_z     = tlm_s16(g_state.imu.accel_z_mss,        100.0f);
+        body.roll_rate   = tlm_s16(g_state.imu.gyro_z_rads,        500.0f);
+        body.deployment  = (uint8_t)constrain(g_state.control.deployment_frac * 255.0f, 0.0f, 255.0f);
+        body.baro_pa     = (uint16_t)constrain(g_state.baro.pressure_pa * 0.5f, 0.0f, 65535.0f);
+        body.baro_temp   = (int8_t)constrain(g_state.baro.temperature_c, -128.0f, 127.0f);
+
+        frame_len = radio_build_frame(frame, RADIO_FRAME_TYPE_FLIGHT,
+                                      (const uint8_t*)&body, sizeof(body));
+    }
+
+    bool ok = radio_tx_frame(frame, frame_len, false);
+    cs_high();
+    SPI1.endTransaction();
+    if (ok) _telem_sent++;
+    return ok;
+}
+
+void radio_telemetry_stats(uint16_t* seq, uint32_t* sent, uint32_t* skipped) {
+    if (seq)     *seq     = _telem_seq;
+    if (sent)    *sent    = _telem_sent;
+    if (skipped) *skipped = _telem_skipped;
 }
