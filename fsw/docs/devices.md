@@ -115,7 +115,13 @@ event.acceleration.z;
 **Interface:** I2C2 — SDA2=25, SCL2=24 → `Wire2` (primary); UART7 TX=28/RX=29 also available  
 **Address:** 0x42 (u-blox default)  
 **PPS:** GPS_PPS → Pin 30 (1 Hz pulse, attach interrupt for UTC time sync)  
-**Note:** No antenna — do not transmit. I2C communication and UTC time work without antenna.
+**Firmware config:** UBX-only over I2C, 10 Hz NAV-PVT, Airborne <4g dynamic
+model, PPS interrupt attached for UTC-second timing.
+**Critical decision:** GPS is not launch-critical and must not gate flight-state
+progression or airbrake deployment. The MAX-M10S can still lose fix during
+high-G boost; GPS is for UTC, telemetry, recovery, and post-flight analysis.
+**Antenna:** Active patch antenna through the board bias tee / VCC_RF path.
+Verify the antenna voltage and current limit before flight.
 
 ```cpp
 #include <SparkFun_u-blox_GNSS_v3.h>

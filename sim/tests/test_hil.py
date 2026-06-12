@@ -116,6 +116,26 @@ class TestEmulator:
         q = rail_quaternion(85.0, 230.0)
         assert abs(np.linalg.norm(q) - 1.0) < 1e-9
 
+    def test_gps_drops_above_4g_and_reacquires(self):
+        """AIRBORNE4g receiver model: fix lost during boost, back ~2 s after
+        dynamics settle — mirrors gps_monitor_update expectations."""
+        em = SensorEmulator(_isa_pressure, pad_elevation_m=0.0)
+        state = [0, 0, 500.0, 0, 0, 100.0, 1, 0, 0, 0, 0, 0, 0]
+        boost = em.flight_sensors(state, np.array([0.0, 0.0, 8 * _G]))
+        assert boost.gps_valid == 0                       # 8 g > 4 g envelope
+        s = em.flight_sensors(state, np.array([0.0, 0.0, -_G - 5.0]))
+        assert s.gps_valid == 0                           # still reacquiring
+        for _ in range(250):                              # 2.5 s of coast
+            s = em.flight_sensors(state, np.array([0.0, 0.0, -_G - 5.0]))
+        assert s.gps_valid == 1, "fix never reacquired after dynamics settled"
+        assert not math.isnan(s.gps_alt_msl_m)
+
+    def test_gps_model_can_be_disabled(self):
+        em = SensorEmulator(_isa_pressure, pad_elevation_m=0.0, gps_model=False)
+        state = [0, 0, 500.0, 0, 0, 100.0, 1, 0, 0, 0, 0, 0, 0]
+        s = em.flight_sensors(state, np.array([0.0, 0.0, 8 * _G]))
+        assert s.gps_valid == 1
+
 
 # ─── Closed loop over a pty ───────────────────────────────────────────────────
 

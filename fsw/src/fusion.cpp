@@ -1,6 +1,7 @@
 #include "fusion.h"
 #include "flight_state.h"
 #include "sensors.h"
+#include "gps.h"
 #include "config.h"
 #include "debug.h"
 
@@ -110,6 +111,16 @@ void fusion_init() {
 
     _cf_alt_m   = 0.0f;
     _cf_vel_mps = 0.0f;
+
+    // Baro rolling average + re-zero state. Zero at boot anyway; explicit
+    // resets make fusion_init() a full re-init so flight_state_reset() can
+    // give a HIL session a boot-like fresh pad capture.
+    _baro_idx        = 0;
+    _baro_sum        = 0.0f;
+    _baro_count      = 0;
+    _stable_since_ms = 0;
+    _last_rezero_ms  = 0;
+    _was_stable      = false;
 
     // On a cold start pad_pressure_pa is 0 (zero-initialised FlightState).
     // On a warm restart (watchdog reset during pad hold) it may already be
@@ -379,9 +390,27 @@ void fusion_update() {
             _cf_alt_m   = alt_pred + alpha * alt_err;
             _cf_vel_mps = vel_pred + beta  * alt_err;
         } else {
-            // Baro unavailable — pure dead-reckoning fallback.
-            _cf_alt_m   = alt_pred;
-            _cf_vel_mps = vel_pred;
+            // No new baro sample this tick — normal at 200 Hz vs 50 Hz baro.
+            // Only if the baro has been silent past BARO_DEAD_MS do we fall
+            // back to trusted GPS altitude at weak gains (10 Hz, σ≈3 m,
+            // >100 ms latency) so the CF stays bounded instead of drifting
+            // on accel dead-reckoning. GPS never replaces a live baro.
+            const bool baro_dead = pad_ready &&
+                (g_state.baro.timestamp_ms == 0 ||
+                 now_ms - g_state.baro.timestamp_ms > BARO_DEAD_MS);
+            if (baro_dead && gps_trusted()) {
+                float gps_agl = g_state.gps.altitude_msl_m
+                              - g_state.pad_altitude_msl_m;
+                float alt_err = gps_agl - alt_pred;
+                alt_err = fmaxf(-CF_GPS_ERR_CLAMP_M,
+                                fminf(CF_GPS_ERR_CLAMP_M, alt_err));
+                _cf_alt_m   = alt_pred + CF_GPS_ALPHA * alt_err;
+                _cf_vel_mps = vel_pred + CF_GPS_BETA  * alt_err;
+            } else {
+                // Pure dead-reckoning between samples / no aid available.
+                _cf_alt_m   = alt_pred;
+                _cf_vel_mps = vel_pred;
+            }
         }
     }
 

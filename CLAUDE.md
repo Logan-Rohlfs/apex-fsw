@@ -23,7 +23,7 @@ Key files:
   directly between your turns** (rates, power, etc.) — re-read it before
   editing, never revert values you didn't set.
 - [fsw/src/radio.cpp](fsw/src/radio.cpp) — Si4463 driver + GFSK downlink TX.
-- [sim/scripts/monitor.py](sim/scripts/monitor.py) — the ground GUI (serial +
+- [sim/scripts/horizon.py](sim/scripts/horizon.py) — the ground GUI (serial +
   RTL-SDR sources, plots, spectrum/waterfall, link stats).
 - [sim/scripts/radio_gfsk_rx.py](sim/scripts/radio_gfsk_rx.py) — SDR decoder;
   **the wire-format mirror of radio.cpp**.

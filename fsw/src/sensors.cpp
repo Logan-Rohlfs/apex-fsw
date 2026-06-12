@@ -192,7 +192,12 @@ void sensors_inject_hil(const SimPacket& pkt) {
     static uint8_t _tick = 0;
     _tick++;
 
-    uint32_t ts = pkt.sim_time_ms;
+    // Timestamps are millis() — exactly what the real sensor update paths
+    // write. The freshness consumers (gps_monitor_update staleness window,
+    // fusion's BARO_DEAD_MS fallback) all compare against millis(), so
+    // sim-time stamps would make every injected sample look permanently
+    // stale. pkt.sim_time_ms is still echoed in the TeensyPacket reply.
+    uint32_t ts = millis();
 
     noInterrupts();
 
@@ -238,12 +243,20 @@ void sensors_inject_hil(const SimPacket& pkt) {
         interrupts();
     }
 
-    // GPS — write directly to g_state (bypasses staging path, async)
+    // GPS — write directly to g_state (bypasses staging path, async).
+    // On an invalid packet the fix flags are cleared and timestamp_ms is NOT
+    // advanced, so gps_monitor_update() sees the loss exactly as it would
+    // with real hardware going silent (stale solution → fix lost).
     if (pkt.gps_valid) {
         g_state.gps.altitude_msl_m = pkt.gps_alt_msl_m;
         g_state.gps.valid          = true;
         g_state.gps.fix_quality    = 3;
+        g_state.gps.satellites     = 12;
         g_state.gps.timestamp_ms   = ts;
+    } else {
+        g_state.gps.valid       = false;
+        g_state.gps.fix_quality = 0;
+        g_state.gps.satellites  = 3;   // tracking but no nav solution
     }
 }
 

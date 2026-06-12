@@ -15,6 +15,15 @@
 // Configure servo PWM and drive to the retracted position. Call from setup().
 void control_init();
 
+// Reset the controller to the fresh-flight condition: clears the PID
+// integral, the rate-limited deployment command, the dt anchor and the
+// active-edge latch, zeroes g_state.control and drives the servo retracted.
+// Called from flight_state_arm() — arming is the "new flight" boundary —
+// so a re-arm (or a second HIL session without a power cycle) can never
+// start with a stale integral. With PID_KI < 0 a leftover positive integral
+// suppresses u → late deployment and early close.
+void control_reset();
+
 // Run one control tick. Call at RATE_CONTROL_HZ from the main loop, after
 // flight_state_update(). Computes PID + gates, applies the servo rate limit,
 // writes g_state.control and the servo output.

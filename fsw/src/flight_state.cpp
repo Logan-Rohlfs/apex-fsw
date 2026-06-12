@@ -1,7 +1,9 @@
 #include "flight_state.h"
 #include "config.h"
+#include "control.h"
 #include "debug.h"
 #include "fusion.h"
+#include "storage.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -47,6 +49,12 @@ static bool     _ring_full    = false;
 static uint32_t _ring_last_ms = 0;
 static float    _baro_rate    = 0.0f;
 
+// IDLE auto-arm latch — fires once per boot so a debug-mode DISARM sticks.
+// File scope (not function-static) so flight_state_reset() can re-allow it
+// at a HIL session boundary, making each session boot-like.
+static bool     _auto_armed           = false;
+static uint32_t _last_auto_arm_try_ms = 0;
+
 static float pressure_to_alt_msl(float pa) {
     return 44330.0f * (1.0f - powf(pa / ISA_SEA_LEVEL_PA, 1.0f / 5.255f));
 }
@@ -71,21 +79,55 @@ static void reset_windows() {
 static void enter(FlightPhase p, uint32_t now_ms, const char* how) {
     g_state.phase          = p;
     g_state.phase_entry_ms = now_ms;
+    if (p == FlightPhase::BOOST) {
+        storage_begin_flight(now_ms, how);
+    } else {
+        storage_log_event(LOG_EVENT_PHASE, how);
+    }
     LOG_INFO("%s detected (%s)", phase_name(p), how);
     (void)how;
 }
 
-void flight_state_arm(uint32_t now_ms) {
+bool flight_state_arm(uint32_t now_ms) {
+    if (!storage_logging_ready()) {
+        storage_log_event(LOG_EVENT_STORAGE_FAULT, "arm refused: logging not ready");
+        LOG_ERROR("ARM refused: logging storage not ready");
+        return false;
+    }
     reset_windows();
     fusion_on_armed();
+    control_reset();   // arming = fresh flight: no stale PID integral/deploy
     g_state.phase          = FlightPhase::ARMED;
     g_state.phase_entry_ms = now_ms;
+    storage_log_event(LOG_EVENT_ARMED, "armed");
+    return true;
+}
+
+void flight_state_reset(uint32_t now_ms) {
+    // Boot-like reset. Only invoked from the HIL session-gap handler in
+    // main.cpp (never during flight): each HIL session must behave exactly
+    // like a fresh power-on flight.
+    reset_windows();
+    _auto_armed           = false;
+    _last_auto_arm_try_ms = 0;
+    g_state.phase           = FlightPhase::IDLE;
+    g_state.phase_entry_ms  = now_ms;
+    g_state.burnout_time_ms = 0;
+    // Drop the pad reference so fusion's auto pad capture runs again from a
+    // fresh 50-sample baro average (fusion_init() preserves a non-zero pad
+    // reference for watchdog warm restarts — clear it first).
+    g_state.pad_pressure_pa    = 0.0f;
+    g_state.pad_altitude_msl_m = 0.0f;
+    fusion_init();
+    control_reset();
+    LOG_INFO("Flight state reset to IDLE");
 }
 
 void flight_state_disarm() {
     if (g_state.phase == FlightPhase::ARMED) {
         g_state.phase = FlightPhase::IDLE;
         reset_windows();
+        storage_log_event(LOG_EVENT_DISARMED, "disarmed");
     }
 }
 
@@ -121,11 +163,13 @@ void flight_state_update(uint32_t now_ms) {
             // Auto-arm: pad reference captured + boot delay elapsed.
             // Airbrakes are not pyro — ARMED only enables launch detection.
             // Fires once per boot so a debug-mode DISARM sticks.
-            static bool _auto_armed = false;
-            if (!_auto_armed && pad_ready && now_ms >= AUTO_ARM_DELAY_MS) {
-                _auto_armed = true;
-                flight_state_arm(now_ms);
-                LOG_INFO("Auto-armed");
+            if (!_auto_armed && pad_ready && now_ms >= AUTO_ARM_DELAY_MS &&
+                now_ms - _last_auto_arm_try_ms >= 1000) {
+                _last_auto_arm_try_ms = now_ms;
+                if (flight_state_arm(now_ms)) {
+                    _auto_armed = true;
+                    LOG_INFO("Auto-armed");
+                }
             }
             break;
         }

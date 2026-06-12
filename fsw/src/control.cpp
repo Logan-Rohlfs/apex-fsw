@@ -2,6 +2,7 @@
 #include "config.h"
 #include "debug.h"
 #include "flight_state.h"
+#include "storage.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -40,13 +41,19 @@ static bool     _was_active = false;
 void control_init() {
     analogWriteFrequency(SERVO_PIN, SERVO_PWM_HZ);
     analogWriteResolution(SERVO_PWM_RES_BITS);
-    servo_write_us(deploy_to_us(0.0f));
-
-    _integral = 0.0f;
-    _deploy   = 0.0f;
-    _last_ms  = 0;
+    control_reset();
     LOG_INFO("Control init — servo pin %d, %d–%d us", SERVO_PIN,
              SERVO_MIN_US, SERVO_MAX_US);
+}
+
+void control_reset() {
+    _integral   = 0.0f;
+    _deploy     = 0.0f;
+    _last_ms    = 0;        // dt anchor — first tick after reset uses 1/RATE
+    _was_active = false;
+    g_state.control = ControlState{};
+    g_state.control.servo_angle_deg = deploy_to_deg(0.0f);
+    servo_write_us(deploy_to_us(0.0f));
 }
 
 void control_update(uint32_t now_ms) {
@@ -72,7 +79,10 @@ void control_update(uint32_t now_ms) {
         && vel < MACH_GATE_MPS
         && alt > MIN_DEPLOY_ALT_M;
 
-    if (active && !_was_active) LOG_INFO("Airbrake control ACTIVE");
+    if (active && !_was_active) {
+        LOG_INFO("Airbrake control ACTIVE");
+        storage_log_event(LOG_EVENT_CONTROL_ACTIVE, "airbrake control active");
+    }
     _was_active = active;
 
     // ── PID (MATLAB port — error in metres, D-term = velocity) ────────────────

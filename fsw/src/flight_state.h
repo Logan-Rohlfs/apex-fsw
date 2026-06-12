@@ -23,9 +23,16 @@ void flight_state_update(uint32_t now_ms);
 
 // Force IDLE → ARMED (fresh pad reference) / ARMED → IDLE. Used by the HIL
 // auto-arm path and the debug-mode ARM/DISARM commands. flight_state_arm()
-// resets all detection windows and calls fusion_on_armed().
-void flight_state_arm(uint32_t now_ms);
+// resets all detection windows and calls fusion_on_armed(). Returns false if
+// launch-critical preflight requirements (currently storage logging) are not met.
+bool flight_state_arm(uint32_t now_ms);
 void flight_state_disarm();
+
+// Boot-like full reset back to IDLE: detection windows, max altitude, baro
+// rate ring, the once-per-boot auto-arm latch, the pad reference (fusion is
+// re-initialised so auto pad capture runs again) and the control state.
+// Only called at the HIL session boundary — never in flight builds' loop.
+void flight_state_reset(uint32_t now_ms);
 
 // ─── Raw Sensor Data ──────────────────────────────────────────────────────────
 // Written by sensor layer timer callbacks.

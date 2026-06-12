@@ -44,6 +44,13 @@ _NOISE_HIGHG_MSS = 0.049     # ADXL375: doc value, flagged "verify vs datasheet"
 _NOISE_MAG_GAUSS = 0.0004    # MMC5983MA: 0.4 mG RMS
 _NOISE_GPS_ALT_M = 3.0       # MAX-M10S vertical (~2× horizontal CEP)
 
+# MAX-M10S receiver model. The AIRBORNE4g dynamic platform tracks at most
+# 4 g of dynamics — boost is ~14 g, so the fix drops at launch and the
+# tracking loops need a few seconds to re-converge once dynamics calm down.
+# This mirrors the firmware's expectation (gps_monitor_update in gps.cpp).
+_GPS_DYNAMICS_LIMIT_G = 4.0
+_GPS_REACQUIRE_S = 2.0
+
 
 @dataclass(frozen=True)
 class SensorErrors:
@@ -138,7 +145,8 @@ class SensorEmulator:
                  mag_strength_ut: float = 48.0,
                  noise: bool = False,
                  seed: Optional[int] = None,
-                 errors: Optional[SensorErrors] = None):
+                 errors: Optional[SensorErrors] = None,
+                 gps_model: bool = True):
         self._pressure_fn = pressure_fn
         self.pad_elevation_m = pad_elevation_m
         self._noise = noise
@@ -146,6 +154,13 @@ class SensorEmulator:
         self._errors = errors or SensorErrors()
         self._delay = deque(maxlen=max(1, self._errors.delay_ticks + 1))
         self._misalignment = _euler_matrix_xyz(*self._errors.misalignment_deg)
+
+        # GPS receiver dynamics model (AIRBORNE4g envelope + reacquisition).
+        # Time advances with the 100 Hz flight_sensors contract.
+        self._gps_model = gps_model
+        self._gps_locked = True
+        self._gps_relock_t = 0.0
+        self._t_s = 0.0
 
         # NED geomagnetic components → ENU world vector, in Gauss.
         dec = math.radians(mag_declination_deg)
@@ -233,8 +248,25 @@ class SensorEmulator:
         ``state`` is ``[x, y, z, vx, vy, vz, e0, e1, e2, e3, w1, w2, w3]``
         as passed to the airbrake controller.  ``accel_world`` is the
         finite-differenced coordinate acceleration in the inertial frame.
+
+        Each call advances the GPS receiver model by one 100 Hz tick:
+        the fix drops while coordinate dynamics exceed the AIRBORNE4g
+        envelope (every boost) and returns _GPS_REACQUIRE_S after they
+        settle, exercising the firmware's fix-loss handling in every run.
         """
         quat = np.asarray(state[6:10], dtype=float)
         omega = np.asarray(state[10:13], dtype=float)
-        return self._make(quat, np.asarray(accel_world, dtype=float),
-                          omega, float(state[2]))
+        accel = np.asarray(accel_world, dtype=float)
+
+        self._t_s += 0.01
+        gps_valid = True
+        if self._gps_model:
+            if float(np.linalg.norm(accel)) > _GPS_DYNAMICS_LIMIT_G * _G:
+                self._gps_locked = False
+                self._gps_relock_t = self._t_s + _GPS_REACQUIRE_S
+            elif not self._gps_locked and self._t_s >= self._gps_relock_t:
+                self._gps_locked = True
+            gps_valid = self._gps_locked
+
+        return self._make(quat, accel, omega, float(state[2]),
+                          gps_valid=gps_valid)

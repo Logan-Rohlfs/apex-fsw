@@ -41,8 +41,9 @@ static void timer_mag_cb()  { sensors_update_mag();  }
 
 void setup() {
 #ifdef APEX_HIL
-    // HIL mode — all sensor data arrives over USB serial as SimPackets.
-    // Hardware sensors and timers are not initialised.
+    // HIL mode — identical to the flight build except at the sensor-injection
+    // boundary: sensor data arrives over USB serial as SimPackets instead of
+    // from hardware, and the per-packet loop replaces the hardware timers.
     Serial.begin(HIL_BAUD);
     while (!Serial && millis() < 5000);
 
@@ -52,8 +53,29 @@ void setup() {
     Serial.printf("#INFO: SimPacket=%u bytes  TeensyPacket=%u bytes  rate=%d Hz\n",
                   (unsigned)sizeof(SimPacket), (unsigned)sizeof(TeensyPacket), RATE_HIL_HZ);
 
+    pinMode(PIN_3V3_2_EN, OUTPUT);
+    digitalWrite(PIN_3V3_2_EN, HIGH);
+
+    led_init();
+    storage_init();
     sensors_init_hil();
     fusion_init();   // uses RATE_HIL_HZ internally
+
+    // GPS is the one justified divergence from the flight code path: the
+    // real module on a bench would only report an indoor no-fix and fight
+    // the injected data, so gps_init() is not called. GPS solutions are
+    // injected via SimPackets and still flow through gps_monitor_update().
+
+    // Radio runs in HIL exactly like flight (full rehearsal — watch the
+    // Radio page during a HIL run). Same power-cycle so the Si4463 always
+    // cold-boots after firmware uploads.
+    digitalWrite(PIN_3V3_2_EN, LOW);
+    delay(50);
+    digitalWrite(PIN_3V3_2_EN, HIGH);
+    delay(200); // extended: allow Si4463 crystal to fully stabilise
+    if (!radio_init())
+        Serial.println("#WARN: radio init failed — HIL continues without downlink");
+
     control_init();  // servo runs in HIL too — actuator-in-the-loop on the bench
     g_state.phase = FlightPhase::IDLE;
 
@@ -107,24 +129,21 @@ void setup() {
 #ifdef APEX_HIL
 
 void loop() {
-    // ── Settle period: accumulate 50 baro readings (~0.5s) before arming ─────
-    // Ensures pad_pressure_pa is captured from a stable average, not a single
-    // cold-start reading. During settle, fusion runs but no TeensyPacket is sent.
-    static bool     _armed        = false;
-    static uint16_t _settle_count = 0;
-    static uint32_t _last_pkt_ms  = 0;   // 0 = no SimPacket yet this session
+    static uint32_t _last_pkt_ms    = 0;     // 0 = no SimPacket yet this session
+    static bool     _session_active = false;
 
     // ── Session management ────────────────────────────────────────────────────
     // The host (run_hil.py / monitor) usually opens the port long after boot,
     // so a single boot-time #HIL_READY is lost. Announce once per second until
-    // a SimPacket arrives. A ≥5 s packet gap ends the session: reset to IDLE
-    // and announce again, so repeated HIL runs work without re-plugging USB.
+    // a SimPacket arrives. A ≥5 s packet gap ends the session: boot-like reset
+    // (flight_state_reset → fresh pad capture, auto-arm, PID state) and
+    // announce again, so repeated HIL runs work without re-plugging USB.
     // (No flight-safety halt needed — this binary never reads real sensors.)
     if (_last_pkt_ms == 0 || millis() - _last_pkt_ms > HIL_SESSION_GAP_MS) {
-        if (_armed || _settle_count > 0) {
-            _armed = false;
-            _settle_count = 0;
-            g_state.phase = FlightPhase::IDLE;
+        if (_session_active) {
+            storage_end_session(millis(), "hil session gap");
+            flight_state_reset(millis());
+            _session_active = false;
             Serial.println("#INFO: HIL session ended — waiting for sim");
         }
         _last_pkt_ms = 0;
@@ -132,36 +151,32 @@ void loop() {
         if (millis() - _last_announce_ms >= 1000) {
             _last_announce_ms = millis();
             Serial.println("#HIL_READY");
-            digitalToggle(LED_BUILTIN);   // slow blink: waiting for the sim
         }
     }
 
     // ── Read and parse incoming bytes ─────────────────────────────────────────
+    // Per packet (100 Hz): exactly the flight pipeline. No HIL-specific
+    // settle/arm logic — fusion's auto pad capture (50-sample baro ring) plus
+    // flight_state_update's IDLE auto-arm bring the FC to ARMED, exactly as
+    // on the pad. AUTO_ARM_DELAY_MS counts from boot, so a session started
+    // later than that arms as soon as the pad reference is captured.
     while (Serial.available()) {
         uint8_t b = (uint8_t)Serial.read();
         SimPacket pkt;
         if (!hil_parse(b, pkt)) continue;
 
-        _last_pkt_ms = millis();
+        _last_pkt_ms    = millis();
+        _session_active = true;
+
         sensors_inject_hil(pkt);
-
-        // Warm-up: run fusion but defer TeensyPackets until settled + armed
         fusion_update();
-
-        if (!_armed) {
-            if (++_settle_count >= 50) {
-                flight_state_arm(millis());
-                _armed = true;
-                Serial.println("#INFO: Pad reference captured — state ARMED");
-            }
-            continue; // don't send TeensyPacket yet
-        }
-
-        // ── State machine + airbrake control (per packet = 100 Hz) ─────────
+        gps_monitor_update(millis());   // fix trust on injected GPS data
         flight_state_update(millis());
         control_update(millis());
+        storage_log_update(millis());
 
-        // ── Send response ──────────────────────────────────────────────────
+        // Reply to every SimPacket from the first one — the phase field tells
+        // the host where the FC is (IDLE during pad capture, then ARMED).
         TeensyPacket reply = hil_make_packet(pkt.sim_time_ms);
         hil_send(reply);
 
@@ -180,10 +195,23 @@ void loop() {
             Serial.printf("!phase:%s\n",          phase_name(g_state.phase));
             Serial.printf("!health:%d\n",         sensors_health());
         }
-
-        static uint8_t _blink = 0;
-        if (++_blink >= 50) { _blink = 0; digitalToggle(LED_BUILTIN); }
     }
+
+    // ── Telemetry downlink — identical to the flight build ───────────────────
+    // 1 Hz quiescent / RADIO_TELEM_FLIGHT_HZ in flight phases; non-blocking
+    // and a no-op if radio_init failed (bench boards vary).
+    static uint32_t last_telem_ms = 0;
+    const bool quiescent = (g_state.phase == FlightPhase::IDLE ||
+                            g_state.phase == FlightPhase::LANDED);
+    const uint32_t telem_period_ms =
+        1000U / (quiescent ? RADIO_TELEM_IDLE_HZ : RADIO_TELEM_FLIGHT_HZ);
+    if (millis() - last_telem_ms >= telem_period_ms) {
+        last_telem_ms = millis();
+        radio_telemetry_tx();
+    }
+
+    storage_mtp_loop();
+    led_update();   // same LED patterns as flight (phase/health driven)
 }
 
 #else // ── Normal / debug loop ──────────────────────────────────────────────────
@@ -201,6 +229,7 @@ void loop() {
     if (millis() - last_gps_ms >= 100) {
         last_gps_ms = millis();
         gps_update();
+        gps_monitor_update(millis());
     }
 
     // ── State machine + airbrake control at RATE_STATE_HZ ────────────────────
@@ -211,6 +240,7 @@ void loop() {
         last_state_ms = millis();
         flight_state_update(millis());
         control_update(millis());
+        storage_log_update(millis());
     }
 
     // ── Telemetry downlink ────────────────────────────────────────────────────
@@ -306,8 +336,11 @@ void loop() {
                 } else if (strcmp(_cmd_buf, "ARM") == 0) {
                     if (g_state.phase == FlightPhase::IDLE ||
                         g_state.phase == FlightPhase::ARMED) {
-                        flight_state_arm(millis());
-                        LOG_INFO("ARMED (pad ref %.0f Pa)", g_state.pad_pressure_pa);
+                        if (flight_state_arm(millis())) {
+                            LOG_INFO("ARMED (pad ref %.0f Pa)", g_state.pad_pressure_pa);
+                        } else {
+                            LOG_ERROR("ARM refused: logging storage not ready");
+                        }
                     } else {
                         LOG_WARN("ARM refused in phase %s", phase_name(g_state.phase));
                     }

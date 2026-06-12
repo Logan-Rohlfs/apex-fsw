@@ -188,10 +188,16 @@ python scripts/run_hil.py --fake           # no hardware — in-process fake Tee
 python scripts/run_hil.py --fake --speed 0 # max speed (fake only)
 ```
 
-The monitor app has the same loop as a source: `python scripts/monitor.py`,
-pick **HIL Sim** in the toolbar (Fake FC checkbox for no-hardware runs) and
+The HORIZON ground app (`python scripts/horizon.py`; `scripts/monitor.py` is a
+deprecated shim) has the same loop as a source: pick the **HIL** tab (Fake FC checkbox for no-hardware runs) and
 Connect. It shows the injected sensors, FC state estimation vs RocketPy truth,
 state machine phase, loop latency, and a live airbrake deployment gauge.
+
+The sensor emulator also models the MAX-M10S receiver envelope: the GPS fix
+drops whenever simulated dynamics exceed 4 g (the AIRBORNE4g platform limit —
+every boost) and reacquires ~2 s after they settle, so the firmware's
+fix-loss handling (`gps_monitor_update` in `fsw/src/gps.cpp`) is exercised in
+every HIL run. Disable with `SensorEmulator(gps_model=False)`.
 
 The loop is paced 1:1 to wall clock by default — the firmware's complementary
 filter integrates wall-clock dt, so real hardware must run at `--speed 1`.

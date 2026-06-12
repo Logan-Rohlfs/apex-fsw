@@ -22,6 +22,23 @@
 // Serial7: TX7=28, RX7=29
 #define PIN_GPS_PPS         30   // 1 Hz pulse — attach interrupt for time sync
 
+// GPS configuration. GPS is useful for UTC, recovery, telemetry, and post-flight
+// reconstruction, but it is intentionally not required for control or flight
+// state progression; high-G boost can still cause temporary fix loss.
+#define GPS_I2C_CLOCK_HZ    400000UL
+#define GPS_NAV_RATE_HZ     10
+#define GPS_DYNAMIC_MODEL   DYN_MODEL_AIRBORNE4g
+
+// GPS trust model. AIRBORNE4g tracks up to 4 g of dynamics — boost is ~14 g,
+// so a fix loss at launch is EXPECTED (logged as such, not a fault). After a
+// loss the first epochs can be garbage while the tracking loops re-converge:
+// require N consecutive fresh fixes before gps_trusted() returns true again.
+// A solution older than GPS_STALE_MS clears gps.valid — a frozen module must
+// not present stale coordinates as live.
+#define GPS_STALE_MS              1500     // > 10 Hz nominal + I2C hiccups
+#define GPS_REACQUIRE_EPOCHS      5        // consecutive fresh fixes to re-trust
+#define GPS_ALT_SANITY_M          300.0f   // |gps AGL − fused AGL| divergence warn
+
 // Radio — RF4463PRO / Si4463 (SPI1)
 // SPI1: MOSI1=26, MISO1=1, SCK1=27
 #define PIN_RAD_MOSI        26
@@ -173,6 +190,15 @@
 #define CF_BOOST_BETA                0.10f  // mild — baro noisy under motor vibration
 #define CF_COAST_BETA                1.00f  // aggressive — baro reliable post-burnout
 #define CF_ALT_ERR_CLAMP_M           5.0f  // max baro correction before clamping spike
+
+// Baro-dead GPS altitude fallback. Engages only when the baro has produced
+// no sample for BARO_DEAD_MS AND gps_trusted() — keeps the CF bounded instead
+// of dead-reckoning on accel alone. Gains are weak: GPS altitude is 10 Hz,
+// σ ≈ 3 m, with >100 ms solution latency. Never used while baro is alive.
+#define BARO_DEAD_MS                 500
+#define CF_GPS_ALPHA                 0.01f
+#define CF_GPS_BETA                  0.20f
+#define CF_GPS_ERR_CLAMP_M           20.0f
 
 // ─── Pad Re-Zero ──────────────────────────────────────────────────────────────
 // Periodically refreshes the ground pressure reference while stationary on pad.
