@@ -94,7 +94,7 @@ void gps_update() {
 
     gps.timestamp_ms = millis();
 
-#ifdef APEX_MONITOR
+#ifdef APEX_DEBUG
     static int8_t   last_logged_fix = -2;
     static uint8_t  last_logged_sats = 0xFF;
     static uint32_t last_summary_ms = 0;

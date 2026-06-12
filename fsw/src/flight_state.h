@@ -14,6 +14,19 @@ enum class FlightPhase : uint8_t {
 
 const char* phase_name(FlightPhase p);
 
+// ─── State machine (flight_state.cpp) ─────────────────────────────────────────
+// Call at RATE_STATE_HZ from the main loop (both flight and HIL builds).
+// Evaluates phase transitions on g_state and advances g_state.phase.
+// Each transition has a primary gate with a confirmation window plus an
+// independent backup gate — see config.h "Detection" sections.
+void flight_state_update(uint32_t now_ms);
+
+// Force IDLE → ARMED (fresh pad reference) / ARMED → IDLE. Used by the HIL
+// auto-arm path and the debug-mode ARM/DISARM commands. flight_state_arm()
+// resets all detection windows and calls fusion_on_armed().
+void flight_state_arm(uint32_t now_ms);
+void flight_state_disarm();
+
 // ─── Raw Sensor Data ──────────────────────────────────────────────────────────
 // Written by sensor layer timer callbacks.
 // Read by fusion layer using sensors_get_*() which performs an atomic copy.

@@ -87,8 +87,10 @@ control:
   # D-term: uses velocity directly as proxy, not d(error)/dt — matches firmware.
   # Gains below are from the MATLAB tuning run. Rescale for SI units before use:
   #   MATLAB operated in feet; RocketPy operates in meters (1 ft = 0.3048 m).
-  #   Kp and Ki must be divided by 0.3048 to maintain the same response in SI.
-  #   Kd is unaffected (velocity term, not an altitude derivative).
+  #   All three gains must be divided by 0.3048 to maintain the same response
+  #   in SI — the D-term is Kd × velocity and velocity has units too (ft/s in
+  #   MATLAB, m/s here). apex_sim/sim/airbrakes.py and fsw/src/config.h both
+  #   apply the rescale at point of use.
   # TODO: re-run Monte Carlo in SI or rescale these values before first HIL run.
   pid:
     kp: 0.4                     # proportional gain — MATLAB value, needs SI rescale

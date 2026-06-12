@@ -55,9 +55,10 @@ static_assert(sizeof(TeensyPacket) == 24, "TeensyPacket size mismatch");
 // would make the quaternion integrate at half-speed (Supervisor Q2 HIGH issue).
 #define RATE_HIL_HZ  100
 
-// Timeout with no SimPacket received → halt (do not fall back to sensor mode).
-// Prevents accidental HIL binary from silently operating as a flight binary.
-#define HIL_NO_PACKET_TIMEOUT_MS  10000
+// A SimPacket gap this long ends the HIL session: the firmware resets to
+// IDLE and resumes announcing #HIL_READY once per second, so a host can
+// connect (or reconnect) at any time without power-cycling the Teensy.
+#define HIL_SESSION_GAP_MS  5000
 
 #ifdef APEX_HIL
 

@@ -58,8 +58,8 @@
 
 // Telemetry beacon rates by phase. FLIGHT frame = 51 B / ~41 ms airtime at
 // 10 kbps; one beat per second is replaced by the HOUSEKEEPING frame (33 B).
-#define RADIO_TELEM_IDLE_HZ     30   // IDLE / LANDED
-#define RADIO_TELEM_FLIGHT_HZ   10   // ARMED / BOOST / COAST / DESCENT
+#define RADIO_TELEM_IDLE_HZ     20   // IDLE / LANDED
+#define RADIO_TELEM_FLIGHT_HZ   20   // ARMED / BOOST / COAST / DESCENT
 
 // ─── I2C Addresses ────────────────────────────────────────────────────────────
 #define BMP581_ADDR         0x46    // ADR tied to GND
@@ -79,34 +79,61 @@
 #define RATE_BARO_HZ        50
 #define RATE_MAG_HZ         25
 
+// ─── Arming ───────────────────────────────────────────────────────────────────
+// IDLE → ARMED automatically once the pad reference is captured and this
+// delay has elapsed (airbrakes are not pyro — ARMED only enables launch
+// detection). Debug builds can also force it with the ARM/DISARM commands.
+#define AUTO_ARM_DELAY_MS           10000
+
 // ─── Launch Detection ─────────────────────────────────────────────────────────
+// Primary: sustained accel (Seymour TX boost peaked at 14.1 g — 7× margin).
+// Backup: sustained baro climb, covers a dead accelerometer. Same dual-gate
+// scheme as commercial altimeters (TeleMetrum accel + baro launch detect).
 #define LAUNCH_ACCEL_THRESH_MSS     19.62f   // 2g
 #define LAUNCH_CONFIRM_MS           150
+#define LAUNCH_BARO_BACKUP_M        30.0f    // baro AGL backup gate
+#define LAUNCH_BARO_CONFIRM_MS      200
 
 // ─── Burnout Detection ────────────────────────────────────────────────────────
+// Primary: axial specific force flips negative (−0.78 g early coast on the
+// Seymour TX recording). Backup: max burn time — N3355 burns ~4.6 s, a stuck
+// gate cannot hold BOOST forever.
 #define BURNOUT_CONFIRM_MS          200
+#define BOOST_MAX_MS                8000
 
 // ─── Airbrake Gates ───────────────────────────────────────────────────────────
 #define POST_BURNOUT_LOCKOUT_MS     2500
-#define MACH_GATE_MPS               240.0f   // 0.7 Mach
+#define MACH_GATE_MPS               240.0f   // 0.7 Mach — no transonic actuation
 #define MIN_DEPLOY_ALT_M            100.0f
 
 // ─── Apogee Detection ─────────────────────────────────────────────────────────
+// Primary: fused (accel-verified) velocity through zero — immune to transonic
+// baro spikes, same approach as TeleMetrum. Backup: baro fell below the
+// running max; armed only well after burnout so the transonic regime (first
+// ~4 s of coast at this rocket's ~M0.85) can never reach it.
 #define APOGEE_VEL_THRESH_MPS       2.0f     // velocity below this = apogee
 #define APOGEE_CONFIRM_MS           500
+#define APOGEE_BACKUP_LOCKOUT_MS    8000     // baro backup armed this long after burnout
+#define APOGEE_BARO_FALL_M          10.0f
 
 // ─── Landed Detection ─────────────────────────────────────────────────────────
-#define LANDED_ACCEL_THRESH_MSS     2.0f     // low accel variance
+// Orientation-independent: |baro rate| (1 s baseline) + accel magnitude near
+// 1 g. A rocket on its side breaks any axial-axis assumption — the CF
+// velocity never settles to zero there (validated on Seymour TX landing).
+#define LANDED_ACCEL_THRESH_MSS     2.0f     // ||accel| − 1 g| band
+#define LANDED_VEL_MAX_MPS          2.0f     // baro-rate threshold
 #define LANDED_CONFIRM_MS           3000
 
 // ─── Control Law ──────────────────────────────────────────────────────────────
 #define TARGET_APOGEE_M             3048.0f  // 10,000 ft AGL
 
-// PID gains from MATLAB, rescaled ft → m (divide by 0.3048)
+// PID gains from MATLAB, rescaled ft → m (divide by 0.3048).
+// All three gains rescale — the D-term is Kd × velocity and velocity has
+// units too (ft/s in MATLAB, m/s here). Matches apex_sim/sim/airbrakes.py.
 // D-term uses velocity directly as proxy — matches sim, do not change.
 #define PID_KP                      (0.4f   / 0.3048f)
 #define PID_KI                      (-0.004f / 0.3048f)
-#define PID_KD                      -0.04f
+#define PID_KD                      (-0.04f / 0.3048f)
 #define PID_U_MIN                   -15.0f
 #define PID_U_MAX                    30.0f
 

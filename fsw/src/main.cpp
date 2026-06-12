@@ -8,11 +8,12 @@
 #include "radio.h"
 #include "led.h"
 #include "storage.h"
+#include "control.h"
 
-// APEX_HIL and APEX_MONITOR are mutually exclusive.
+// APEX_HIL and APEX_DEBUG are mutually exclusive.
 // Interleaved text output causes CRC false-failures in the Python parser.
-#if defined(APEX_HIL) && defined(APEX_MONITOR)
-#error "APEX_HIL cannot be combined with APEX_MONITOR"
+#if defined(APEX_HIL) && defined(APEX_DEBUG)
+#error "APEX_HIL cannot be combined with APEX_DEBUG"
 #endif
 
 #ifdef APEX_HIL
@@ -53,6 +54,7 @@ void setup() {
 
     sensors_init_hil();
     fusion_init();   // uses RATE_HIL_HZ internally
+    control_init();  // servo runs in HIL too — actuator-in-the-loop on the bench
     g_state.phase = FlightPhase::IDLE;
 
     // Signal to the Python replay script that the Teensy is ready.
@@ -60,7 +62,7 @@ void setup() {
 
 #else
     // Normal flight / monitor mode ────────────────────────────────────────────
-#ifdef APEX_MONITOR
+#ifdef APEX_DEBUG
     Serial.begin(921600);
     while (!Serial && millis() < 5000);
 #endif
@@ -85,6 +87,7 @@ void setup() {
     delay(200); // extended: allow Si4463 crystal to fully stabilise
 
     radio_init();
+    control_init();
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
 
@@ -109,16 +112,27 @@ void loop() {
     // cold-start reading. During settle, fusion runs but no TeensyPacket is sent.
     static bool     _armed        = false;
     static uint16_t _settle_count = 0;
+    static uint32_t _last_pkt_ms  = 0;   // 0 = no SimPacket yet this session
 
-    // ── Safety: halt if no SimPacket received within timeout ─────────────────
-    // Prevents HIL binary from operating silently as a flight binary if
-    // the USB cable is unplugged or the PC script never starts.
-    static uint32_t _last_pkt_ms = millis();
-    if (!_armed && (millis() - _last_pkt_ms > HIL_NO_PACKET_TIMEOUT_MS)) {
-        Serial.println("#ERROR: HIL timeout — no SimPacket received. Halting.");
-        while (true) {
-            digitalToggle(LED_BUILTIN);
-            delay(100); // rapid blink: distinct from flight firmware patterns
+    // ── Session management ────────────────────────────────────────────────────
+    // The host (run_hil.py / monitor) usually opens the port long after boot,
+    // so a single boot-time #HIL_READY is lost. Announce once per second until
+    // a SimPacket arrives. A ≥5 s packet gap ends the session: reset to IDLE
+    // and announce again, so repeated HIL runs work without re-plugging USB.
+    // (No flight-safety halt needed — this binary never reads real sensors.)
+    if (_last_pkt_ms == 0 || millis() - _last_pkt_ms > HIL_SESSION_GAP_MS) {
+        if (_armed || _settle_count > 0) {
+            _armed = false;
+            _settle_count = 0;
+            g_state.phase = FlightPhase::IDLE;
+            Serial.println("#INFO: HIL session ended — waiting for sim");
+        }
+        _last_pkt_ms = 0;
+        static uint32_t _last_announce_ms = 0;
+        if (millis() - _last_announce_ms >= 1000) {
+            _last_announce_ms = millis();
+            Serial.println("#HIL_READY");
+            digitalToggle(LED_BUILTIN);   // slow blink: waiting for the sim
         }
     }
 
@@ -136,13 +150,16 @@ void loop() {
 
         if (!_armed) {
             if (++_settle_count >= 50) {
-                fusion_on_armed();
-                g_state.phase = FlightPhase::ARMED;
+                flight_state_arm(millis());
                 _armed = true;
                 Serial.println("#INFO: Pad reference captured — state ARMED");
             }
             continue; // don't send TeensyPacket yet
         }
+
+        // ── State machine + airbrake control (per packet = 100 Hz) ─────────
+        flight_state_update(millis());
+        control_update(millis());
 
         // ── Send response ──────────────────────────────────────────────────
         TeensyPacket reply = hil_make_packet(pkt.sim_time_ms);
@@ -173,7 +190,7 @@ void loop() {
 
 // Telemetry beacon: off by default on the bench (monitor builds), always on
 // in flight builds. Toggled with TELEM_ON / TELEM_OFF over USB.
-#ifdef APEX_MONITOR
+#ifdef APEX_DEBUG
 static bool _telem_enabled = false;
 #else
 static bool _telem_enabled = true;
@@ -184,6 +201,16 @@ void loop() {
     if (millis() - last_gps_ms >= 100) {
         last_gps_ms = millis();
         gps_update();
+    }
+
+    // ── State machine + airbrake control at RATE_STATE_HZ ────────────────────
+    // Fusion runs in the 200 Hz timer ISR; these read its output with brief
+    // noInterrupts() snapshots internally.
+    static uint32_t last_state_ms = 0;
+    if (millis() - last_state_ms >= 1000 / RATE_STATE_HZ) {
+        last_state_ms = millis();
+        flight_state_update(millis());
+        control_update(millis());
     }
 
     // ── Telemetry downlink ────────────────────────────────────────────────────
@@ -203,7 +230,7 @@ void loop() {
 
     static uint32_t last_print = 0;
 
-#ifdef APEX_MONITOR
+#ifdef APEX_DEBUG
     // ── Data output at 50 Hz ──────────────────────────────────────────────────
     if (millis() - last_print >= 20) {
         last_print = millis();
@@ -276,8 +303,18 @@ void loop() {
                 } else if (strcmp(_cmd_buf, "TELEM_OFF") == 0) {
                     _telem_enabled = false;
                     LOG_INFO("Telemetry beacon OFF");
+                } else if (strcmp(_cmd_buf, "ARM") == 0) {
+                    if (g_state.phase == FlightPhase::IDLE ||
+                        g_state.phase == FlightPhase::ARMED) {
+                        flight_state_arm(millis());
+                        LOG_INFO("ARMED (pad ref %.0f Pa)", g_state.pad_pressure_pa);
+                    } else {
+                        LOG_WARN("ARM refused in phase %s", phase_name(g_state.phase));
+                    }
+                } else if (strcmp(_cmd_buf, "DISARM") == 0) {
+                    flight_state_disarm();
+                    LOG_INFO("Phase now %s", phase_name(g_state.phase));
                 }
-                // TODO Phase 1: dispatch ARM / DISARM here
                 _cmd_len = 0;
             }
         } else if (_cmd_len < sizeof(_cmd_buf) - 1) {

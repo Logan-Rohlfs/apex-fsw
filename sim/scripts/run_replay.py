@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import csv as _csv
 import math
-import struct
 import sys
 import threading
 import time
@@ -46,27 +45,25 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Wire protocol — single Python mirror of fsw/src/hil.h.
+from apex_sim.hil.protocol import (          # noqa: E402
+    HIL_BAUD,
+    HIL_MAGIC_SIM_TO_TEENSY,
+    HIL_MAGIC_TEENSY_TO_SIM,
+    SIM_STRUCT,
+    TEENSY_SIZE,
+    TEENSY_STRUCT,
+    crc8,
+    find_port,
+)
+
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
 _SIM_ROOT    = Path(__file__).resolve().parents[1]
 _DEFAULT_CSV = (_SIM_ROOT / "data" / "flights" / "seymour_2026_05_24"
                 / "telemega_flight_2026-05-24.csv")
-
-# ─── Protocol (must match hil.h) ──────────────────────────────────────────────
-
-HIL_MAGIC_SIM_TO_TEENSY = 0xABCD   # LE wire: [0xCD, 0xAB]
-HIL_MAGIC_TEENSY_TO_SIM = 0xCDAB   # LE wire: [0xAB, 0xCD]
-HIL_BAUD                = 921600
-
-# SimPacket: magic(H) + sim_time_ms(I) + 14×float + gps_valid(B) + crc8(B) = 64 bytes
-SIM_FMT  = "<HI" + "f" * 14 + "BB"
-SIM_SIZE = struct.calcsize(SIM_FMT)
-assert SIM_SIZE == 64, f"SimPacket={SIM_SIZE}"
-
-# TeensyPacket: magic(H) + sim_time_ms(I) + 4×float + phase(B) + crc8(B) = 24 bytes
-TEENSY_FMT  = "<HIffffBB"
-TEENSY_SIZE = struct.calcsize(TEENSY_FMT)
-assert TEENSY_SIZE == 24, f"TeensyPacket={TEENSY_SIZE}"
 
 RATE_HZ = 100
 DT_S    = 1.0 / RATE_HZ
@@ -76,25 +73,6 @@ PHASE_COLOR = {"IDLE": "\033[90m", "ARMED": "\033[34m", "BOOST": "\033[33m",
                "COAST": "\033[32m", "DESCENT": "\033[35m", "LANDED": "\033[36m"}
 RESET = "\033[0m"; BOLD = "\033[1m"; RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"
 
-# ─── CRC-8 (poly 0x07, must match hil.cpp) ───────────────────────────────────
-
-def _build_crc8_table() -> bytes:
-    t = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
-        t.append(c)
-    return bytes(t)
-
-_CRC8 = _build_crc8_table()
-
-def crc8(data: bytes) -> int:
-    c = 0
-    for b in data:
-        c = _CRC8[c ^ b]
-    return c
-
 # ─── Packet builders ──────────────────────────────────────────────────────────
 
 def pack_sim(sim_ms: int, ax: float, ay: float, az: float,
@@ -102,7 +80,7 @@ def pack_sim(sim_ms: int, ax: float, ay: float, az: float,
              hx: float, hy: float, hz: float,
              mx: float, my: float, mz: float,
              gps_alt: float, gps_valid: int) -> bytes:
-    body = struct.pack(SIM_FMT,
+    body = SIM_STRUCT.pack(
         HIL_MAGIC_SIM_TO_TEENSY, sim_ms,
         ax, ay, az, gx, gy, gz, baro,
         hx, hy, hz, mx, my, mz,
@@ -116,7 +94,7 @@ class TeensyPkt(NamedTuple):
 def unpack_teensy(data: bytes) -> TeensyPkt | None:
     if len(data) < TEENSY_SIZE:
         return None
-    f = struct.unpack_from(TEENSY_FMT, data)
+    f = TEENSY_STRUCT.unpack_from(data)
     pkt = TeensyPkt(*f)
     if pkt.magic != HIL_MAGIC_TEENSY_TO_SIM:
         return None
@@ -275,21 +253,6 @@ class TeensyReceiver(threading.Thread):
                 with self._lock:
                     self._pkts.append(pkt)
                     self.last = pkt
-
-# ─── Port auto-detection ──────────────────────────────────────────────────────
-
-TEENSY_VID = 0x16C0
-
-def find_port() -> str | None:
-    ports = list(serial.tools.list_ports.comports())
-    def score(p):
-        if p.vid == TEENSY_VID: return 3
-        d = p.device.lower()
-        if "usbmodem" in d or "acm" in d: return 2
-        if "usb" in d: return 1
-        return 0
-    best = max(ports, key=score, default=None)
-    return best.device if best and score(best) > 0 else None
 
 # ─── Main replay ──────────────────────────────────────────────────────────────
 

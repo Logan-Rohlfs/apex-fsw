@@ -10,7 +10,7 @@ ground station ("HORIZON") with a 70 cm yagi will use the same SDR pipeline.
 
 ```
 fsw/      PlatformIO firmware (Teensy 4.1). src/ is small — read all of it.
-          envs: teensy41 (flight/monitor), teensy41_hil (HIL sim builds)
+          envs: teensy41_debug (monitor), teensy41_hil (HIL), teensy41_flight (flight)
 sim/      Python side. .venv is the project venv (Python 3.9 — no match
           statements, no list[int] in evaluated positions outside annotations).
           apex_sim/ = RocketPy HIL/SIL package, scripts/ = ground tools.
@@ -42,7 +42,7 @@ Docs to read before touching the relevant area:
 ```bash
 # Firmware (always build after fsw edits — IDE clang diagnostics about
 # Arduino.h/SPI1/millis are indexer noise; pio is the truth):
-~/.platformio/penv/bin/pio run -e teensy41 -d fsw
+~/.platformio/penv/bin/pio run -e teensy41_debug -d fsw   # also: teensy41_hil, teensy41_flight
 
 # Python: use the project venv, NOT system python:
 sim/.venv/bin/python ...

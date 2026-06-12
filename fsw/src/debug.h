@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-// APEX_MONITOR — connected to the Apex monitor app (laptop debug / HIL prep).
+// APEX_DEBUG — connected to the Apex monitor app (laptop debug / HIL prep).
 //   >key:value  numeric data  → routed to live plots
 //   !key:value  state fields  → routed to state panel
 //   #LEVEL: msg log output   → routed to log panel
@@ -9,7 +9,7 @@
 //
 // (no flag)    — flight build, all macros compile to nothing.
 
-#ifdef APEX_MONITOR
+#ifdef APEX_DEBUG
   #define LOG_INFO(fmt, ...)  Serial.printf("#INFO: "  fmt "\n", ##__VA_ARGS__)
   #define LOG_WARN(fmt, ...)  Serial.printf("#WARN: "  fmt "\n", ##__VA_ARGS__)
   #define LOG_ERROR(fmt, ...) Serial.printf("#ERROR: " fmt "\n", ##__VA_ARGS__)

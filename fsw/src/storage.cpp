@@ -4,7 +4,12 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <SD.h>
+
+// MTP (drag-and-drop log download over USB) only exists when the USB type
+// includes it. The HIL build uses plain USB serial for clean packet I/O.
+#ifdef USB_MTPDISK_SERIAL
 #include <MTP_Teensy.h>
+#endif
 
 static uint8_t _health = 0;
 
@@ -70,9 +75,11 @@ uint8_t storage_init() {
 
     // Register available volumes with MTP so they appear as drives over USB.
     // mtp_loop() must be called from the main loop to service MTP transfers.
+#ifdef USB_MTPDISK_SERIAL
     MTP.begin();
     if (_health & STORAGE_OK_FLASH) MTP.addFilesystem(_flash, "APEX-FLASH");
     if (_health & STORAGE_OK_SD)    MTP.addFilesystem(SD,     "APEX-SD");
+#endif
 
     return _health;
 }
@@ -80,5 +87,7 @@ uint8_t storage_init() {
 uint8_t storage_health() { return _health; }
 
 void storage_mtp_loop() {
+#ifdef USB_MTPDISK_SERIAL
     MTP.loop();
+#endif
 }

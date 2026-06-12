@@ -15,7 +15,7 @@ apex/sim/
 │   ├── config/        # YAML config loader (load_environment, SiteProfile, ...)
 │   ├── sensors/       # sensor noise and bias models (not yet implemented)
 │   ├── sim/           # RocketPy wrappers — environment, rocket, airbrakes, flight
-│   ├── hil/           # serial protocol and hardware interface (not yet implemented)
+│   ├── hil/           # HIL: protocol, serial link, sensor emulator, closed-loop runner
 │   └── analysis/      # flight comparison — scalar table, trace plots, OR .ork parser
 ├── config/            # parameter files — edit these, not the Python
 │   ├── environment.yaml    # atmosphere model, rail, active_site pointer
@@ -177,13 +177,41 @@ python scripts/run_replay.py  # auto-detects Teensy
 See `scripts/run_replay.py` for full options (`--csv`, `--pre-pad`, `--speed`, `--out`).
 Requires a Teensy flashed with the HIL build (`pio run -e teensy41_hil -t upload`).
 
-**Real-time HIL (not yet implemented)** — closes the loop between a live RocketPy
-simulation and the Teensy so `deployment_frac` feeds back into airbrake drag.
-Entry point will be `scripts/run_hil.py`. Python-side serial framing lives in
-`apex_sim/hil/` once built.
+**Real-time HIL (implemented)** — closes the loop between a live RocketPy
+simulation and the Teensy: sensor data synthesised from the true flight state is
+injected at 100 Hz, the flight computer runs fusion / state machine / control, and
+the returned `deployment_frac` feeds back into the simulated airbrake drag.
 
-The serial protocol (packet structs, CRC-8, magic bytes, baud) is fully defined on the
-Teensy side in `fsw/src/hil.h`.
+```bash
+python scripts/run_hil.py                  # real Teensy (auto-detected)
+python scripts/run_hil.py --fake           # no hardware — in-process fake Teensy
+python scripts/run_hil.py --fake --speed 0 # max speed (fake only)
+```
+
+The monitor app has the same loop as a source: `python scripts/monitor.py`,
+pick **HIL Sim** in the toolbar (Fake FC checkbox for no-hardware runs) and
+Connect. It shows the injected sensors, FC state estimation vs RocketPy truth,
+state machine phase, loop latency, and a live airbrake deployment gauge.
+
+The loop is paced 1:1 to wall clock by default — the firmware's complementary
+filter integrates wall-clock dt, so real hardware must run at `--speed 1`.
+
+Module layout (`apex_sim/hil/`):
+
+| Module | Contents |
+|---|---|
+| `protocol.py` | Packet structs, CRC-8, pack/unpack — the Python mirror of `fsw/src/hil.h`. **Change both in the same commit.** |
+| `link.py` | `HilLink` — threaded serial link separating binary packets from ASCII status lines |
+| `emulator.py` | `SensorEmulator` — RocketPy true state → body-frame IMU/baro/mag/GPS readings |
+| `fake_teensy.py` | `FakeTeensy` — pty-backed reference model of the firmware state machine + PID, for hardware-free runs and tests |
+| `runner.py` | `warm_up` / `run_closed_loop` — pad warm-up then the RocketPy flight with the FC in the loop |
+
+The firmware implements the full chain (fusion, state machine with redundant
+detection gates, MATLAB-tuned PID, servo PWM). `fake_teensy.py` is the matching
+reference model, kept in lockstep with `fsw/src/flight_state.cpp` /
+`fsw/src/control.cpp` — `tests/test_hil_flight_replay.py` validates the reference
+against the real Seymour TX recording, and a real-Teensy `run_hil.py` run should
+match a `--fake` run.
 
 ---
 
@@ -193,7 +221,9 @@ Teensy side in `fsw/src/hil.h`.
 python -m pytest tests/
 ```
 
-> *Test suite not yet implemented.*
+`tests/test_hil.py` covers the HIL stack end-to-end with no hardware: protocol
+round-trips, sensor-emulator physics, and full closed-loop flights (kinematic and
+RocketPy) against the fake Teensy over a real pty.
 
 ---
 

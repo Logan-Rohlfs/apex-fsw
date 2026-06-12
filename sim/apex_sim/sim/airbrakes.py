@@ -131,7 +131,10 @@ def attach_airbrakes(
         ``observed_variables`` carries persistent state between calls:
         ``[time, deployment, predicted_apogee_m, error_m, integral_m_s]``
         """
-        airbrakes = interactive_objects[0]
+        # RocketPy 1.10 passes a lone interactive object bare, not in a list.
+        airbrakes = (interactive_objects[0]
+                     if isinstance(interactive_objects, (list, tuple))
+                     else interactive_objects)
 
         # Unpack state [x, y, z, vx, vy, vz, ...]
         alt_asl = state[2]

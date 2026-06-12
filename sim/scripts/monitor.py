@@ -2,12 +2,16 @@
 """
 Apex Flight Computer — Ground Monitor
 
-Two data sources, switched in the toolbar:
-  USB Serial   — laptop-connected Teensy (APEX_MONITOR build), full sensor set
+Three data sources, switched in the toolbar:
+  USB Serial   — laptop-connected Teensy (teensy41_debug build), full sensor set
   RTL-SDR      — 2-GFSK telemetry downlink (441.480 MHz) with live spectrum,
                  waterfall, ground-station plot layout, and link stats
+  HIL Sim      — closed-loop hardware-in-the-loop: runs the RocketPy sim
+                 against a Teensy (teensy41_hil build) or the in-process fake
+                 flight computer; shows injected sensors, state estimation vs
+                 truth, state machine, and airbrake deployment
 
-Both sources speak the same line protocol:
+All sources speak the same line protocol:
   >key:value    numeric — routed to live plots and values table
   !key:value    state   — routed to state panel (phase, health, link, etc.)
   #LEVEL: msg   log     — shown in the log panel with color coding
@@ -25,6 +29,10 @@ import shutil
 import subprocess
 import threading
 from collections import deque
+from pathlib import Path
+
+# apex_sim package (HIL source) lives one level up from scripts/
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import serial
@@ -36,9 +44,10 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea,
     QFrame, QTextEdit, QGridLayout, QGroupBox,
     QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QCompleter,
+    QProxyStyle, QStyle, QTabBar,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QPoint
+from PyQt5.QtGui import QFont, QColor, QPainter, QPolygon
 
 from radio_gfsk_rx import (
     BITRATE_BPS,
@@ -83,6 +92,34 @@ RADIO_PLOT_GROUPS = [
     ("Link",             ["packet_loss_pct", "radio_rx_quality", "radio_freq_offset_khz"],
                          ["#ff4444", "#44ffaa", "#ffdd44"]),
 ]
+
+# HIL layout — closed-loop sim view. est_* comes from the flight computer's
+# TeensyPackets, true_* from the RocketPy state, sim_* is what the emulator
+# injects. Dim gray = ground truth "ghost" under the FC's estimate.
+HIL_PLOT_GROUPS = [
+    ("State Estimation", ["est_alt", "true_alt", "pred_apogee"],
+                         ["#00d4ff", "#8888aa", "#a8ff3e"]),
+    ("Velocity",         ["est_vel", "true_vel"],
+                         ["#ff6b35", "#8888aa"]),
+    ("Airbrakes",        ["deployment"],
+                         ["#00d4ff"]),
+    ("Injected Accel",   ["sim_accel_x", "sim_accel_y", "sim_accel_z"],
+                         ["#ff4444", "#44ff44", "#4488ff"]),
+    ("Injected Gyro",    ["sim_gyro_x", "sim_gyro_y", "sim_gyro_z"],
+                         ["#ff8844", "#88ff44", "#4488ff"]),
+    ("Injected Baro",    ["sim_baro_pa"],
+                         ["#ffdd44"]),
+    ("Loop Latency",     ["hil_lat_ms"],
+                         ["#ff44aa"]),
+]
+
+# Flight-info reference values — mirror fsw/src/config.h / airbrakes.yaml
+TARGET_APOGEE_M = 3048.0    # 10,000 ft AGL
+MACH_GATE_MPS   = 240.0     # Mach 0.7 — deployment allowed below this
+FT_PER_M        = 3.28084
+
+# Monitor pages (tab index → source mode)
+PAGES = [("Sensor Debug", "serial"), ("Radio Debug", "radio"), ("HIL Debug", "hil")]
 
 # Sensor health bitmask (must match config.h)
 SENSOR_BITS = {"IMU": 0, "HG": 1, "BAR": 2, "MAG": 3}
@@ -133,6 +170,52 @@ def mono_font(size: int, bold: bool = False) -> QFont:
     f = QFont("Menlo", size, QFont.Bold if bold else QFont.Normal)
     f.setStyleHint(QFont.Monospace)
     return f
+
+
+class MonitorStyle(QProxyStyle):
+    """Paint small control arrows without depending on glyph fonts or assets."""
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        arrow_elements = {
+            QStyle.PE_IndicatorArrowDown,
+            QStyle.PE_IndicatorSpinUp,
+            QStyle.PE_IndicatorSpinDown,
+        }
+        if element in arrow_elements and isinstance(widget, (QComboBox, QSpinBox, QDoubleSpinBox)):
+            self._draw_arrow(element, option, painter)
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+    def _draw_arrow(self, element, option, painter):
+        rect = option.rect
+        if rect.isEmpty():
+            return
+
+        size = max(5, min(9, min(rect.width(), rect.height()) - 4))
+        half = size // 2
+        center = rect.center()
+        color = QColor(TEXT_DIM if option.state & QStyle.State_Enabled else BORDER_HI)
+
+        if element == QStyle.PE_IndicatorSpinUp:
+            points = [
+                QPoint(center.x(), center.y() - half),
+                QPoint(center.x() - half, center.y() + half),
+                QPoint(center.x() + half, center.y() + half),
+            ]
+        else:
+            points = [
+                QPoint(center.x() - half, center.y() - half),
+                QPoint(center.x() + half, center.y() - half),
+                QPoint(center.x(), center.y() + half),
+            ]
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawPolygon(QPolygon(points))
+        painter.restore()
+
 
 KNOWN_COMMANDS = [
     "ARM",
@@ -504,6 +587,152 @@ class RadioWorker(QThread):
         self._terminate_proc()
         self.wait(3000)
 
+
+# ─── HIL worker ───────────────────────────────────────────────────────────────
+
+class _HilAborted(Exception):
+    """Raised from the tick callback to unwind RocketPy when the user stops."""
+
+
+class HilWorker(QThread):
+    """Runs the closed-loop HIL session (apex_sim.hil.runner) in a thread.
+
+    Every controller tick is translated into the monitor's native line
+    protocol and emitted as one batch, so the existing routing, plots, state
+    panel, and log handle HIL data exactly like the other sources. The
+    callback runs inside the 100 Hz control loop — it only formats strings
+    and emits one queued signal.
+    """
+
+    lines_received = pyqtSignal(list)        # batch of protocol lines per tick
+    status_changed = pyqtSignal(str, bool)   # (message, is_error)
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._port = ""
+        self._fake = True
+        self._speed = 1.0
+        self._noise = True
+
+    def configure(self, port: str, fake: bool, speed: float, noise: bool = True):
+        self._port = port
+        self._fake = fake
+        self._speed = speed
+        self._noise = noise
+
+    def stop(self):
+        self._running = False
+        self.wait(5000)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _emit_tick(self, row, link, last_phase):
+        from apex_sim.hil.protocol import PHASE_NAMES
+
+        lines = [
+            f">true_alt:{row.true_alt_agl_m:.2f}",
+            f">true_vel:{row.true_vel_z_mps:.3f}",
+            f">sim_accel_x:{row.sensors.accel_x_mss:.3f}",
+            f">sim_accel_y:{row.sensors.accel_y_mss:.3f}",
+            f">sim_accel_z:{row.sensors.accel_z_mss:.3f}",
+            f">sim_gyro_x:{row.sensors.gyro_x_rads:.4f}",
+            f">sim_gyro_y:{row.sensors.gyro_y_rads:.4f}",
+            f">sim_gyro_z:{row.sensors.gyro_z_rads:.4f}",
+            f">sim_baro_pa:{row.sensors.baro_pa:.1f}",
+            f">hil_lat_ms:{row.latency_ms:.2f}",
+        ]
+        if row.reply is not None:
+            lines += [
+                f">est_alt:{row.reply.est_alt_agl_m:.2f}",
+                f">est_vel:{row.reply.est_vel_mps:.3f}",
+                f">pred_apogee:{row.reply.pred_apogee_m:.1f}",
+                f">deployment:{row.reply.deployment_frac:.4f}",
+            ]
+            phase = PHASE_NAMES.get(row.reply.phase, "?")
+            if phase != last_phase[0]:
+                last_phase[0] = phase
+                lines.append(f"!phase:{phase}")
+        # Forward flight-computer ASCII (#INFO transitions, warnings) live.
+        lines.extend(link.drain_lines())
+        self.lines_received.emit(lines)
+
+    # ── session ───────────────────────────────────────────────────────────────
+
+    def run(self):
+        self._running = True
+        fake = None
+        link = None
+        try:
+            self.status_changed.emit("HIL: building RocketPy sim…", False)
+            import yaml
+            from apex_sim.config.loader import load_environment
+            from apex_sim.hil.link import HilLink
+            from apex_sim.hil.runner import run_closed_loop
+            from apex_sim.sim.environment import build_environment
+            from apex_sim.sim.rocket import build_rocket
+
+            env_cfg = load_environment()
+            env_cfg.atmosphere.model_override = "standard_atmosphere"
+            env = build_environment(env_cfg)
+            rocket = build_rocket()
+            with (Path(__file__).resolve().parents[1]
+                  / "config" / "airbrakes.yaml").open() as fh:
+                airbrakes_cfg = yaml.safe_load(fh)
+            if not self._running:
+                raise _HilAborted()
+
+            if self._fake:
+                from apex_sim.hil.fake_teensy import FakeTeensy
+                fake = FakeTeensy()
+                port = fake.port
+            else:
+                port = self._port
+            link = HilLink(port)
+            if not self._fake:
+                link.reset_input()
+            self.status_changed.emit(f"HIL: waiting for flight computer on {port}…", False)
+            if not link.wait_for_line("READY", timeout=15.0):
+                self.status_changed.emit(
+                    "HIL: no #HIL_READY — flash the teensy41_hil build", True)
+                return
+            self.lines_received.emit(["#INFO: HIL flight computer ready"])
+
+            self.status_changed.emit("HIL: warming up on pad…", False)
+            last_phase = ["ARMED"]
+
+            def tick(row):
+                if not self._running:
+                    raise _HilAborted()
+                self._emit_tick(row, link, last_phase)
+
+            result = run_closed_loop(
+                link, env, rocket, env_cfg, airbrakes_cfg,
+                speed=self._speed, terminate_on_apogee=False,
+                max_time=120.0, noise=self._noise, tick_cb=tick)
+
+            apogee_ft = (result.flight.apogee - env.elevation) * 3.28084
+            replies = [r.reply for r in result.rows if r.reply is not None]
+            max_dep = max((r.deployment_frac for r in replies), default=0.0)
+            self.lines_received.emit([
+                f"#INFO: HIL flight complete — apogee {apogee_ft:.0f} ft AGL, "
+                f"max deployment {max_dep * 100:.0f}%",
+                f"#INFO: {len(result.rows)} ticks, {result.missed} missed, "
+                f"{result.crc_errors} CRC errors",
+            ])
+            self.status_changed.emit("HIL: flight complete", False)
+        except _HilAborted:
+            self.status_changed.emit("HIL: stopped", False)
+        except Exception as exc:  # noqa: BLE001 — surface anything in the UI
+            self.status_changed.emit(f"HIL error: {exc}", True)
+        finally:
+            if link is not None:
+                link.close()
+            if fake is not None:
+                fake.close()
+            self._running = False
+
+
 # ─── Plot widget — passes wheel events up so the scroll area scrolls ─────────
 
 class PlotWidget(pg.PlotWidget):
@@ -845,6 +1074,50 @@ class PlotGroupWidget(QGroupBox):
         self._y[key] = deque(maxlen=MAX_POINTS)
         self._make_curve(key, color)
 
+# ─── Deployment gauge ────────────────────────────────────────────────────────
+
+class DeploymentGauge(QWidget):
+    """Horizontal 0–100 % bar for airbrake deployment.
+
+    Driven from the `deployment` numeric key (0.0–1.0), so it works for the
+    HIL source and the radio telemetry downlink alike.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(26)
+        self._frac = 0.0
+
+    def set_fraction(self, frac: float):
+        frac = max(0.0, min(1.0, frac))
+        if abs(frac - self._frac) > 0.0005:
+            self._frac = frac
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(1, 1, -1, -1)
+
+        p.setPen(pg.mkPen(BORDER_HI))
+        p.setBrush(QColor(INSET))
+        p.drawRoundedRect(r, 4, 4)
+
+        fill = QRectF(r)
+        fill.setWidth(r.width() * self._frac)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(ACCENT))
+        p.save()
+        p.setClipRect(fill)
+        p.drawRoundedRect(QRectF(r), 4, 4)
+        p.restore()
+
+        p.setFont(mono_font(10, bold=True))
+        p.setPen(QColor("#0d0d1a" if self._frac > 0.55 else TEXT))
+        p.drawText(r, Qt.AlignCenter, f"{self._frac * 100:.1f}%")
+        p.end()
+
+
 # ─── State panel ─────────────────────────────────────────────────────────────
 
 class StatePanel(QWidget):
@@ -864,6 +1137,51 @@ class StatePanel(QWidget):
         self.phase_label.setFixedHeight(54)
         self.phase_label.setStyleSheet(badge_style(PHASE_COLORS["IDLE"], radius=6))
         layout.addWidget(self.phase_label)
+
+        # Flight info — converted/derived values in flight units. Fed from the
+        # same numeric keys as the plots (serial/radio: alt_agl, velocity;
+        # HIL: est_alt, est_vel), buffered and repainted on the UI tick.
+        flight_box = QGroupBox("Flight")
+        flight_grid = QGridLayout(flight_box)
+        flight_grid.setContentsMargins(6, 4, 6, 4)
+        flight_grid.setVerticalSpacing(2)
+        self._flight_labels: dict[str, QLabel] = {}
+
+        def flight_row(row: int, title: str, key: str, size: int = 10):
+            k = QLabel(title)
+            k.setFont(mono_font(9))
+            k.setStyleSheet("color:#aaaacc;")
+            v = QLabel("—")
+            v.setFont(mono_font(size, bold=True))
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            v.setStyleSheet("color:#ffffff;")
+            flight_grid.addWidget(k, row, 0)
+            flight_grid.addWidget(v, row, 1)
+            self._flight_labels[key] = v
+
+        flight_row(0, "Alt",         "f_alt", size=12)
+        flight_row(1, "Max alt",     "f_max")
+        flight_row(2, "Pred apogee", "f_pred", size=12)
+        flight_row(3, "vs 10k ft",   "f_err")
+        flight_row(4, "Speed",       "f_speed", size=12)
+        flight_row(5, "Deploy gate", "f_gate")
+        self._flight_labels["f_gate"].setText(f"< {MACH_GATE_MPS:.0f} m/s")
+        self._flight_labels["f_gate"].setStyleSheet(f"color:{TEXT_DIM};")
+        layout.addWidget(flight_box)
+
+        self._flight_alt_m = None      # latest values, flushed on UI tick
+        self._flight_max_m = 0.0
+        self._flight_pred_m = None
+        self._flight_speed = None
+
+        # Airbrake deployment gauge — fed by the `deployment` numeric key
+        # (HIL replies and radio telemetry both carry it)
+        gauge_box = QGroupBox("Airbrakes")
+        gauge_layout = QVBoxLayout(gauge_box)
+        gauge_layout.setContentsMargins(6, 4, 6, 4)
+        self.deploy_gauge = DeploymentGauge()
+        gauge_layout.addWidget(self.deploy_gauge)
+        layout.addWidget(gauge_box)
 
         # Sensor health row
         health_box = QGroupBox("Sensors")
@@ -1010,10 +1328,51 @@ class StatePanel(QWidget):
         # Buffered — labels repaint on the UI tick via flush_values(), not at
         # the incoming serial rate.
         self._pending_values[key] = value
+        if key in ("alt_agl", "est_alt"):
+            self._flight_alt_m = value
+            if value > self._flight_max_m:
+                self._flight_max_m = value
+        elif key == "pred_apogee":
+            self._flight_pred_m = value
+        elif key in ("velocity", "est_vel"):
+            self._flight_speed = value
+
+    def reset_flight(self):
+        self._flight_alt_m = None
+        self._flight_max_m = 0.0
+        self._flight_pred_m = None
+        self._flight_speed = None
+        for key in ("f_alt", "f_max", "f_pred", "f_err", "f_speed"):
+            self._flight_labels[key].setText("—")
+            self._flight_labels[key].setStyleSheet("color:#ffffff;")
+        self.deploy_gauge.set_fraction(0.0)
+
+    def _flush_flight(self):
+        if self._flight_alt_m is not None:
+            self._flight_labels["f_alt"].setText(f"{self._flight_alt_m * FT_PER_M:,.0f} ft")
+            self._flight_labels["f_max"].setText(f"{self._flight_max_m * FT_PER_M:,.0f} ft")
+        if self._flight_pred_m is not None:
+            err_ft = (self._flight_pred_m - TARGET_APOGEE_M) * FT_PER_M
+            self._flight_labels["f_pred"].setText(
+                f"{self._flight_pred_m * FT_PER_M:,.0f} ft")
+            err = self._flight_labels["f_err"]
+            err.setText(f"{err_ft:+,.0f} ft")
+            tol = abs(err_ft)
+            err.setStyleSheet("color:%s;" % (
+                GOOD if tol < 100 else AMBER if tol < 300 else "#ff6666"))
+        if self._flight_speed is not None:
+            speed = self._flight_labels["f_speed"]
+            speed.setText(f"{self._flight_speed:.1f} m/s")
+            # Green = below the mach gate (deployment allowed), amber above
+            below = self._flight_speed < MACH_GATE_MPS
+            speed.setStyleSheet("color:%s;" % (GOOD if below else AMBER))
 
     def flush_values(self):
+        self._flush_flight()
         if not self._pending_values:
             return
+        if "deployment" in self._pending_values:
+            self.deploy_gauge.set_fraction(self._pending_values["deployment"])
         for key, value in self._pending_values.items():
             if key not in self._value_rows:
                 row = self._values_layout.rowCount()
@@ -1095,12 +1454,14 @@ class MainWindow(QMainWindow):
 
         self._worker = SerialWorker()
         self._radio_worker = RadioWorker()
+        self._hil_worker = HilWorker()
         self._t_start = None
         self._window_s = DEFAULT_WINDOW_S
 
         # Key → PlotGroupWidget mapping for routing, per source
         self._key_to_group_serial: dict[str, PlotGroupWidget] = {}
         self._key_to_group_radio: dict[str, PlotGroupWidget] = {}
+        self._key_to_group_hil: dict[str, PlotGroupWidget] = {}
         self._overflow_group: PlotGroupWidget | None = None
 
         # Debounced restart so gain/freq/ppm changes apply while connected
@@ -1125,6 +1486,24 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Page tabs — Sensor Debug / Radio Debug / HIL Debug. Each tab swaps
+        # the toolbar controls and plot layout; panels themselves are shared.
+        tab_strip = QFrame()
+        tab_strip.setObjectName("tabstrip")
+        tab_layout = QHBoxLayout(tab_strip)
+        tab_layout.setContentsMargins(10, 0, 10, 0)
+        tab_layout.setSpacing(0)
+        self.tab_bar = QTabBar()
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.setFocusPolicy(Qt.NoFocus)
+        for title, _mode in PAGES:
+            self.tab_bar.addTab(title)
+        self.tab_bar.currentChanged.connect(self._on_source_changed)
+        tab_layout.addWidget(self.tab_bar)
+        tab_layout.addStretch()
+        root.addWidget(tab_strip)
+
         # Toolbar — fixed-height control bar with bottom separator
         root.addWidget(self._build_toolbar())
 
@@ -1146,16 +1525,6 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(6)
-
-        # Source selector
-        self.source_combo = QComboBox()
-        self.source_combo.addItem("USB Serial", "serial")
-        self.source_combo.addItem("RTL-SDR Radio", "radio")
-        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
-        layout.addWidget(QLabel("Source:"))
-        layout.addWidget(self.source_combo)
-
-        layout.addSpacing(8)
 
         # Port selector
         self.port_label = QLabel("Port:")
@@ -1222,6 +1591,35 @@ class MainWindow(QMainWindow):
         self.radio_device_input.setFixedWidth(36)
         layout.addWidget(self.radio_device_label)
         layout.addWidget(self.radio_device_input)
+
+        # HIL controls — fake flight computer (pty, no hardware) + pacing
+        self.hil_fake_check = QCheckBox("Fake FC")
+        self.hil_fake_check.setToolTip(
+            "Run against the in-process reference flight computer\n"
+            "(apex_sim.hil.fake_teensy) instead of a real Teensy.")
+        self.hil_fake_check.setChecked(True)
+        self.hil_fake_check.toggled.connect(self._on_source_changed)
+        layout.addWidget(self.hil_fake_check)
+
+        self.hil_speed_label = QLabel("Speed:")
+        self.hil_speed_spin = QDoubleSpinBox()
+        self.hil_speed_spin.setRange(0.0, 4.0)
+        self.hil_speed_spin.setDecimals(2)
+        self.hil_speed_spin.setSingleStep(0.25)
+        self.hil_speed_spin.setValue(1.0)
+        self.hil_speed_spin.setFixedWidth(72)
+        self.hil_speed_spin.setToolTip(
+            "Sim pacing. 1.0 = real time (required for real hardware —\n"
+            "the firmware's filter integrates wall-clock dt). 0 = max (fake only).")
+        layout.addWidget(self.hil_speed_label)
+        layout.addWidget(self.hil_speed_spin)
+
+        self.hil_noise_check = QCheckBox("Noise")
+        self.hil_noise_check.setChecked(True)
+        self.hil_noise_check.setToolTip(
+            "Per-sample sensor noise from the docs/sensors noise model\n"
+            "(BMP581 0.32 Pa, ICM-45686 0.069 m/s², MMC5983MA 0.4 mG, ...).")
+        layout.addWidget(self.hil_noise_check)
 
         # Retune live: any radio setting change restarts rtl_sdr (debounced)
         self.radio_freq_spin.valueChanged.connect(self._schedule_radio_retune)
@@ -1310,6 +1708,17 @@ class MainWindow(QMainWindow):
             for key in keys:
                 self._key_to_group_radio[key] = group
 
+        hil = self._source_mode() == "hil"
+        self._hil_groups: list[PlotGroupWidget] = []
+        for title, keys, colors in HIL_PLOT_GROUPS:
+            group = PlotGroupWidget(title, keys, colors)
+            group.setVisible(hil)
+            self._hil_groups.append(group)
+            self._plot_groups.append(group)
+            self._plot_layout.addWidget(group)
+            for key in keys:
+                self._key_to_group_hil[key] = group
+
         self._plot_layout.addStretch()
         scroll.setWidget(container)
         return scroll
@@ -1384,19 +1793,28 @@ class MainWindow(QMainWindow):
         self._radio_worker.status_changed.connect(self._on_status)
         self._radio_worker.spectrum_ready.connect(self.spectrum_panel.update_spectrum)
         self._radio_worker.finished.connect(self._on_worker_finished)
+        self._hil_worker.lines_received.connect(self._on_lines)
+        self._hil_worker.status_changed.connect(self._on_status)
+        self._hil_worker.finished.connect(self._on_worker_finished)
         self.state_panel.copy_requested.connect(self._copy_to_clipboard)
 
     # ── Serial control ────────────────────────────────────────────────────────
 
     def _source_mode(self) -> str:
-        return self.source_combo.currentData() or "serial"
+        idx = self.tab_bar.currentIndex() if hasattr(self, "tab_bar") else 0
+        return PAGES[idx][1] if 0 <= idx < len(PAGES) else "serial"
 
     def _on_source_changed(self):
-        radio = self._source_mode() == "radio"
-        serial_widgets = [
-            self.port_label, self.port_combo, self.refresh_btn,
-            self.baud_label, self.baud_combo,
-        ]
+        mode = self._source_mode()
+        radio = mode == "radio"
+        hil = mode == "hil"
+        hil_fake = hil and self.hil_fake_check.isChecked()
+
+        # Port selector serves both USB serial and HIL-on-hardware
+        for widget in (self.port_label, self.port_combo, self.refresh_btn):
+            widget.setVisible(mode == "serial" or (hil and not hil_fake))
+        for widget in (self.baud_label, self.baud_combo):
+            widget.setVisible(mode == "serial")
         radio_widgets = [
             self.radio_freq_label, self.radio_freq_spin,
             self.radio_gain_label, self.radio_gain_input,
@@ -1404,25 +1822,30 @@ class MainWindow(QMainWindow):
             self.radio_rate_label, self.radio_rate_spin,
             self.radio_device_label, self.radio_device_input,
         ]
-        for widget in serial_widgets:
-            widget.setVisible(not radio)
         for widget in radio_widgets:
             widget.setVisible(radio)
+        for widget in (self.hil_fake_check, self.hil_speed_label,
+                       self.hil_speed_spin, self.hil_noise_check):
+            widget.setVisible(hil)
 
         if hasattr(self, "spectrum_panel"):
             self.spectrum_panel.setVisible(radio)
             for group in self._serial_groups:
-                group.setVisible(not radio)
+                group.setVisible(mode == "serial")
             for group in self._radio_groups:
                 group.setVisible(radio)
+            for group in self._hil_groups:
+                group.setVisible(hil)
 
         if hasattr(self, "state_panel"):
             self.state_panel.set_link_mode(radio)
 
         if hasattr(self, "cmd_input"):
-            self.cmd_input.setEnabled(not radio)
+            self.cmd_input.setEnabled(mode == "serial")
             if radio:
                 self.cmd_input.setPlaceholderText("Radio RX is receive-only; send RADIO_DATA_TEST over USB")
+            elif hil:
+                self.cmd_input.setPlaceholderText("HIL link is packet-based — no text commands")
             else:
                 self.cmd_input.setPlaceholderText("Command (Tab completes, Up/Down history)")
 
@@ -1469,9 +1892,15 @@ class MainWindow(QMainWindow):
         elif self._radio_worker.isRunning():
             self._radio_worker.stop()
             self._set_disconnected()
+        elif self._hil_worker.isRunning():
+            self._hil_worker.stop()
+            self._set_disconnected()
         else:
-            if self._source_mode() == "radio":
+            mode = self._source_mode()
+            if mode == "radio":
                 self._start_radio()
+            elif mode == "hil":
+                self._start_hil()
             else:
                 idx  = self.port_combo.currentIndex()
                 port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
@@ -1481,7 +1910,23 @@ class MainWindow(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet(
                 f"background:{BAD}; color:#ffffff; border:1px solid #cc4444;")
-            self.source_combo.setEnabled(False)
+            self.tab_bar.setEnabled(False)   # no page switching mid-session
+
+    def _start_hil(self):
+        fake = self.hil_fake_check.isChecked()
+        speed = float(self.hil_speed_spin.value())
+        port = ""
+        if not fake:
+            idx = self.port_combo.currentIndex()
+            port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
+            if speed != 1.0:
+                self._log("[monitor] HIL on real hardware needs speed 1.0 — overriding "
+                          "(firmware filter integrates wall-clock dt)")
+                speed = 1.0
+        self._clear_data()
+        self._hil_worker.configure(port, fake, speed,
+                                   noise=self.hil_noise_check.isChecked())
+        self._hil_worker.start()
 
     def _start_radio(self):
         freq_hz = int(round(self.radio_freq_spin.value() * 1e6))
@@ -1507,10 +1952,11 @@ class MainWindow(QMainWindow):
     def _set_disconnected(self):
         self.connect_btn.setText("Connect")
         self.connect_btn.setStyleSheet("")
-        self.source_combo.setEnabled(True)
+        self.tab_bar.setEnabled(True)
 
     def _on_worker_finished(self):
-        if not self._worker.isRunning() and not self._radio_worker.isRunning():
+        if (not self._worker.isRunning() and not self._radio_worker.isRunning()
+                and not self._hil_worker.isRunning()):
             self._set_disconnected()
 
     def _send_command(self):
@@ -1528,6 +1974,12 @@ class MainWindow(QMainWindow):
 
     # ── Data routing ──────────────────────────────────────────────────────────
 
+    def _on_lines(self, lines: list):
+        """Batched protocol lines from the HIL worker (one batch per tick)."""
+        at = time.monotonic()
+        for line in lines:
+            self._on_line(line, at)
+
     def _on_line(self, line: str, at: float = None):
         now = time.monotonic() if at is None else at
         if self._t_start is None:
@@ -1539,7 +1991,9 @@ class MainWindow(QMainWindow):
             try:
                 key, val_str = line[1:].split(":", 1)
                 value = float(val_str)
-                key_map = (self._key_to_group_radio if self._source_mode() == "radio"
+                mode = self._source_mode()
+                key_map = (self._key_to_group_radio if mode == "radio"
+                           else self._key_to_group_hil if mode == "hil"
                            else self._key_to_group_serial)
                 group = key_map.get(key)
                 if group is None:
@@ -1690,6 +2144,7 @@ class MainWindow(QMainWindow):
         self._t_start = None
         for group in self._plot_groups:
             group.clear()
+        self.state_panel.reset_flight()
         self.log_view.clear()   # QTextEdit.clear()
 
     def _apply_dark_theme(self):
@@ -1702,6 +2157,20 @@ class MainWindow(QMainWindow):
             QSplitter::handle:hover {{ background: {ACCENT}; }}
             QToolTip                {{ background: {SURFACE}; color: {TEXT};
                                        border: 1px solid {BORDER_HI}; padding: 3px 6px; }}
+
+            /* ── Page tabs ────────────────────────────────────────────────── */
+            QFrame#tabstrip         {{ background: {BG};
+                                       border-bottom: 1px solid {BORDER}; }}
+            QTabBar                 {{ background: transparent; }}
+            QTabBar::tab            {{ background: transparent; color: {TEXT_DIM};
+                                       padding: 7px 18px 5px 18px;
+                                       border: none;
+                                       border-bottom: 2px solid transparent;
+                                       font-weight: bold; }}
+            QTabBar::tab:hover      {{ color: {TEXT}; }}
+            QTabBar::tab:selected   {{ color: {ACCENT};
+                                       border-bottom: 2px solid {ACCENT}; }}
+            QTabBar::tab:disabled   {{ color: {BORDER_HI}; }}
 
             /* ── Toolbar ──────────────────────────────────────────────────── */
             QFrame#toolbar          {{ background: #111122;
@@ -1740,16 +2209,7 @@ class MainWindow(QMainWindow):
             QPushButton:hover       {{ background: #2a2a4a; border-color: {ACCENT}; }}
             QPushButton:pressed     {{ background: #16162e; }}
 
-            /* ── ComboBox dropdown + popup ─────────────────────────────────
-               Leave arrow glyphs to Qt's native style. Qt stylesheets do not
-               reliably support CSS border triangles on all platforms, which
-               can render as empty symbol boxes instead of arrows. */
-            QComboBox::drop-down    {{ subcontrol-origin: padding;
-                                       subcontrol-position: top right;
-                                       width: 18px;
-                                       border-left: 1px solid #303050;
-                                       border-radius: 0 3px 3px 0; }}
-
+            /* ── ComboBox popup ──────────────────────────────────────────── */
             QComboBox QAbstractItemView {{
                                        background: {SURFACE};
                                        border: 1px solid {BORDER_HI};
@@ -1757,34 +2217,6 @@ class MainWindow(QMainWindow):
                                        selection-background-color: #2a2a50;
                                        selection-color: #ffffff;
                                        outline: none; }}
-
-            /* ── SpinBox arrow button frames ────────────────────────────────
-               As with combo boxes, use native Qt arrow drawing for the glyphs
-               so no icon font or platform-specific symbol is required. */
-            QSpinBox::up-button     {{ subcontrol-origin: border;
-                                       subcontrol-position: top right;
-                                       width: 16px;
-                                       border-left: 1px solid #303050;
-                                       border-bottom: 1px solid #303050;
-                                       background: transparent; }}
-            QSpinBox::down-button   {{ subcontrol-origin: border;
-                                       subcontrol-position: bottom right;
-                                       width: 16px;
-                                       border-left: 1px solid #303050;
-                                       background: transparent; }}
-            QDoubleSpinBox::up-button
-                                    {{ subcontrol-origin: border;
-                                       subcontrol-position: top right;
-                                       width: 16px;
-                                       border-left: 1px solid #303050;
-                                       border-bottom: 1px solid #303050;
-                                       background: transparent; }}
-            QDoubleSpinBox::down-button
-                                    {{ subcontrol-origin: border;
-                                       subcontrol-position: bottom right;
-                                       width: 16px;
-                                       border-left: 1px solid #303050;
-                                       background: transparent; }}
 
             /* ── Scrollbars ───────────────────────────────────────────────── */
             QScrollBar:vertical     {{ background: {BG}; width: 8px;
@@ -1817,6 +2249,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._worker.stop()
         self._radio_worker.stop()
+        self._hil_worker.stop()
         event.accept()
 
 
@@ -1824,6 +2257,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app._monitor_style = MonitorStyle(app.style())
+    app.setStyle(app._monitor_style)
     app.setApplicationName("Apex Monitor")
     win = MainWindow()
     win.show()
