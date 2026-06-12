@@ -84,6 +84,11 @@ _REF_AREA_M2 = 0.019001
 _CD_CLEAN = 0.576
 _G = 9.81
 _SETTLE_PACKETS = 50
+_CF_BOOST_ALPHA = 0.005
+_CF_COAST_ALPHA = 0.02
+_CF_BOOST_BETA = 0.10
+_CF_COAST_BETA = 1.00
+_CF_ALT_ERR_CLAMP_M = 5.0
 
 _PH_IDLE, _PH_ARMED, _PH_BOOST, _PH_COAST, _PH_DESCENT, _PH_LANDED = range(6)
 
@@ -181,11 +186,18 @@ class FlightLogic:
         # ── Estimator: α-β complementary filter (mirrors fusion.cpp) ──────────
         in_flight = self.phase in (_PH_BOOST, _PH_COAST, _PH_DESCENT)
         if in_flight:
+            if self.phase == _PH_BOOST:
+                alpha = _CF_BOOST_ALPHA
+                beta = _CF_BOOST_BETA
+            else:
+                alpha = _CF_COAST_ALPHA
+                beta = _CF_COAST_BETA
             vel_pred = self.vel + vert_accel * dt
             alt_pred = self.alt + self.vel * dt
-            err = max(-5.0, min(5.0, baro_agl - alt_pred))
-            self.alt = alt_pred + 0.2 * err
-            self.vel = vel_pred + 1.0 * err
+            err = max(-_CF_ALT_ERR_CLAMP_M,
+                      min(_CF_ALT_ERR_CLAMP_M, baro_agl - alt_pred))
+            self.alt = alt_pred + alpha * err
+            self.vel = vel_pred + beta * err
         else:
             self.alt = baro_agl
             self.vel = 0.0

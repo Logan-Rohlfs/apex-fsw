@@ -23,16 +23,19 @@ Run: python scripts/monitor.py
 """
 
 import html
+import csv
 import sys
 import time
 import shutil
 import subprocess
 import threading
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 # apex_sim package (HIL source) lives one level up from scripts/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_SIM_ROOT = Path(__file__).resolve().parents[1]
 
 import numpy as np
 import serial
@@ -97,20 +100,22 @@ RADIO_PLOT_GROUPS = [
 # TeensyPackets, true_* from the RocketPy state, sim_* is what the emulator
 # injects. Dim gray = ground truth "ghost" under the FC's estimate.
 HIL_PLOT_GROUPS = [
-    ("State Estimation", ["est_alt", "true_alt", "pred_apogee"],
-                         ["#00d4ff", "#8888aa", "#a8ff3e"]),
-    ("Velocity",         ["est_vel", "true_vel"],
-                         ["#ff6b35", "#8888aa"]),
-    ("Airbrakes",        ["deployment"],
-                         ["#00d4ff"]),
+    ("State Estimation", ["est_alt", "true_alt", "pred_apogee", "fake_est_alt", "fake_pred_apogee"],
+                         ["#00d4ff", "#8888aa", "#a8ff3e", "#ff44aa", "#ffaa44"]),
+    ("Velocity",         ["est_vel", "true_vel", "fake_est_vel"],
+                         ["#ff6b35", "#8888aa", "#ff44aa"]),
+    ("Airbrakes",        ["deployment", "fake_deployment"],
+                         ["#00d4ff", "#ff44aa"]),
     ("Injected Accel",   ["sim_accel_x", "sim_accel_y", "sim_accel_z"],
                          ["#ff4444", "#44ff44", "#4488ff"]),
     ("Injected Gyro",    ["sim_gyro_x", "sim_gyro_y", "sim_gyro_z"],
                          ["#ff8844", "#88ff44", "#4488ff"]),
     ("Injected Baro",    ["sim_baro_pa"],
                          ["#ffdd44"]),
-    ("Loop Latency",     ["hil_lat_ms"],
-                         ["#ff44aa"]),
+    ("Loop Latency",     ["hil_lat_ms", "fake_hil_lat_ms"],
+                         ["#ff44aa", "#44ffaa"]),
+    ("Fake Shadow Delta", ["fake_delta_alt", "fake_delta_vel", "fake_delta_deployment"],
+                          ["#ff44aa", "#44ffaa", "#ffaa44"]),
 ]
 
 # Flight-info reference values — mirror fsw/src/config.h / airbrakes.yaml
@@ -614,12 +619,23 @@ class HilWorker(QThread):
         self._fake = True
         self._speed = 1.0
         self._noise = True
+        self._record_csv = True
+        self._compare_fake = False
+        self._sensor_seed = None
+        self._sensor_delay_ms = 0.0
+        self._tick_count = 0
 
-    def configure(self, port: str, fake: bool, speed: float, noise: bool = True):
+    def configure(self, port: str, fake: bool, speed: float, noise: bool = True,
+                  record_csv: bool = True, compare_fake: bool = False,
+                  sensor_seed=None, sensor_delay_ms: float = 0.0):
         self._port = port
         self._fake = fake
         self._speed = speed
         self._noise = noise
+        self._record_csv = record_csv
+        self._compare_fake = compare_fake and not fake
+        self._sensor_seed = sensor_seed
+        self._sensor_delay_ms = sensor_delay_ms
 
     def stop(self):
         self._running = False
@@ -627,9 +643,82 @@ class HilWorker(QThread):
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
+    def _csv_header(self, compare_fake: bool):
+        header = [
+            "t_s", "sim_ms", "true_alt_agl_m", "true_vel_z_mps",
+            "sim_accel_x_mss", "sim_accel_y_mss", "sim_accel_z_mss",
+            "sim_gyro_x_rads", "sim_gyro_y_rads", "sim_gyro_z_rads",
+            "sim_baro_pa",
+            "est_alt_agl_m", "est_vel_mps", "pred_apogee_m",
+            "deployment_frac", "phase", "latency_ms",
+        ]
+        if compare_fake:
+            header.extend([
+                "fake_est_alt_agl_m", "fake_est_vel_mps", "fake_pred_apogee_m",
+                "fake_deployment_frac", "fake_phase", "fake_latency_ms",
+                "fake_minus_primary_alt_m", "fake_minus_primary_vel_mps",
+                "fake_minus_primary_deployment",
+            ])
+        return header
+
+    def _write_csv_row(self, writer, row, compare_fake: bool):
+        from apex_sim.hil.protocol import PHASE_NAMES
+
+        if writer is None:
+            return
+        reply = row.reply
+        out = [
+            f"{row.t_s:.3f}",
+            str(row.sim_ms),
+            f"{row.true_alt_agl_m:.2f}",
+            f"{row.true_vel_z_mps:.3f}",
+            f"{row.sensors.accel_x_mss:.3f}",
+            f"{row.sensors.accel_y_mss:.3f}",
+            f"{row.sensors.accel_z_mss:.3f}",
+            f"{row.sensors.gyro_x_rads:.4f}",
+            f"{row.sensors.gyro_y_rads:.4f}",
+            f"{row.sensors.gyro_z_rads:.4f}",
+            f"{row.sensors.baro_pa:.1f}",
+        ]
+        if reply is None:
+            out.extend(["", "", "", "", "MISS", f"{row.latency_ms:.2f}"])
+        else:
+            out.extend([
+                f"{reply.est_alt_agl_m:.2f}",
+                f"{reply.est_vel_mps:.3f}",
+                f"{reply.pred_apogee_m:.1f}",
+                f"{reply.deployment_frac:.4f}",
+                PHASE_NAMES.get(reply.phase, str(reply.phase)),
+                f"{row.latency_ms:.2f}",
+            ])
+
+        if compare_fake:
+            fake_pkt = row.shadow_replies.get("fake")
+            if fake_pkt is None:
+                out.extend([""] * 9)
+            else:
+                out.extend([
+                    f"{fake_pkt.est_alt_agl_m:.2f}",
+                    f"{fake_pkt.est_vel_mps:.3f}",
+                    f"{fake_pkt.pred_apogee_m:.1f}",
+                    f"{fake_pkt.deployment_frac:.4f}",
+                    PHASE_NAMES.get(fake_pkt.phase, str(fake_pkt.phase)),
+                    f"{row.shadow_latencies_ms.get('fake', 0.0):.2f}",
+                ])
+                if reply is None:
+                    out.extend(["", "", ""])
+                else:
+                    out.extend([
+                        f"{fake_pkt.est_alt_agl_m - reply.est_alt_agl_m:.2f}",
+                        f"{fake_pkt.est_vel_mps - reply.est_vel_mps:.3f}",
+                        f"{fake_pkt.deployment_frac - reply.deployment_frac:.4f}",
+                    ])
+        writer.writerow(out)
+
     def _emit_tick(self, row, link, last_phase):
         from apex_sim.hil.protocol import PHASE_NAMES
 
+        self._tick_count += 1
         lines = [
             f">true_alt:{row.true_alt_agl_m:.2f}",
             f">true_vel:{row.true_vel_z_mps:.3f}",
@@ -641,6 +730,8 @@ class HilWorker(QThread):
             f">sim_gyro_z:{row.sensors.gyro_z_rads:.4f}",
             f">sim_baro_pa:{row.sensors.baro_pa:.1f}",
             f">hil_lat_ms:{row.latency_ms:.2f}",
+            f"!hil_ticks:{self._tick_count}",
+            f"!hil_lat:{row.latency_ms:.1f} ms",
         ]
         if row.reply is not None:
             lines += [
@@ -653,6 +744,25 @@ class HilWorker(QThread):
             if phase != last_phase[0]:
                 last_phase[0] = phase
                 lines.append(f"!phase:{phase}")
+        fake_pkt = row.shadow_replies.get("fake")
+        if fake_pkt is not None:
+            lines += [
+                f">fake_est_alt:{fake_pkt.est_alt_agl_m:.2f}",
+                f">fake_est_vel:{fake_pkt.est_vel_mps:.3f}",
+                f">fake_pred_apogee:{fake_pkt.pred_apogee_m:.1f}",
+                f">fake_deployment:{fake_pkt.deployment_frac:.4f}",
+                f">fake_hil_lat_ms:{row.shadow_latencies_ms.get('fake', 0.0):.2f}",
+            ]
+            if row.reply is not None:
+                d_alt = fake_pkt.est_alt_agl_m - row.reply.est_alt_agl_m
+                d_vel = fake_pkt.est_vel_mps - row.reply.est_vel_mps
+                d_dep = fake_pkt.deployment_frac - row.reply.deployment_frac
+                lines += [
+                    f">fake_delta_alt:{d_alt:.2f}",
+                    f">fake_delta_vel:{d_vel:.3f}",
+                    f">fake_delta_deployment:{d_dep:.4f}",
+                    f"!hil_shadow:dAlt {d_alt:+.1f} m  dVel {d_vel:+.2f} m/s  dDep {d_dep * 100:+.1f}%",
+                ]
         # Forward flight-computer ASCII (#INFO transitions, warnings) live.
         lines.extend(link.drain_lines())
         self.lines_received.emit(lines)
@@ -661,12 +771,19 @@ class HilWorker(QThread):
 
     def run(self):
         self._running = True
+        self._tick_count = 0
         fake = None
+        fake_shadow = None
         link = None
+        shadow_links = {}
+        csv_file = None
+        csv_writer = None
+        out_path = None
         try:
             self.status_changed.emit("HIL: building RocketPy sim…", False)
             import yaml
             from apex_sim.config.loader import load_environment
+            from apex_sim.hil.emulator import SensorErrors
             from apex_sim.hil.link import HilLink
             from apex_sim.hil.runner import run_closed_loop
             from apex_sim.sim.environment import build_environment
@@ -681,6 +798,17 @@ class HilWorker(QThread):
                 airbrakes_cfg = yaml.safe_load(fh)
             if not self._running:
                 raise _HilAborted()
+
+            if self._record_csv:
+                out_dir = _SIM_ROOT / "output"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"hil_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                csv_file = out_path.open("w", newline="")
+                csv_writer = csv.writer(csv_file)
+                csv_writer.writerow(self._csv_header(self._compare_fake))
+                self.lines_received.emit([f"#INFO: HIL CSV recording -> {out_path}"])
+            else:
+                self.lines_received.emit(["#INFO: HIL CSV recording disabled"])
 
             if self._fake:
                 from apex_sim.hil.fake_teensy import FakeTeensy
@@ -698,38 +826,96 @@ class HilWorker(QThread):
                 return
             self.lines_received.emit(["#INFO: HIL flight computer ready"])
 
+            if self._compare_fake:
+                from apex_sim.hil.fake_teensy import FakeTeensy
+                fake_shadow = FakeTeensy()
+                fake_link = HilLink(fake_shadow.port)
+                if not fake_link.wait_for_line("READY", timeout=5.0):
+                    fake_link.close()
+                    self.status_changed.emit("HIL: fake shadow did not become ready", True)
+                    return
+                shadow_links["fake"] = fake_link
+                self.lines_received.emit([
+                    "#INFO: HIL fake-shadow comparison enabled (real hardware primary)",
+                    "!hil_shadow:waiting for paired packets",
+                ])
+            else:
+                self.lines_received.emit(["#INFO: HIL fake-shadow comparison disabled"])
+
             self.status_changed.emit("HIL: warming up on pad…", False)
             last_phase = ["ARMED"]
+            sensor_kwargs = {
+                "seed": self._sensor_seed,
+                "errors": SensorErrors(
+                    delay_ticks=max(0, int(round(self._sensor_delay_ms / 10.0)))),
+            }
 
             def tick(row):
                 if not self._running:
                     raise _HilAborted()
+                self._write_csv_row(csv_writer, row, self._compare_fake)
                 self._emit_tick(row, link, last_phase)
 
             result = run_closed_loop(
                 link, env, rocket, env_cfg, airbrakes_cfg,
                 speed=self._speed, terminate_on_apogee=False,
-                max_time=120.0, noise=self._noise, tick_cb=tick)
+                max_time=120.0, noise=self._noise,
+                sensor_kwargs=sensor_kwargs,
+                shadow_links=shadow_links,
+                tick_cb=tick)
 
             apogee_ft = (result.flight.apogee - env.elevation) * 3.28084
             replies = [r.reply for r in result.rows if r.reply is not None]
             max_dep = max((r.deployment_frac for r in replies), default=0.0)
-            self.lines_received.emit([
+            summary = [
                 f"#INFO: HIL flight complete — apogee {apogee_ft:.0f} ft AGL, "
                 f"max deployment {max_dep * 100:.0f}%",
                 f"#INFO: {len(result.rows)} ticks, {result.missed} missed, "
                 f"{result.crc_errors} CRC errors",
-            ])
+                f"!hil_ticks:{len(result.rows)}",
+                f"!hil_missed:{result.missed}",
+                f"!hil_crc:{result.crc_errors}",
+            ]
+            if self._compare_fake:
+                pairs = [(r.reply, r.shadow_replies.get("fake")) for r in result.rows
+                         if r.reply is not None and r.shadow_replies.get("fake") is not None]
+                if pairs:
+                    max_alt_delta = max(abs(f.est_alt_agl_m - p.est_alt_agl_m)
+                                        for p, f in pairs)
+                    max_vel_delta = max(abs(f.est_vel_mps - p.est_vel_mps)
+                                        for p, f in pairs)
+                    max_dep_delta = max(abs(f.deployment_frac - p.deployment_frac)
+                                        for p, f in pairs)
+                    phase_mismatch = sum(1 for p, f in pairs if p.phase != f.phase)
+                    summary.extend([
+                        f"#INFO: fake shadow delta max |alt|={max_alt_delta:.1f} m, "
+                        f"|vel|={max_vel_delta:.2f} m/s, "
+                        f"|deploy|={max_dep_delta * 100:.1f}%, "
+                        f"phase mismatches={phase_mismatch}/{len(pairs)}",
+                        f"!hil_shadow:max dAlt {max_alt_delta:.1f} m  "
+                        f"dVel {max_vel_delta:.2f} m/s  dDep {max_dep_delta * 100:.1f}%",
+                    ])
+                else:
+                    summary.append("#WARN: fake shadow comparison produced no paired replies")
+            if out_path is not None:
+                summary.append(f"#INFO: HIL CSV saved -> {out_path}")
+            self.lines_received.emit(summary)
             self.status_changed.emit("HIL: flight complete", False)
         except _HilAborted:
             self.status_changed.emit("HIL: stopped", False)
         except Exception as exc:  # noqa: BLE001 — surface anything in the UI
             self.status_changed.emit(f"HIL error: {exc}", True)
         finally:
+            if csv_file is not None:
+                csv_file.close()
             if link is not None:
                 link.close()
+            for shadow in shadow_links.values():
+                shadow.close()
             if fake is not None:
                 fake.close()
+            if fake_shadow is not None:
+                fake_shadow.close()
             self._running = False
 
 
@@ -1218,6 +1404,7 @@ class StatePanel(QWidget):
         self._link_value_labels: dict[str, QLabel] = {}
         self._link_serial_widgets: list[QLabel] = []
         self._link_radio_widgets: list[QLabel] = []
+        self._link_hil_widgets: list[QLabel] = []
 
         def link_row(row: int, title: str, key: str, widgets: list):
             k = QLabel(title)
@@ -1244,9 +1431,15 @@ class StatePanel(QWidget):
         link_row(7, "Quality", "rx_quality", self._link_radio_widgets)
         link_row(8, "Offset",  "rx_offset",  self._link_radio_widgets)
         link_row(9, "Packets", "rx_count",   self._link_radio_widgets)
+        # HIL mode: packet-loop stats and optional fake-shadow summary
+        link_row(10, "Ticks",   "hil_ticks",  self._link_hil_widgets)
+        link_row(11, "Latency", "hil_lat",    self._link_hil_widgets)
+        link_row(12, "Missed",  "hil_missed", self._link_hil_widgets)
+        link_row(13, "CRC",     "hil_crc",    self._link_hil_widgets)
+        link_row(14, "Shadow",  "hil_shadow", self._link_hil_widgets)
 
         layout.addWidget(link_box)
-        self.set_link_mode(radio=False)
+        self.set_link_mode("serial")
 
         # GPS status row
         gps_box = QGroupBox("GPS")
@@ -1306,12 +1499,16 @@ class StatePanel(QWidget):
         layout.addWidget(values_box)
         layout.addStretch()
 
-    def set_link_mode(self, radio: bool):
-        """Show TX stats (USB serial) or RX packet stats (SDR) in the Link box."""
+    def set_link_mode(self, mode="serial"):
+        """Show TX stats (USB), RX packet stats (SDR), or packet-loop stats (HIL)."""
+        if isinstance(mode, bool):
+            mode = "radio" if mode else "serial"
         for w in self._link_serial_widgets:
-            w.setVisible(not radio)
+            w.setVisible(mode == "serial")
         for w in self._link_radio_widgets:
-            w.setVisible(radio)
+            w.setVisible(mode == "radio")
+        for w in self._link_hil_widgets:
+            w.setVisible(mode == "hil")
 
     def update_phase(self, phase: str):
         phase = phase.strip().upper()
@@ -1621,6 +1818,43 @@ class MainWindow(QMainWindow):
             "(BMP581 0.32 Pa, ICM-45686 0.069 m/s², MMC5983MA 0.4 mG, ...).")
         layout.addWidget(self.hil_noise_check)
 
+        self.hil_seed_label = QLabel("Seed:")
+        self.hil_seed_input = QLineEdit()
+        self.hil_seed_input.setPlaceholderText("auto")
+        self.hil_seed_input.setFixedWidth(54)
+        self.hil_seed_input.setToolTip(
+            "Optional integer RNG seed for reproducible noisy HIL runs.\n"
+            "Leave blank for a fresh random sequence.")
+        layout.addWidget(self.hil_seed_label)
+        layout.addWidget(self.hil_seed_input)
+
+        self.hil_delay_label = QLabel("Delay:")
+        self.hil_delay_spin = QDoubleSpinBox()
+        self.hil_delay_spin.setRange(0.0, 500.0)
+        self.hil_delay_spin.setDecimals(0)
+        self.hil_delay_spin.setSingleStep(10.0)
+        self.hil_delay_spin.setValue(0.0)
+        self.hil_delay_spin.setSuffix(" ms")
+        self.hil_delay_spin.setFixedWidth(74)
+        self.hil_delay_spin.setToolTip(
+            "Sensor transport delay injected before the flight computer sees\n"
+            "each simulated sample. Rounded to 10 ms HIL ticks.")
+        layout.addWidget(self.hil_delay_label)
+        layout.addWidget(self.hil_delay_spin)
+
+        self.hil_record_check = QCheckBox("Record CSV")
+        self.hil_record_check.setChecked(True)
+        self.hil_record_check.setToolTip(
+            "Save each HIL run to sim/output/hil_gui_<timestamp>.csv.")
+        layout.addWidget(self.hil_record_check)
+
+        self.hil_compare_check = QCheckBox("Compare Fake")
+        self.hil_compare_check.setChecked(False)
+        self.hil_compare_check.setToolTip(
+            "When running real hardware HIL, mirror the same sensor packets\n"
+            "through the in-process fake flight computer and plot/log deltas.")
+        layout.addWidget(self.hil_compare_check)
+
         # Retune live: any radio setting change restarts rtl_sdr (debounced)
         self.radio_freq_spin.valueChanged.connect(self._schedule_radio_retune)
         self.radio_ppm_spin.valueChanged.connect(self._schedule_radio_retune)
@@ -1825,8 +2059,12 @@ class MainWindow(QMainWindow):
         for widget in radio_widgets:
             widget.setVisible(radio)
         for widget in (self.hil_fake_check, self.hil_speed_label,
-                       self.hil_speed_spin, self.hil_noise_check):
+                       self.hil_speed_spin, self.hil_noise_check,
+                       self.hil_seed_label, self.hil_seed_input,
+                       self.hil_delay_label, self.hil_delay_spin,
+                       self.hil_record_check):
             widget.setVisible(hil)
+        self.hil_compare_check.setVisible(hil and not hil_fake)
 
         if hasattr(self, "spectrum_panel"):
             self.spectrum_panel.setVisible(radio)
@@ -1838,7 +2076,7 @@ class MainWindow(QMainWindow):
                 group.setVisible(hil)
 
         if hasattr(self, "state_panel"):
-            self.state_panel.set_link_mode(radio)
+            self.state_panel.set_link_mode("hil" if hil else "radio" if radio else "serial")
 
         if hasattr(self, "cmd_input"):
             self.cmd_input.setEnabled(mode == "serial")
@@ -1915,7 +2153,21 @@ class MainWindow(QMainWindow):
     def _start_hil(self):
         fake = self.hil_fake_check.isChecked()
         speed = float(self.hil_speed_spin.value())
+        seed_text = self.hil_seed_input.text().strip()
+        sensor_seed = None
+        seed_warning = None
+        if seed_text:
+            try:
+                sensor_seed = int(seed_text, 0)
+            except ValueError:
+                seed_warning = f"[monitor] Invalid HIL seed '{seed_text}' — using auto"
+        delay_ms = float(self.hil_delay_spin.value())
+        record_csv = self.hil_record_check.isChecked()
+        compare_fake = (not fake) and self.hil_compare_check.isChecked()
         port = ""
+        self._clear_data()
+        if seed_warning is not None:
+            self._log(seed_warning)
         if not fake:
             idx = self.port_combo.currentIndex()
             port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
@@ -1923,9 +2175,21 @@ class MainWindow(QMainWindow):
                 self._log("[monitor] HIL on real hardware needs speed 1.0 — overriding "
                           "(firmware filter integrates wall-clock dt)")
                 speed = 1.0
-        self._clear_data()
-        self._hil_worker.configure(port, fake, speed,
-                                   noise=self.hil_noise_check.isChecked())
+        self._log(
+            "[monitor] HIL options: "
+            f"{'fake FC' if fake else 'real FC'}, speed={speed:.2f}, "
+            f"noise={'on' if self.hil_noise_check.isChecked() else 'off'}, "
+            f"seed={sensor_seed if sensor_seed is not None else 'auto'}, "
+            f"delay={delay_ms:.0f} ms, "
+            f"csv={'on' if record_csv else 'off'}, "
+            f"compare_fake={'on' if compare_fake else 'off'}")
+        self._hil_worker.configure(
+            port, fake, speed,
+            noise=self.hil_noise_check.isChecked(),
+            record_csv=record_csv,
+            compare_fake=compare_fake,
+            sensor_seed=sensor_seed,
+            sensor_delay_ms=delay_ms)
         self._hil_worker.start()
 
     def _start_radio(self):

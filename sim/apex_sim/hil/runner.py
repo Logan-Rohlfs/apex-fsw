@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from rocketpy import Flight
@@ -46,6 +46,8 @@ class HilRow:
     sensors: SimSensors        # the injected sensor readings
     reply: Optional[TeensyPkt]
     latency_ms: float
+    shadow_replies: Dict[str, Optional[TeensyPkt]] = field(default_factory=dict)
+    shadow_latencies_ms: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -65,19 +67,23 @@ class HilResult:
 def warm_up(link: HilLink, emulator: SensorEmulator,
             rail_inclination_deg: float, rail_heading_deg: float,
             duration_s: float = 6.0, speed: float = 1.0,
-            reply_timeout: float = 5.0) -> int:
+            reply_timeout: float = 5.0,
+            shadow_links: Optional[Dict[str, HilLink]] = None) -> int:
     """Stream on-pad packets until the flight computer arms.
 
     Returns the last sim_time_ms sent (the flight phase continues from it).
     Raises RuntimeError if no TeensyPacket reply arrives after the warm-up.
     """
     sensors = emulator.pad_sensors(rail_inclination_deg, rail_heading_deg)
+    shadows = shadow_links or {}
     n = max(int(duration_s * 100), 60)   # ≥ settle window (50) + margin
     wall0 = time.monotonic()
     sim_ms = 0
     for i in range(n):
         sim_ms = i * 10
         link.send(sim_ms, sensors)
+        for shadow in shadows.values():
+            shadow.send(sim_ms, sensors)
         if speed > 0:
             rem = wall0 + (i + 1) * 0.01 / speed - time.monotonic()
             if rem > 0:
@@ -87,7 +93,10 @@ def warm_up(link: HilLink, emulator: SensorEmulator,
     deadline = time.monotonic() + reply_timeout
     while time.monotonic() < deadline:
         sim_ms += 10
-        if link.transact(sim_ms, sensors, timeout=0.1) is not None:
+        primary = link.transact(sim_ms, sensors, timeout=0.1)
+        for shadow in shadows.values():
+            shadow.transact(sim_ms, sensors, timeout=0.1)
+        if primary is not None:
             return sim_ms
         if speed > 0:
             time.sleep(0.01 / speed)
@@ -100,6 +109,8 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
                     speed: float = 1.0, warmup_s: float = 6.0,
                     terminate_on_apogee: bool = True, max_time: float = 120.0,
                     noise: bool = False,
+                    sensor_kwargs: Optional[dict] = None,
+                    shadow_links: Optional[Dict[str, HilLink]] = None,
                     tick_cb: Optional[Callable] = None) -> HilResult:
     """Warm up, then fly the RocketPy sim with the flight computer in the loop.
 
@@ -134,11 +145,13 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
         mag_inclination_deg=mag.inclination_deg,
         mag_strength_ut=mag.field_strength_ut,
         noise=noise,
+        **(sensor_kwargs or {}),
     )
     rail = env_cfg.rail
 
     pad_ms = warm_up(link, emulator, rail.inclination_deg, rail.heading_deg,
-                     duration_s=warmup_s, speed=speed)
+                     duration_s=warmup_s, speed=speed,
+                     shadow_links=shadow_links)
     result = HilResult(flight=None)
     result.lines.extend(link.drain_lines())
 
@@ -147,7 +160,7 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
 
     ctx = {
         "prev_t": None, "prev_v": None, "accel": np.zeros(3),
-        "deploy": 0.0, "phase": None, "wall0": None,
+        "deploy": 0.0, "phase": None, "wall0": None, "last_sim_ms": None,
     }
 
     def _controller(t, sampling_rate, state, state_history,
@@ -157,6 +170,16 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
                      if isinstance(interactive_objects, (list, tuple))
                      else interactive_objects)
 
+        sim_ms = pad_ms + 10 + int(round(t * 1000.0))
+        if ctx["last_sim_ms"] == sim_ms:
+            # RocketPy may evaluate controllers more than once at the same
+            # integration time. The real HIL contract is one packet per 100 Hz
+            # controller tick; duplicate transactions would advance firmware
+            # time and servo rate limits without advancing the simulated state.
+            airbrakes.deployment_level = ctx["deploy"]
+            return [t, ctx["deploy"]]
+        ctx["last_sim_ms"] = sim_ms
+
         # Coordinate acceleration via finite difference of true velocity.
         v = np.asarray(state[3:6], dtype=float)
         if ctx["prev_t"] is not None and t > ctx["prev_t"]:
@@ -164,7 +187,6 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
         ctx["prev_t"], ctx["prev_v"] = t, v
 
         sim_sensors = emulator.flight_sensors(state, ctx["accel"])
-        sim_ms = pad_ms + 10 + int(round(t * 1000.0))
 
         # Pace sim time to wall clock (anchor at the first flight tick).
         if ctx["wall0"] is None:
@@ -177,9 +199,15 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
         t_send = time.monotonic()
         reply = link.transact(sim_ms, sim_sensors, timeout=0.05)
         latency_ms = (time.monotonic() - t_send) * 1e3
+        shadow_replies: Dict[str, Optional[TeensyPkt]] = {}
+        shadow_latencies: Dict[str, float] = {}
+        for name, shadow in (shadow_links or {}).items():
+            st = time.monotonic()
+            shadow_replies[name] = shadow.transact(sim_ms, sim_sensors, timeout=0.05)
+            shadow_latencies[name] = (time.monotonic() - st) * 1e3
 
         if reply is not None:
-            ctx["deploy"] = reply.deployment_frac
+            ctx["deploy"] = max(0.0, min(1.0, reply.deployment_frac))
             name = PHASE_NAMES.get(reply.phase, str(reply.phase))
             if name != ctx["phase"]:
                 if ctx["phase"] is not None:
@@ -194,7 +222,9 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
             true_alt_agl_m=float(state[2]) - emulator.pad_elevation_m,
             true_vel_z_mps=float(state[5]),
             sensors=sim_sensors,
-            reply=reply, latency_ms=latency_ms)
+            reply=reply, latency_ms=latency_ms,
+            shadow_replies=shadow_replies,
+            shadow_latencies_ms=shadow_latencies)
         result.rows.append(row)
         if tick_cb is not None:
             tick_cb(row)

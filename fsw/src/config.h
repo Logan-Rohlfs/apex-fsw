@@ -194,3 +194,12 @@
 #define LOG_RATE_COAST_HZ           100
 #define LOG_RATE_DESCENT_HZ         25
 #define LOG_RING_BUF_SECONDS        60      // pre-launch ring buffer depth
+
+// Binary flight logger. Storage is launch-critical: arming is refused unless
+// both QSPI flash and microSD are mounted, writable, and the boot log is open.
+// Runtime writes are sampled in the main loop (never sensor ISRs). The RAM ring
+// keeps compact prelaunch samples so the log contains context before BOOST.
+#define LOG_PRELAUNCH_RING_HZ       50
+#define LOG_PAD_FILE_HZ             2
+#define LOG_FLIGHT_FILE_HZ          100     // fastest useful state/control rate
+#define LOG_FILE_FLUSH_INTERVAL_MS  1000

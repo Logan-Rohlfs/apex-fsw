@@ -49,6 +49,7 @@ warnings.filterwarnings("ignore", message=".*LibreSSL.*", category=Warning)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from apex_sim.config.loader import load_environment                    # noqa: E402
+from apex_sim.hil.emulator import SensorErrors                         # noqa: E402
 from apex_sim.hil.link import HilLink                                  # noqa: E402
 from apex_sim.hil.protocol import PHASE_NAMES, find_port               # noqa: E402
 from apex_sim.hil.runner import HilRow, run_closed_loop                # noqa: E402
@@ -69,6 +70,8 @@ def main():
     ap.add_argument("--port", default=None)
     ap.add_argument("--fake", action="store_true",
                     help="use the in-process fake Teensy (no hardware)")
+    ap.add_argument("--compare-fake", action="store_true",
+                    help="shadow the same run through FakeTeensy; real hardware remains primary")
     ap.add_argument("--speed", type=float, default=1.0,
                     help="pacing factor; 1.0 = real time, 0 = max (fake only)")
     ap.add_argument("--site", default=None)
@@ -79,9 +82,31 @@ def main():
                     help="simulate past apogee (default: stop at apogee)")
     ap.add_argument("--no-noise", action="store_true",
                     help="disable the per-sensor noise model (deterministic run)")
+    ap.add_argument("--sensor-seed", type=int, default=None,
+                    help="RNG seed for reproducible noisy realism runs")
+    ap.add_argument("--accel-bias-mg", default="0,0,0",
+                    help="fixed ICM accel bias x,y,z in milli-g")
+    ap.add_argument("--highg-bias-mg", default="0,0,0",
+                    help="fixed ADXL375 accel bias x,y,z in milli-g")
+    ap.add_argument("--gyro-bias-dps", default="0,0,0",
+                    help="fixed gyro bias x,y,z in deg/s")
+    ap.add_argument("--mag-bias-mg", default="0,0,0",
+                    help="fixed magnetometer bias x,y,z in milli-gauss")
+    ap.add_argument("--baro-bias-pa", type=float, default=0.0,
+                    help="fixed barometer pressure bias in Pa")
+    ap.add_argument("--gps-bias-m", type=float, default=0.0,
+                    help="fixed GPS altitude bias in metres")
+    ap.add_argument("--misalign-deg", default="0,0,0",
+                    help="fixed sensor mount rotation x,y,z in degrees")
+    ap.add_argument("--sensor-delay-ms", type=float, default=0.0,
+                    help="integer-tick sensor delay; rounded to 10 ms HIL ticks")
     ap.add_argument("--max-time", type=float, default=120.0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+
+    if args.fake and args.compare_fake:
+        print(f"{YEL}--compare-fake is ignored when --fake is the primary FC.{RESET}")
+        args.compare_fake = False
 
     if not args.fake and args.speed != 1.0:
         print(f"{YEL}WARNING: speed={args.speed} against real hardware distorts the "
@@ -99,6 +124,8 @@ def main():
 
     # ── Open link ──────────────────────────────────────────────────────────────
     fake = None
+    fake_shadow = None
+    shadow_links = {}
     if args.fake:
         from apex_sim.hil.fake_teensy import FakeTeensy
         fake = FakeTeensy()
@@ -121,6 +148,16 @@ def main():
             sys.exit(1)
         print(f"{GRN}Flight computer ready.{RESET}  Warming up "
               f"({args.warmup:.0f} s on pad)...")
+
+        if args.compare_fake:
+            from apex_sim.hil.fake_teensy import FakeTeensy
+            fake_shadow = FakeTeensy()
+            fake_link = HilLink(fake_shadow.port)
+            if not fake_link.wait_for_line("READY", timeout=5.0):
+                print(f"{RED}Fake shadow did not become ready.{RESET}")
+                sys.exit(1)
+            shadow_links["fake"] = fake_link
+            print(f"{GRN}Fake shadow ready.{RESET}  Same sensor packets will be mirrored.")
 
         # ── Live tick printer (1 Hz of sim time + transitions) ────────────────
         state = {"phase": None, "count": 0}
@@ -147,11 +184,18 @@ def main():
             airbrakes_cfg=airbrakes_cfg,
             speed=args.speed, warmup_s=args.warmup,
             terminate_on_apogee=not args.full, max_time=args.max_time,
-            noise=not args.no_noise, tick_cb=tick)
+            noise=not args.no_noise,
+            sensor_kwargs=_sensor_kwargs(args),
+            shadow_links=shadow_links,
+            tick_cb=tick)
     finally:
         link.close()
+        for shadow in shadow_links.values():
+            shadow.close()
         if fake is not None:
             fake.close()
+        if fake_shadow is not None:
+            fake_shadow.close()
 
     # ── CSV log ────────────────────────────────────────────────────────────────
     out_path = Path(args.out) if args.out else (
@@ -159,22 +203,50 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s", "true_alt_agl_m", "true_vel_z_mps",
-                    "est_alt_agl_m", "est_vel_mps", "pred_apogee_m",
-                    "deployment_frac", "phase", "latency_ms"])
+        header = ["t_s", "true_alt_agl_m", "true_vel_z_mps",
+                  "est_alt_agl_m", "est_vel_mps", "pred_apogee_m",
+                  "deployment_frac", "phase", "latency_ms"]
+        if "fake" in shadow_links:
+            header.extend([
+                "fake_est_alt_agl_m", "fake_est_vel_mps", "fake_pred_apogee_m",
+                "fake_deployment_frac", "fake_phase", "fake_latency_ms",
+                "fake_minus_primary_alt_m", "fake_minus_primary_vel_mps",
+                "fake_minus_primary_deployment",
+            ])
+        w.writerow(header)
         for r in result.rows:
             if r.reply is not None:
-                w.writerow([f"{r.t_s:.3f}", f"{r.true_alt_agl_m:.2f}",
-                            f"{r.true_vel_z_mps:.3f}",
-                            f"{r.reply.est_alt_agl_m:.2f}",
-                            f"{r.reply.est_vel_mps:.3f}",
-                            f"{r.reply.pred_apogee_m:.1f}",
-                            f"{r.reply.deployment_frac:.4f}",
-                            PHASE_NAMES.get(r.reply.phase, r.reply.phase),
-                            f"{r.latency_ms:.2f}"])
+                row = [f"{r.t_s:.3f}", f"{r.true_alt_agl_m:.2f}",
+                       f"{r.true_vel_z_mps:.3f}",
+                       f"{r.reply.est_alt_agl_m:.2f}",
+                       f"{r.reply.est_vel_mps:.3f}",
+                       f"{r.reply.pred_apogee_m:.1f}",
+                       f"{r.reply.deployment_frac:.4f}",
+                       PHASE_NAMES.get(r.reply.phase, r.reply.phase),
+                       f"{r.latency_ms:.2f}"]
+                fake_pkt = r.shadow_replies.get("fake")
+                if "fake" in shadow_links:
+                    if fake_pkt is not None:
+                        row.extend([
+                            f"{fake_pkt.est_alt_agl_m:.2f}",
+                            f"{fake_pkt.est_vel_mps:.3f}",
+                            f"{fake_pkt.pred_apogee_m:.1f}",
+                            f"{fake_pkt.deployment_frac:.4f}",
+                            PHASE_NAMES.get(fake_pkt.phase, fake_pkt.phase),
+                            f"{r.shadow_latencies_ms.get('fake', 0.0):.2f}",
+                            f"{fake_pkt.est_alt_agl_m - r.reply.est_alt_agl_m:.2f}",
+                            f"{fake_pkt.est_vel_mps - r.reply.est_vel_mps:.3f}",
+                            f"{fake_pkt.deployment_frac - r.reply.deployment_frac:.4f}",
+                        ])
+                    else:
+                        row.extend([""] * 9)
+                w.writerow(row)
             else:
-                w.writerow([f"{r.t_s:.3f}", f"{r.true_alt_agl_m:.2f}",
-                            f"{r.true_vel_z_mps:.3f}", "", "", "", "", "MISS", ""])
+                row = [f"{r.t_s:.3f}", f"{r.true_alt_agl_m:.2f}",
+                       f"{r.true_vel_z_mps:.3f}", "", "", "", "", "MISS", ""]
+                if "fake" in shadow_links:
+                    row.extend([""] * 9)
+                w.writerow(row)
 
     # ── Summary ────────────────────────────────────────────────────────────────
     flight = result.flight
@@ -199,6 +271,22 @@ def main():
         print(f"  FC max est alt: {max_est*_FT_PER_M:7.0f} ft AGL  "
               f"(|est-true| max {max(alt_err):.1f} m)")
         print(f"  Max deployment: {max_dep*100:.1f}%")
+        if "fake" in shadow_links:
+            pairs = [(r.reply, r.shadow_replies.get("fake")) for r in result.rows
+                     if r.reply is not None and r.shadow_replies.get("fake") is not None]
+            if pairs:
+                max_alt_delta = max(abs(f.est_alt_agl_m - p.est_alt_agl_m)
+                                    for p, f in pairs)
+                max_vel_delta = max(abs(f.est_vel_mps - p.est_vel_mps)
+                                    for p, f in pairs)
+                max_dep_delta = max(abs(f.deployment_frac - p.deployment_frac)
+                                    for p, f in pairs)
+                phase_mismatch = sum(1 for p, f in pairs if p.phase != f.phase)
+                print("  Fake shadow delta:")
+                print(f"    max |alt|={max_alt_delta:.1f} m  "
+                      f"max |vel|={max_vel_delta:.2f} m/s  "
+                      f"max |deploy|={max_dep_delta*100:.1f}%  "
+                      f"phase mismatches={phase_mismatch}/{len(pairs)}")
     print("  Phase transitions:")
     for t, name in result.transitions:
         print(f"    t={t:7.2f}s  →  {PHASE_COLOR.get(name, '')}{name}{RESET}")
@@ -215,6 +303,30 @@ def _load_airbrakes() -> dict:
     import yaml
     with (_SIM_ROOT / "config" / "airbrakes.yaml").open() as fh:
         return yaml.safe_load(fh)
+
+
+def _triple(text: str, scale: float = 1.0):
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected x,y,z")
+    return tuple(float(p) * scale for p in parts)
+
+
+def _sensor_kwargs(args) -> dict:
+    g = 9.80665
+    deg = 3.141592653589793 / 180.0
+    delay_ticks = max(0, int(round(args.sensor_delay_ms / 10.0)))
+    errors = SensorErrors(
+        accel_bias_mss=_triple(args.accel_bias_mg, g / 1000.0),
+        highg_bias_mss=_triple(args.highg_bias_mg, g / 1000.0),
+        gyro_bias_rads=_triple(args.gyro_bias_dps, deg),
+        mag_bias_gauss=_triple(args.mag_bias_mg, 1e-3),
+        baro_bias_pa=args.baro_bias_pa,
+        gps_alt_bias_m=args.gps_bias_m,
+        misalignment_deg=_triple(args.misalign_deg),
+        delay_ticks=delay_ticks,
+    )
+    return {"seed": args.sensor_seed, "errors": errors}
 
 
 if __name__ == "__main__":
