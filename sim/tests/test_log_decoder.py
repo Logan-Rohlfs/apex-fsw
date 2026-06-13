@@ -134,6 +134,9 @@ def test_export_logs_writes_one_wide_csv_per_flight(tmp_path):
     rows = list(csv.DictReader(csv_path.open()))
     assert [row["record_type"] for row in rows] == ["EVENT", "SAMPLE", "SAMPLE"]
     assert rows[0]["event"] == "LAUNCH_DETECTED"
+    assert rows[-1]["utc"] == "2026-06-12T18:44:03.281Z"
+    assert rows[-1]["local_time"]
+    assert rows[-1]["local_time"] != rows[-1]["utc"]
     assert rows[-1]["phase"] == "BOOST"
     assert rows[-1]["deploy"]
     assert (csv_path.parent / "metadata.json").exists()

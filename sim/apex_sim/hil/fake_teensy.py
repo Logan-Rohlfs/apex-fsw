@@ -62,7 +62,7 @@ _LAUNCH_BARO_BACKUP_M = 30.0          # baro-only launch detect (accel failure)
 _LAUNCH_BARO_CONFIRM_MS = 200
 _BURNOUT_CONFIRM_MS = 200
 _BOOST_MAX_MS = 8000                  # forced burnout (N3355 burns ~4.6 s)
-_POST_BURNOUT_LOCKOUT_MS = 2500
+_POST_BURNOUT_LOCKOUT_MS = 1000
 _MACH_GATE_MPS = 240.0                # Mach 0.7 — no transonic actuation
 _MIN_DEPLOY_ALT_M = 100.0
 _APOGEE_VEL_THRESH_MPS = 2.0
@@ -78,7 +78,12 @@ _PID_KI = -0.004 / 0.3048
 _PID_KD = -0.04 / 0.3048   # D-term is Kd × velocity — velocity rescales too
 _PID_U_MIN = -15.0
 _PID_U_MAX = 30.0
-_SERVO_MAX_RATE_PER_S = 1.0 / 0.24
+_SERVO_MAX_RATE_PER_S = 1.0 / 0.24    # SERVO_FULL_TRAVEL_S — mirrors the firmware
+# Servo motion profile parity with fsw/src/control.cpp: the reported
+# deployment_frac is rate-limited to a full 0→1 stroke in SERVO_FULL_TRAVEL_S,
+# same as the firmware. The firmware's µs endpoints / inverted mapping / smooth
+# arm sweep are hardware specifics that don't change the 0–1 fraction the host
+# sees, so this fraction-domain rate limit is the faithful mirror.
 _ROCKET_MASS_KG = 30.44
 _REF_AREA_M2 = 0.019001
 _CD_CLEAN = 0.576
@@ -165,7 +170,10 @@ class FlightLogic:
 
         self.packets += 1
 
-        # Settle: average baro for the pad reference, send nothing yet.
+        # Settle: average baro for the pad reference. Reply to every packet
+        # from the first one (phase IDLE during capture, then ARMED) — mirrors
+        # the firmware's reply-every-packet HIL contract; the host watches the
+        # phase field to know when the FC has armed.
         if not self.armed:
             self.pad_baro_sum += s.baro_pa
             if self.packets >= _SETTLE_PACKETS:
@@ -173,8 +181,15 @@ class FlightLogic:
                 self.pad_alt_msl = _pressure_to_alt_msl(avg)
                 self.armed = True
                 self.phase = _PH_ARMED
+                # Arm = fresh flight: clear PID state (parity with the
+                # firmware's control_reset() called from flight_state_arm()).
+                self._integral = 0.0
+                self.deploy = 0.0
                 self._say("#INFO: Pad reference captured - state ARMED")
-            return None
+            return TeensyPkt(
+                magic=0, sim_time_ms=sim_ms, deployment_frac=0.0,
+                est_alt_agl_m=0.0, est_vel_mps=0.0, pred_apogee_m=0.0,
+                phase=self.phase, crc=0)
 
         baro_agl = _pressure_to_alt_msl(s.baro_pa) - self.pad_alt_msl
         # Vertical accel proxy: axial specific force minus gravity (rocket

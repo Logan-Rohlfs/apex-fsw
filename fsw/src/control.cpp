@@ -3,6 +3,10 @@
 #include "debug.h"
 #include "flight_state.h"
 #include "storage.h"
+#include "board.h"        // servo power high-side switch
+#ifdef APEX_HIL
+#include "hil.h"          // g_hil_dt_s — sim-authoritative timestep
+#endif
 
 #include <Arduino.h>
 #include <math.h>
@@ -22,10 +26,11 @@ static void servo_write_us(float us) {
     analogWrite(SERVO_PIN, (int)(duty + 0.5f));
 }
 
-// deployment fraction → pulse width / horn angle. If the linkage runs
-// backwards, swap SERVO_MIN_US / SERVO_MAX_US in config.h.
+// deployment fraction → pulse width. INVERTED: frac 0 → SERVO_MAX_US
+// (retracted), frac 1 → SERVO_MIN_US (fully deployed). If the linkage runs the
+// other way, swap SERVO_MIN_US / SERVO_MAX_US in config.h.
 static float deploy_to_us(float frac) {
-    return SERVO_MIN_US + frac * (float)(SERVO_MAX_US - SERVO_MIN_US);
+    return SERVO_MAX_US - frac * (float)(SERVO_MAX_US - SERVO_MIN_US);
 }
 static float deploy_to_deg(float frac) {
     return SERVO_MIN_DEG + frac * (SERVO_MAX_DEG - SERVO_MIN_DEG);
@@ -53,16 +58,46 @@ void control_reset() {
     _was_active = false;
     g_state.control = ControlState{};
     g_state.control.servo_angle_deg = deploy_to_deg(0.0f);
-    servo_write_us(deploy_to_us(0.0f));
+    servo_write_us(deploy_to_us(0.0f));   // hold retracted command
+}
+
+void control_arm() {
+    // Power the servo (off through the pad sit), then bring it to retracted
+    // with a smooth sweep from the assumed center pulse so it does not snap on
+    // power-up. The sweep is a one-time blocking move at the deliberate ARM
+    // event; skipped in HIL (no hardware, and it must not stall the packet loop).
+    board_servo_power(true);
+#ifndef APEX_HIL
+    const int steps = SERVO_INIT_SWEEP_MS / 20;
+    for (int i = 1; i <= steps; i++) {
+        const float frac = 0.5f * (1.0f - (float)i / (float)steps);  // 0.5 → 0
+        servo_write_us(deploy_to_us(frac));
+        delay(20);
+    }
+#endif
+    control_reset();
+}
+
+void control_disarm() {
+    control_reset();
+    board_servo_power(false);   // unpower servo when not armed
 }
 
 void control_update(uint32_t now_ms) {
+#ifdef APEX_HIL
+    // Sim-authoritative dt in HIL (g_hil_dt_s, from the SimPacket stream — see
+    // fusion.cpp): one control tick per packet on simulated time. Keeps the
+    // PID integral and servo rate-limit deterministic and immune to USB jitter.
+    const float dt = g_hil_dt_s;
+    _last_ms = now_ms;
+#else
     float dt = 1.0f / RATE_CONTROL_HZ;
     if (_last_ms != 0 && now_ms > _last_ms) {
         dt = (now_ms - _last_ms) * 1e-3f;
         if (dt > 0.05f) dt = 1.0f / RATE_CONTROL_HZ;
     }
     _last_ms = now_ms;
+#endif
 
     // Snapshot ISR-written fused state (200 Hz fusion timer in flight builds).
     noInterrupts();
@@ -104,7 +139,7 @@ void control_update(uint32_t now_ms) {
     }
 
     // ── Servo rate limit (full travel in 0.24 s) ──────────────────────────────
-    const float max_delta = (1.0f / 0.24f) * dt;
+    const float max_delta = (1.0f / SERVO_FULL_TRAVEL_S) * dt;
     float delta = desired - _deploy;
     delta = fmaxf(-max_delta, fminf(max_delta, delta));
     _deploy = fmaxf(0.0f, fminf(1.0f, _deploy + delta));

@@ -7,6 +7,7 @@ import json
 import shutil
 import struct
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Union
 
@@ -53,7 +54,7 @@ SAMPLE_V0 = struct.Struct("<IBBBBHBB" + "f" * 21)
 CSV_COLUMNS = [
     "record_type", "seq", "boot_id", "flight_id", "time_ms",
     "sample_ms", "phase", "event", "event_detail",
-    "utc", "gps_fix", "gps_sats", "storage_health", "storage_faults",
+    "utc", "local_time", "gps_fix", "gps_sats", "storage_health", "storage_faults",
     "config_hash", "build_flags", "rate_fusion_hz", "rate_state_hz",
     "rate_control_hz", "log_flight_hz",
     "alt_m", "vel_mps", "pred_apogee_m", "vert_accel_mps2",
@@ -326,6 +327,7 @@ def _sample_from_parts(prefix, floats, has_utc: bool) -> dict:
         "utc": _utc_string(utc_valid, utc_year, utc_month, utc_day,
                            utc_hour, utc_minute, utc_second, utc_ms),
     })
+    payload["local_time"] = _local_time_string(payload["utc"])
     return payload
 
 
@@ -425,6 +427,17 @@ def _utc_string(valid, year, month, day, hour, minute, second, ms) -> str:
     if not valid or not year:
         return ""
     return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}.{ms:03d}Z"
+
+
+def _local_time_string(utc: str) -> str:
+    if not utc:
+        return ""
+    try:
+        dt = datetime.strptime(utc, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return ""
+    local = dt.replace(tzinfo=timezone.utc).astimezone()
+    return local.strftime("%I:%M:%S.%f")[:-3] + local.strftime(" %p %Z")
 
 
 def _safe_time(utc: str) -> str:

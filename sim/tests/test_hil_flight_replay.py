@@ -94,16 +94,21 @@ class TestSeymourReplay:
     def test_phases_in_order_no_skips_no_repeats(self, flight):
         _, hist = flight
         names = [n for _, n in _transitions(hist)]
-        assert names == ["ARMED", "BOOST", "COAST", "DESCENT", "LANDED"], names
+        # The FC reports IDLE during pad capture (reply-every-packet contract),
+        # then ARMED once the pad reference settles, then the flight phases.
+        assert names == ["IDLE", "ARMED", "BOOST", "COAST", "DESCENT",
+                         "LANDED"], names
 
     def test_no_progress_on_pad(self, flight):
-        """5 s of pad data before launch — must sit in ARMED the whole time."""
+        """Pad data before launch — the FC may only sit in IDLE (pad capture)
+        or ARMED; it must never prematurely detect a launch."""
         _, hist = flight
         for t, reply in hist:
             if reply is None or t >= -0.1:
                 continue
-            assert PHASE_NAMES[reply.phase] == "ARMED", (
-                f"left ARMED at t={t:.2f}s, before launch")
+            assert PHASE_NAMES[reply.phase] in ("IDLE", "ARMED"), (
+                f"premature phase {PHASE_NAMES[reply.phase]} at t={t:.2f}s, "
+                "before launch")
 
     def test_launch_detected_promptly(self, flight):
         _, hist = flight

@@ -108,6 +108,71 @@ static LittleFS_QPINAND _flash;
 static File _flash_log;
 static File _sd_log;
 
+static bool _export_mode = false;
+static bool _export_delete_allowed = false;
+
+#ifdef USB_MTPDISK_SERIAL
+class ExportGuardFS : public FS {
+public:
+    explicit ExportGuardFS(FS* inner = nullptr) : _inner(inner) {}
+    void setInner(FS* inner) { _inner = inner; }
+
+    File open(const char* filename, uint8_t mode = FILE_READ) override {
+        if (_inner == nullptr) return File();
+        if (mode != FILE_READ && !_export_delete_allowed) return File();
+        return _inner->open(filename, mode);
+    }
+
+    bool exists(const char* filepath) override {
+        return _inner != nullptr ? _inner->exists(filepath) : false;
+    }
+
+    bool mkdir(const char* filepath) override {
+        return (_inner != nullptr && _export_delete_allowed) ? _inner->mkdir(filepath) : false;
+    }
+
+    bool rename(const char* oldfilepath, const char* newfilepath) override {
+        return (_inner != nullptr && _export_delete_allowed) ?
+            _inner->rename(oldfilepath, newfilepath) : false;
+    }
+
+    bool remove(const char* filepath) override {
+        return (_inner != nullptr && _export_delete_allowed) ? _inner->remove(filepath) : false;
+    }
+
+    bool rmdir(const char* filepath) override {
+        return (_inner != nullptr && _export_delete_allowed) ? _inner->rmdir(filepath) : false;
+    }
+
+    uint64_t usedSize() override {
+        return _inner != nullptr ? _inner->usedSize() : 0;
+    }
+
+    uint64_t totalSize() override {
+        return _inner != nullptr ? _inner->totalSize() : 0;
+    }
+
+    bool format(int type = 0, char progressChar = 0, Print& pr = Serial) override {
+        return (_inner != nullptr && _export_delete_allowed) ?
+            _inner->format(type, progressChar, pr) : false;
+    }
+
+    bool mediaPresent() override {
+        return _inner != nullptr && _inner->mediaPresent();
+    }
+
+    const char* name() override {
+        return _inner != nullptr ? _inner->name() : nullptr;
+    }
+
+private:
+    FS* _inner;
+};
+
+static ExportGuardFS _mtp_flash_fs(&_flash);
+static ExportGuardFS _mtp_sd_fs(&SD);
+#endif
+
 static uint32_t _boot_id = 0;
 static uint32_t _next_flight_id = 1;
 static uint32_t _flight_id = 0;
@@ -407,6 +472,8 @@ uint8_t storage_init() {
     _faults = LOG_FAULT_NONE;
     _flight_started = false;
     _ring_flushed = false;
+    _export_mode = false;
+    _export_delete_allowed = false;
     _ring_head = 0;
     _ring_count = 0;
 
@@ -453,8 +520,8 @@ uint8_t storage_init() {
     // Register available volumes with MTP so they appear as drives over USB.
 #ifdef USB_MTPDISK_SERIAL
     MTP.begin();
-    if (_health & STORAGE_OK_FLASH) MTP.addFilesystem(_flash, "APEX-FLASH");
-    if (_health & STORAGE_OK_SD)    MTP.addFilesystem(SD,     "APEX-SD");
+    if (_health & STORAGE_OK_FLASH) MTP.addFilesystem(_mtp_flash_fs, "APEX-FLASH");
+    if (_health & STORAGE_OK_SD)    MTP.addFilesystem(_mtp_sd_fs,    "APEX-SD");
 #endif
 
     return _health;
@@ -496,6 +563,8 @@ void storage_begin_flight(uint32_t now_ms, const char* reason) {
 }
 
 void storage_log_update(uint32_t now_ms) {
+    if (_export_mode) return;
+
     FlightPhase phase = g_state.phase;
     const bool prelaunch = (phase == FlightPhase::IDLE || phase == FlightPhase::ARMED);
 
@@ -529,8 +598,37 @@ void storage_end_session(uint32_t now_ms, const char* reason) {
     _ring_count = 0;
 }
 
+bool storage_enter_export_mode(uint32_t now_ms) {
+    if (_export_mode) return true;
+
+    storage_log_event(LOG_EVENT_EXPORT_MODE, "export mode: logging stopped");
+    flush_logs(now_ms, true);
+    if (_flash_log) _flash_log.close();
+    if (_sd_log) _sd_log.close();
+    _export_mode = true;
+    _export_delete_allowed = false;
+    _flight_started = false;
+    _flight_id = 0;
+    return true;
+}
+
+bool storage_export_mode_active() {
+    return _export_mode;
+}
+
+bool storage_allow_deletion(uint32_t now_ms) {
+    (void)now_ms;
+    if (!_export_mode) return false;
+    _export_delete_allowed = true;
+    return true;
+}
+
+bool storage_deletion_allowed() {
+    return _export_delete_allowed;
+}
+
 void storage_mtp_loop() {
 #ifdef USB_MTPDISK_SERIAL
-    MTP.loop();
+    if (_export_mode) MTP.loop();
 #endif
 }

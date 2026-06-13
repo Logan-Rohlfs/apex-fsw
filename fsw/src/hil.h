@@ -62,6 +62,14 @@ static_assert(sizeof(TeensyPacket) == 24, "TeensyPacket size mismatch");
 
 #ifdef APEX_HIL
 
+// Sim-authoritative timestep (seconds) for the packet currently being
+// processed, derived by the HIL loop from consecutive SimPacket.sim_time_ms.
+// fusion_update() and control_update() read this instead of wall-clock
+// micros()/millis() so the estimator advances on *simulated* time — one
+// real packet, one real step — immune to USB delivery jitter, and correct
+// even if a packet is dropped or the host streams at a different rate.
+extern float g_hil_dt_s;
+
 // ─── CRC-8 ────────────────────────────────────────────────────────────────────
 // Polynomial 0x07 (CRC-8/SMBUS). Covers all bytes except the crc8 field itself.
 // Table-driven for predictable latency.

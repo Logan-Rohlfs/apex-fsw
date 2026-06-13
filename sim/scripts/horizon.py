@@ -50,6 +50,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _SIM_ROOT = Path(__file__).resolve().parents[1]
 _RAW_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs"
+_DELETED_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs_deleted"
+_DELETE_CONFIRM_PHRASE = "yes i really do want to delete these files"
 
 import numpy as np
 import serial
@@ -63,7 +65,8 @@ from PyQt5.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QCompleter,
     QProxyStyle, QStyle, QTabBar, QFileDialog, QListWidget,
     QListWidgetItem, QAbstractItemView,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QInputDialog,
+    QMessageBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QPoint, QUrl
 from PyQt5.QtGui import QFont, QColor, QPainter, QPolygon, QDesktopServices
@@ -90,7 +93,9 @@ EXPECTED_TX_BW_HZ = 2 * (DEVIATION_HZ + BITRATE_BPS // 2)   # Carson bandwidth
 # Keys matched against incoming >key:value lines. Unmatched keys go to "Other".
 
 PLOT_GROUPS = [
-    ("Fusion",    ["alt_agl", "velocity", "pred_apogee"],  ["#00d4ff", "#ff6b35", "#a8ff3e"]),
+    ("Fusion",    ["alt_agl", "velocity", "pred_apogee", "vert_accel"],
+                  ["#00d4ff", "#ff6b35", "#a8ff3e", "#bb88ff"]),
+    ("Airbrakes", ["deployment", "servo_angle"],            ["#00d4ff", "#ff9933"]),
     ("IMU Accel", ["accel_x", "accel_y", "accel_z"],       ["#ff4444", "#44ff44", "#4488ff"]),
     ("IMU Gyro",  ["gyro_x",  "gyro_y",  "gyro_z"],        ["#ff8844", "#88ff44", "#4488ff"]),
     ("High-G",    ["highg_x", "highg_y", "highg_z"],       ["#ff44aa", "#44ffaa", "#aa44ff"]),
@@ -246,6 +251,8 @@ class HorizonStyle(QProxyStyle):
 KNOWN_COMMANDS = [
     "ARM",
     "DISARM",
+    "EXPORT_MODE",      # IDLE/LANDED only: stop logging, enable MTP log download
+    "ALLOW_DELETION",   # after EXPORT_MODE: permit MTP writes/deletes
     "RADIO_DATA_TEST",
     "RADIO_MARKER",
     "RADIO_MARKER_441",
@@ -2149,8 +2156,10 @@ class MainWindow(QMainWindow):
         device_layout.setContentsMargins(8, 6, 8, 8)
         device_layout.setSpacing(6)
         device_layout.addWidget(section_hint(
-            "Raw .APXLOG files on the Teensy's storage. Refresh uses libmtp "
-            "first, then falls back to mounted APEX volumes."))
+            "Raw .APXLOG files on the Teensy's storage. The flight computer only "
+            "serves files over USB after EXPORT_MODE (IDLE/LANDED only) — connect "
+            "on the Sensors tab, click Enter Export Mode, then Refresh. Refresh "
+            "uses libmtp first, then falls back to mounted APEX volumes."))
 
         self.device_table = QTableWidget(0, 3)
         self.device_table.setHorizontalHeaderLabels(["File", "Size", "Source"])
@@ -2166,6 +2175,14 @@ class MainWindow(QMainWindow):
 
         device_row = QHBoxLayout()
         device_row.setSpacing(6)
+        export_mode_btn = QPushButton("Enter Export Mode")
+        export_mode_btn.setFixedWidth(150)
+        export_mode_btn.setToolTip(
+            "Send EXPORT_MODE over USB serial. The flight computer stops logging,\n"
+            "closes its log files and enables MTP download. Allowed only in\n"
+            "IDLE / LANDED. Requires an active serial connection (Sensors tab).")
+        export_mode_btn.clicked.connect(self._enter_export_mode)
+        device_row.addWidget(export_mode_btn)
         refresh_device_btn = QPushButton("Refresh")
         refresh_device_btn.setFixedWidth(110)
         refresh_device_btn.clicked.connect(self._refresh_device_files)
@@ -2187,6 +2204,13 @@ class MainWindow(QMainWindow):
         pull_all_export_btn.setFixedWidth(130)
         pull_all_export_btn.clicked.connect(lambda: self._pull_all_device_files(export_after=True))
         device_row.addWidget(pull_all_export_btn)
+        delete_device_btn = QPushButton("Delete Selected")
+        delete_device_btn.setFixedWidth(130)
+        delete_device_btn.setToolTip(
+            "Delete selected APXLOG files from the flight computer.\n"
+            "Requires local-copy checks and typed confirmation.")
+        delete_device_btn.clicked.connect(self._delete_selected_device_files)
+        device_row.addWidget(delete_device_btn)
         device_layout.addLayout(device_row)
         layout.addWidget(device_box)
 
@@ -2220,6 +2244,13 @@ class MainWindow(QMainWindow):
             "(e.g. logs someone sent you).")
         add_external_btn.clicked.connect(self._add_external_logs)
         archive_row.addWidget(add_external_btn)
+        delete_local_btn = QPushButton("Delete Selected Local")
+        delete_local_btn.setFixedWidth(150)
+        delete_local_btn.setToolTip(
+            "Move selected local APXLOG copies to raw_logs_deleted.\n"
+            "Requires device-copy checks and typed confirmation.")
+        delete_local_btn.clicked.connect(self._delete_selected_local_logs)
+        archive_row.addWidget(delete_local_btn)
         archive_layout.addLayout(archive_row)
         archive_layout.addWidget(section_hint(
             "Files keep their on-board names; HORIZON reads APXLOG contents "
@@ -2308,8 +2339,9 @@ class MainWindow(QMainWindow):
 
         self._log_action_buttons = [
             refresh_device_btn, select_all_device_btn, pull_sel_btn,
-            pull_all_btn, pull_all_export_btn, refresh_archive_btn,
-            select_all_btn, add_external_btn, export_sel_btn, export_all_btn,
+            pull_all_btn, pull_all_export_btn, delete_device_btn,
+            refresh_archive_btn, select_all_btn, add_external_btn,
+            delete_local_btn, export_sel_btn, export_all_btn,
         ]
         self._refresh_local_log_choices(select_all=False)
         return panel
@@ -2745,6 +2777,58 @@ class MainWindow(QMainWindow):
         return [Path(item.data(Qt.UserRole))
                 for item in self.local_log_list.selectedItems()]
 
+    def _local_log_index(self) -> dict[tuple[str, int], list[Path]]:
+        index: dict[tuple[str, int], list[Path]] = {}
+        for path in self._local_log_paths():
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            index.setdefault((path.name, size), []).append(path)
+        return index
+
+    def _find_local_copy_for_entry(self, entry: dict,
+                                   index: dict[tuple[str, int], list[Path]] | None = None) -> Path | None:
+        size = entry.get("size")
+        if not isinstance(size, int):
+            return None
+        name = Path(str(entry.get("name", ""))).name
+        matches = (index or self._local_log_index()).get((name, size), [])
+        return matches[0] if matches else None
+
+    def _device_entry_matches_local_path(self, entry: dict, path: Path) -> bool:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        return Path(str(entry.get("name", ""))).name == path.name and entry.get("size") == size
+
+    @staticmethod
+    def _device_entry_key(entry: dict) -> tuple:
+        if entry.get("kind") == "mtp":
+            return ("mtp", entry.get("id"))
+        return ("volume", entry.get("src"))
+
+    def _confirm_dangerous_delete(self, title: str, body: str,
+                                  extra_warning: str = "") -> bool:
+        lines = [
+            body,
+            "",
+            "This cannot happen from one click. The next step requires an exact typed confirmation.",
+        ]
+        if extra_warning:
+            lines.extend(["", extra_warning])
+        lines.extend([
+            "",
+            f'Type exactly: "{_DELETE_CONFIRM_PHRASE}"',
+        ])
+        QMessageBox.warning(self, title, "\n".join(lines))
+        text, ok = QInputDialog.getText(
+            self, title, f'Type exactly:\n{_DELETE_CONFIRM_PHRASE}')
+        if not ok:
+            return False
+        return text.strip() == _DELETE_CONFIRM_PHRASE
+
     def _add_external_logs(self):
         """Copy .APXLOG files from anywhere on disk into the laptop archive."""
         files, _ = QFileDialog.getOpenFileNames(
@@ -2897,9 +2981,15 @@ class MainWindow(QMainWindow):
         skipped: list[str] = []
         errors: list[str] = []
         mode = "mounted volume"
+        local_index = self._local_log_index()
 
         for i, entry in enumerate(entries):
             progress(f"Pulling {entry['name']} ({i + 1}/{len(entries)})…")
+            existing = self._find_local_copy_for_entry(entry, local_index)
+            if existing is not None:
+                skipped.append(str(existing))
+                continue
+
             if entry["kind"] == "volume":
                 src = Path(entry["src"])
                 root = Path(entry["root"])
@@ -2911,6 +3001,7 @@ class MainWindow(QMainWindow):
                 dst = self._dedupe_path(dst)
                 shutil.copy2(src, dst)
                 copied.append(dst)
+                local_index.setdefault((dst.name, dst.stat().st_size), []).append(dst)
                 continue
 
             # MTP entry — mtp-getfile can block for minutes per file
@@ -2940,11 +3031,77 @@ class MainWindow(QMainWindow):
                 continue
             tmp.replace(dst)
             copied.append(dst)
+            local_index.setdefault((dst.name, dst.stat().st_size), []).append(dst)
 
         if errors:
             raise RuntimeError("Some MTP downloads failed:\n" + "\n".join(errors))
         return {"kind": "pull", "mode": mode, "copied": copied,
                 "skipped": skipped, "listing": "", "n_requested": len(entries)}
+
+    def _trash_local_paths(self, paths: list[Path], progress) -> dict:
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        trash_root = _DELETED_LOG_ARCHIVE / stamp
+        moved: list[tuple[Path, Path]] = []
+        errors: list[str] = []
+        for i, src in enumerate(paths):
+            progress(f"Moving local log {src.name} ({i + 1}/{len(paths)})…")
+            try:
+                if not src.exists():
+                    errors.append(f"{src}: file no longer exists")
+                    continue
+                try:
+                    rel = src.relative_to(_RAW_LOG_ARCHIVE)
+                except ValueError:
+                    rel = Path(src.name)
+                dst = self._dedupe_path(trash_root / rel)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                moved.append((src, dst))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{src}: {exc}")
+        if errors:
+            raise RuntimeError("Some local files could not be moved:\n" + "\n".join(errors))
+        return {"kind": "delete_local", "moved": moved, "trash_root": trash_root}
+
+    def _delete_device_entries(self, entries: list[dict], progress) -> dict:
+        deleted: list[str] = []
+        deleted_keys: list[tuple] = []
+        rescued: list[Path] = []
+        errors: list[str] = []
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        rescue_root = _DELETED_LOG_ARCHIVE / stamp / "from_device"
+
+        for i, entry in enumerate(entries):
+            progress(f"Deleting device log {entry['name']} ({i + 1}/{len(entries)})…")
+            if entry["kind"] == "mtp":
+                code, out = self._run_mtp_tool(
+                    ["mtp-delfile", "-n", str(entry.get("id"))], timeout_s=60)
+                if code is None or code != 0:
+                    errors.append(
+                        f"{entry['name']}: "
+                        f"{out.strip() or f'mtp-delfile exited with status {code}'}")
+                    continue
+                deleted.append(str(entry["name"]))
+                deleted_keys.append(self._device_entry_key(entry))
+                continue
+
+            try:
+                src = Path(entry["src"])
+                root = Path(entry["root"])
+                rel = src.relative_to(root)
+                dst = self._dedupe_path(rescue_root / root.parent.name / rel)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                rescued.append(dst)
+                deleted.append(str(entry["name"]))
+                deleted_keys.append(self._device_entry_key(entry))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{entry['name']}: {exc}")
+
+        if errors:
+            raise RuntimeError("Some device files could not be deleted:\n" + "\n".join(errors))
+        return {"kind": "delete_device", "deleted": deleted,
+                "deleted_keys": deleted_keys, "rescued": rescued}
 
     def _run_mtp_tool(self, args: list[str], timeout_s: float) -> tuple[int | None, str]:
         exe = shutil.which(args[0])
@@ -3016,6 +3173,28 @@ class MainWindow(QMainWindow):
         self._set_log_decode_text(busy_msg)
         return True
 
+    def _enter_export_mode(self):
+        """Tell the flight computer to enter EXPORT_MODE over USB serial.
+
+        The current firmware only services MTP (log download) after this
+        command, and only accepts it in IDLE/LANDED. Uses the shared serial
+        link — the user connects on the Sensors tab; this just sends the line.
+        """
+        if not self._worker.isRunning():
+            self._append_log_decode_text(
+                "Not connected over USB serial.\n"
+                "Connect to the flight computer on the Sensors tab first, then "
+                "click Enter Export Mode.")
+            self._log("[horizon] Enter Export Mode: connect serial on the "
+                      "Sensors tab first")
+            return
+        self._worker.send_bytes(b"EXPORT_MODE\n")
+        self._append_log_decode_text(
+            "Sent EXPORT_MODE. Watch the Sensors-tab log for "
+            "'#INFO: EXPORT_MODE active' (refused unless the FC is in "
+            "IDLE/LANDED), then click Refresh to list device files.")
+        self._log("[horizon] Sent EXPORT_MODE to flight computer")
+
     def _refresh_device_files(self):
         """List .APXLOG files present on the flight computer — in the worker
         thread (mtp-files alone can block for tens of seconds)."""
@@ -3083,6 +3262,82 @@ class MainWindow(QMainWindow):
             return result
 
         self._start_log_job(job, "Pulling logs from flight computer…")
+
+    def _delete_selected_device_files(self):
+        entries = self._selected_device_entries()
+        if not entries:
+            self._set_log_decode_text(
+                "No device files selected — Refresh the Flight Computer list "
+                "and select rows first.")
+            return
+
+        local_index = self._local_log_index()
+        missing_local = [
+            entry for entry in entries
+            if self._find_local_copy_for_entry(entry, local_index) is None
+        ]
+        extra = ""
+        if missing_local:
+            names = "\n".join(f"  {e['name']} ({self._fmt_size(e.get('size'))})"
+                              for e in missing_local)
+            extra = (
+                "WARNING: HORIZON cannot find local archive copies for these "
+                "selected device files. Pull them to the laptop before deleting "
+                "unless you are absolutely sure another copy exists:\n"
+                f"{names}")
+
+        if not self._confirm_dangerous_delete(
+            "Delete logs from flight computer",
+            f"Delete {len(entries)} selected APXLOG file(s) from the flight computer?",
+            extra):
+            self._set_log_decode_text("Device delete canceled.")
+            return
+
+        snapshot = [dict(e) for e in entries]
+
+        def job(progress):
+            return self._delete_device_entries(snapshot, progress)
+
+        self._start_log_job(job, "Deleting logs from flight computer…")
+
+    def _delete_selected_local_logs(self):
+        paths = self._selected_local_log_paths()
+        if not paths:
+            self._set_log_decode_text("No local archive files selected.")
+            return
+        if not self._device_entries:
+            self._set_log_decode_text(
+                "Refresh the Flight Computer file list before deleting local logs. "
+                "HORIZON needs the current device list to check whether another "
+                "copy is still onboard.")
+            return
+
+        missing_on_device = [
+            path for path in paths
+            if not any(self._device_entry_matches_local_path(entry, path)
+                       for entry in self._device_entries)
+        ]
+        extra = ""
+        if missing_on_device:
+            names = "\n".join(f"  {path.name}" for path in missing_on_device)
+            extra = (
+                "WARNING: These local files are not currently listed on the "
+                "flight computer. Moving them may leave no onboard copy:\n"
+                f"{names}")
+
+        if not self._confirm_dangerous_delete(
+            "Delete local archive logs",
+            f"Move {len(paths)} selected local APXLOG file(s) to the recently deleted folder?",
+            extra):
+            self._set_log_decode_text("Local delete canceled.")
+            return
+
+        snapshot = [Path(p) for p in paths]
+
+        def job(progress):
+            return self._trash_local_paths(snapshot, progress)
+
+        self._start_log_job(job, "Moving local logs to recently deleted…")
 
     def _export_logs(self, summary_only: bool = False, all_files: bool = False):
         # Gather widget state on the UI thread; the job itself must not
@@ -3171,6 +3426,43 @@ class MainWindow(QMainWindow):
             if self._log_export_after_pull:
                 self._log_export_after_pull = False
                 self._export_logs(summary_only=False)
+            return
+
+        if result["kind"] == "delete_local":
+            moved = result["moved"]
+            lines = [
+                f"Moved {len(moved)} local APXLOG file(s) to recently deleted.",
+                f"Recently deleted folder: {result['trash_root']}",
+            ]
+            if moved:
+                lines.append("Moved:")
+                lines.extend(f"  {src}  ->  {dst}" for src, dst in moved)
+            self._set_log_decode_text("\n".join(lines))
+            self._refresh_local_log_choices(select_all=False)
+            self._log(f"[horizon] Moved {len(moved)} local log file(s) to recently deleted")
+            return
+
+        if result["kind"] == "delete_device":
+            deleted = result["deleted"]
+            deleted_keys = set(tuple(key) for key in result.get("deleted_keys", []))
+            self._device_entries = [
+                entry for entry in self._device_entries
+                if self._device_entry_key(entry) not in deleted_keys
+            ]
+            self._populate_device_table(self._device_entries)
+            lines = [f"Deleted {len(deleted)} APXLOG file(s) from the flight computer."]
+            if result["rescued"]:
+                lines.extend([
+                    "",
+                    "Mounted-volume files were moved into a local rescue folder:",
+                    *(f"  {p}" for p in result["rescued"]),
+                ])
+            if deleted:
+                lines.append("")
+                lines.append("Deleted:")
+                lines.extend(f"  {name}" for name in deleted)
+            self._set_log_decode_text("\n".join(lines))
+            self._log(f"[horizon] Deleted {len(deleted)} device log file(s)")
             return
 
         # Export / summary result

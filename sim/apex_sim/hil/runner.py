@@ -67,42 +67,70 @@ class HilResult:
 def warm_up(link: HilLink, emulator: SensorEmulator,
             rail_inclination_deg: float, rail_heading_deg: float,
             duration_s: float = 6.0, speed: float = 1.0,
-            reply_timeout: float = 5.0,
+            arm_timeout: float = 30.0,
             shadow_links: Optional[Dict[str, HilLink]] = None) -> int:
-    """Stream on-pad packets until the flight computer arms.
+    """Stream on-pad packets until the FC auto-arms, then hold on the pad.
+
+    The firmware replies to every SimPacket from the first one (the new HIL
+    contract); the ``phase`` field reports IDLE during pad capture and ARMED
+    once fusion's auto pad reference + the IDLE auto-arm have run — exactly the
+    flight path, no HIL-specific arming.  This streams pad data until ARMED is
+    seen, then holds on the pad for ``duration_s`` more (the programmable pad
+    sit time: fills the prelaunch RAM ring and exercises pad re-zero, just like
+    sitting on the rail; BOOST later flushes the ring into the flight log).
 
     Returns the last sim_time_ms sent (the flight phase continues from it).
-    Raises RuntimeError if no TeensyPacket reply arrives after the warm-up.
+    Raises RuntimeError if the FC never reports ARMED within ``arm_timeout``.
     """
     sensors = emulator.pad_sensors(rail_inclination_deg, rail_heading_deg)
     shadows = shadow_links or {}
-    n = max(int(duration_s * 100), 60)   # ≥ settle window (50) + margin
     wall0 = time.monotonic()
-    sim_ms = 0
-    for i in range(n):
-        sim_ms = i * 10
-        link.send(sim_ms, sensors)
+    state = {"i": 0, "sim_ms": 0}
+
+    def _tick() -> Optional[TeensyPkt]:
+        reply = link.transact(state["sim_ms"], sensors, timeout=0.1)
         for shadow in shadows.values():
-            shadow.send(sim_ms, sensors)
+            shadow.transact(state["sim_ms"], sensors, timeout=0.1)
         if speed > 0:
-            rem = wall0 + (i + 1) * 0.01 / speed - time.monotonic()
+            rem = wall0 + (state["i"] + 1) * 0.01 / speed - time.monotonic()
             if rem > 0:
                 time.sleep(rem)
+        state["i"] += 1
+        state["sim_ms"] = state["i"] * 10
+        return reply
 
-    # The firmware replies to every packet once armed — prove the loop works.
-    deadline = time.monotonic() + reply_timeout
+    # Phase 1 — stream pad packets until the FC reports ARMED.
+    deadline = time.monotonic() + arm_timeout
+    armed = False
+    last_phase = None
     while time.monotonic() < deadline:
-        sim_ms += 10
-        primary = link.transact(sim_ms, sensors, timeout=0.1)
-        for shadow in shadows.values():
-            shadow.transact(sim_ms, sensors, timeout=0.1)
-        if primary is not None:
-            return sim_ms
-        if speed > 0:
-            time.sleep(0.01 / speed)
-    raise RuntimeError(
-        "Flight computer never armed during warm-up — no TeensyPacket reply. "
-        "Check the APEX_HIL build is flashed and the port is correct.")
+        reply = _tick()
+        if reply is not None:
+            last_phase = PHASE_NAMES.get(reply.phase, reply.phase)
+            if last_phase == "ARMED":
+                armed = True
+                break
+    if not armed:
+        # Surface the firmware's own diagnostic (#INFO/#WARN lines explaining
+        # why it has not armed — pad capture, storage-not-ready, auto-arm
+        # countdown) so the reason reaches the operator instead of a blind
+        # timeout. The HIL build emits these once per second while IDLE.
+        fc_lines = [ln for ln in link.drain_lines()
+                    if ln.startswith("#")][-4:]
+        detail = ("\n  Flight computer said:\n    " + "\n    ".join(fc_lines)
+                  if fc_lines else "")
+        raise RuntimeError(
+            "Flight computer never reported ARMED during warm-up "
+            f"(last phase: {last_phase}). Check the APEX_HIL build is flashed "
+            "and the port is correct. Most common cause is 'no log, no arm' — "
+            "arming is refused unless both QSPI flash and the microSD card are "
+            "mounted and writable on the board." + detail)
+
+    # Phase 2 — programmable pad sit: hold on the pad, filling the RAM ring.
+    for _ in range(max(int(duration_s * 100), 0)):
+        _tick()
+
+    return state["sim_ms"]
 
 
 def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,

@@ -164,6 +164,31 @@ class TestFakeTeensyLoop:
         assert abs(reply.est_alt_agl_m) < 2.0     # on the pad
         assert reply.deployment_frac == 0.0
 
+    def test_replies_every_packet_idle_before_armed(self, fake_link):
+        """New HIL contract: the FC replies to every SimPacket from the first
+        one, reporting IDLE during pad capture and ARMED once settled. The
+        host's warm_up() depends on watching this phase field — a regression
+        to 'no reply until armed' would hang the loop."""
+        fake, link = fake_link
+        assert link.wait_for_line("HIL_READY", timeout=3.0)
+        em, pad = _pad_sensors()
+
+        # First packet must already get a reply, and it must read IDLE.
+        first = link.transact(0, pad, timeout=1.0)
+        assert first is not None, "no reply to the first SimPacket"
+        assert protocol.PHASE_NAMES[first.phase] == "IDLE"
+        assert first.deployment_frac == 0.0
+
+        # Drive past the settle window; the phase must transition to ARMED
+        # and every packet keeps getting a reply.
+        saw_armed = False
+        for i in range(1, 70):
+            reply = link.transact(i * 10, pad, timeout=1.0)
+            assert reply is not None, f"missing reply at packet {i}"
+            if protocol.PHASE_NAMES[reply.phase] == "ARMED":
+                saw_armed = True
+        assert saw_armed, "FC never reported ARMED across the settle window"
+
     def test_synthetic_flight_reaches_coast_and_deploys(self, fake_link):
         """Drive a kinematic vertical flight; expect BOOST → COAST and PID
         deployment after the post-burnout lockout."""

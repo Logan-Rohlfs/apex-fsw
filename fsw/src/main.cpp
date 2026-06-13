@@ -9,6 +9,8 @@
 #include "led.h"
 #include "storage.h"
 #include "control.h"
+#include "board.h"
+#include "watchdog.h"
 
 // APEX_HIL and APEX_DEBUG are mutually exclusive.
 // Interleaved text output causes CRC false-failures in the Python parser.
@@ -53,6 +55,7 @@ void setup() {
     Serial.printf("#INFO: SimPacket=%u bytes  TeensyPacket=%u bytes  rate=%d Hz\n",
                   (unsigned)sizeof(SimPacket), (unsigned)sizeof(TeensyPacket), RATE_HIL_HZ);
 
+    board_init();     // power rails, arm switches, buzzer
     pinMode(PIN_3V3_2_EN, OUTPUT);
     digitalWrite(PIN_3V3_2_EN, HIGH);
 
@@ -79,18 +82,23 @@ void setup() {
     control_init();  // servo runs in HIL too — actuator-in-the-loop on the bench
     g_state.phase = FlightPhase::IDLE;
 
+    watchdog_begin();   // after all slow init
+
     // Signal to the Python replay script that the Teensy is ready.
     Serial.println("#HIL_READY");
 
 #else
     // Normal flight / monitor mode ────────────────────────────────────────────
-#ifdef APEX_DEBUG
+#if defined(APEX_DEBUG) || defined(USB_MTPDISK_SERIAL)
     Serial.begin(921600);
+#ifdef APEX_DEBUG
     while (!Serial && millis() < 5000);
+#endif
 #endif
 
     LOG_INFO("Apex FSW starting");
 
+    board_init();     // power rails, arm switches, buzzer
     pinMode(PIN_3V3_2_EN, OUTPUT);
     digitalWrite(PIN_3V3_2_EN, HIGH);
 
@@ -121,7 +129,29 @@ void setup() {
              RATE_FUSION_HZ, RATE_BARO_HZ, RATE_MAG_HZ);
 
     g_state.phase = FlightPhase::IDLE;
+
+    watchdog_begin();   // after all slow init
 #endif
+}
+
+// ─── Status buzzer ────────────────────────────────────────────────────────────
+// Steady pattern from the current state so an operator on the pad (no uplink)
+// can hear what the FC is doing. Event chirps (ARM, GPS lock) are fired at the
+// transition sites. Silent once flying.
+static void status_buzzer_update() {
+    uint8_t pat;
+    switch (g_state.phase) {
+        case FlightPhase::IDLE:
+            pat = storage_logging_ready() ? BUZZ_PREARM : BUZZ_FAULT;
+            break;
+        case FlightPhase::ARMED:
+            pat = BUZZ_ARMED;
+            break;
+        default:
+            pat = BUZZ_SILENT;   // in flight / landed
+            break;
+    }
+    board_buzzer(pat);
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -129,6 +159,7 @@ void setup() {
 #ifdef APEX_HIL
 
 void loop() {
+    watchdog_feed();
     static uint32_t _last_pkt_ms    = 0;     // 0 = no SimPacket yet this session
     static bool     _session_active = false;
 
@@ -168,12 +199,48 @@ void loop() {
         _last_pkt_ms    = millis();
         _session_active = true;
 
+        // Sim-authoritative timestep from the packet's own sim_time_ms — the
+        // estimator advances on simulated time, so it presents like a real,
+        // evenly-clocked data stream no matter how the bytes arrive over USB
+        // (jitter, batching) or if a packet is dropped. fusion/control read
+        // g_hil_dt_s. First packet of a session has no predecessor → nominal.
+        static uint32_t _prev_sim_ms = 0;
+        float sim_dt = 1.0f / RATE_HIL_HZ;
+        if (_prev_sim_ms != 0 && pkt.sim_time_ms > _prev_sim_ms) {
+            sim_dt = (pkt.sim_time_ms - _prev_sim_ms) * 1e-3f;
+            if (sim_dt <= 0.0f || sim_dt > 0.05f) sim_dt = 1.0f / RATE_HIL_HZ;
+        }
+        _prev_sim_ms = pkt.sim_time_ms;
+        g_hil_dt_s = sim_dt;
+
         sensors_inject_hil(pkt);
         fusion_update();
         gps_monitor_update(millis());   // fix trust on injected GPS data
         flight_state_update(millis());
         control_update(millis());
         storage_log_update(millis());
+
+        // ── Why-not-armed diagnostic (1 Hz while IDLE) ────────────────────
+        // LOG_* are no-ops in the HIL build, so an arm refusal is otherwise
+        // silent and the host just times out. Spell out the blocker so the
+        // operator sees it. Mirrors flight_state_update's IDLE auto-arm gates:
+        // pad reference captured → boot delay elapsed → storage logging ready.
+        if (g_state.phase == FlightPhase::IDLE) {
+            static uint32_t _last_why_ms = 0;
+            if (millis() - _last_why_ms >= 1000) {
+                _last_why_ms = millis();
+                if (g_state.pad_pressure_pa <= 0.0f) {
+                    Serial.println("#INFO: HIL IDLE — capturing pad reference (baro settling)");
+                } else if (!storage_logging_ready()) {
+                    Serial.printf("#WARN: HIL cannot arm — 'no log, no arm': storage "
+                                  "not ready (QSPI+SD required). health=0x%02X faults=0x%04X\n",
+                                  storage_health(), storage_faults());
+                } else if (millis() < AUTO_ARM_DELAY_MS) {
+                    Serial.printf("#INFO: HIL IDLE — auto-arm in %lu ms\n",
+                                  (unsigned long)(AUTO_ARM_DELAY_MS - millis()));
+                }
+            }
+        }
 
         // Reply to every SimPacket from the first one — the phase field tells
         // the host where the FC is (IDLE during pad capture, then ARMED).
@@ -210,6 +277,8 @@ void loop() {
         radio_telemetry_tx();
     }
 
+    status_buzzer_update();
+    board_update(millis());
     storage_mtp_loop();
     led_update();   // same LED patterns as flight (phase/health driven)
 }
@@ -225,8 +294,9 @@ static bool _telem_enabled = true;
 #endif
 
 void loop() {
+    watchdog_feed();
     static uint32_t last_gps_ms = 0;
-    if (millis() - last_gps_ms >= 100) {
+    if (!storage_export_mode_active() && millis() - last_gps_ms >= 100) {
         last_gps_ms = millis();
         gps_update();
         gps_monitor_update(millis());
@@ -236,7 +306,8 @@ void loop() {
     // Fusion runs in the 200 Hz timer ISR; these read its output with brief
     // noInterrupts() snapshots internally.
     static uint32_t last_state_ms = 0;
-    if (millis() - last_state_ms >= 1000 / RATE_STATE_HZ) {
+    if (!storage_export_mode_active() &&
+        millis() - last_state_ms >= 1000 / RATE_STATE_HZ) {
         last_state_ms = millis();
         flight_state_update(millis());
         control_update(millis());
@@ -247,7 +318,7 @@ void loop() {
     // 1 Hz on the pad / after landing, RADIO_TELEM_FLIGHT_HZ once armed.
     // radio_telemetry_tx is non-blocking (~1 ms of SPI; ~42 ms airtime).
     static uint32_t last_telem_ms = 0;
-    if (_telem_enabled) {
+    if (!storage_export_mode_active() && _telem_enabled) {
         const bool quiescent = (g_state.phase == FlightPhase::IDLE ||
                                 g_state.phase == FlightPhase::LANDED);
         const uint32_t period_ms =
@@ -258,11 +329,11 @@ void loop() {
         }
     }
 
+#ifdef APEX_DEBUG
     static uint32_t last_print = 0;
 
-#ifdef APEX_DEBUG
     // ── Data output at 50 Hz ──────────────────────────────────────────────────
-    if (millis() - last_print >= 20) {
+    if (!storage_export_mode_active() && millis() - last_print >= 20) {
         last_print = millis();
 
         Serial.printf(">alt_agl:%.2f\n",     g_state.fused.altitude_agl_m);
@@ -285,6 +356,10 @@ void loop() {
         Serial.printf(">mag_x:%.4f\n",       g_state.mag.x_gauss);
         Serial.printf(">mag_y:%.4f\n",       g_state.mag.y_gauss);
         Serial.printf(">mag_z:%.4f\n",       g_state.mag.z_gauss);
+        // Airbrake command — drives the ground app's deployment gauge so it
+        // is live on a connected bench board, not just in HIL.
+        Serial.printf(">deployment:%.3f\n",  g_state.control.deployment_frac);
+        Serial.printf(">servo_angle:%.1f\n", g_state.control.servo_angle_deg);
         Serial.printf("!phase:%s\n",         phase_name(g_state.phase));
         Serial.printf("!health:%d\n",        sensors_health());
         Serial.printf("!gps_fix:%d\n",       gps_fix_state());
@@ -310,9 +385,12 @@ void loop() {
         }
     }
 
-    // ── Command parser ────────────────────────────────────────────────────────
-    // Reads newline-terminated ASCII commands from the monitor app.
-    // Commands: ARM, DISARM (state machine hooks added in Phase 1).
+#endif
+
+#ifdef USB_MTPDISK_SERIAL
+    // ── USB command parser ───────────────────────────────────────────────────
+    // EXPORT_MODE is available in debug and flight MTP+Serial builds. Debug-only
+    // bench commands remain inside APEX_DEBUG below.
     static char    _cmd_buf[32];
     static uint8_t _cmd_len = 0;
     while (Serial.available()) {
@@ -320,8 +398,28 @@ void loop() {
         if (c == '\n' || c == '\r') {
             if (_cmd_len > 0) {
                 _cmd_buf[_cmd_len] = '\0';
+#ifdef APEX_DEBUG
                 LOG_INFO("CMD: %s", _cmd_buf);
-                if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
+#endif
+                if (strcmp(_cmd_buf, "EXPORT_MODE") == 0) {
+                    if (g_state.phase == FlightPhase::IDLE ||
+                        g_state.phase == FlightPhase::LANDED) {
+                        storage_enter_export_mode(millis());
+                        _telem_enabled = false;
+                        Serial.println("#INFO: EXPORT_MODE active — logging closed, MTP download enabled");
+                    } else {
+                        Serial.printf("#ERROR: EXPORT_MODE refused in phase %s\n",
+                                      phase_name(g_state.phase));
+                    }
+                } else if (strcmp(_cmd_buf, "ALLOW_DELETION") == 0) {
+                    if (storage_allow_deletion(millis())) {
+                        Serial.println("#WARN: Export deletion enabled — MTP writes/deletes are now allowed");
+                    } else {
+                        Serial.println("#ERROR: ALLOW_DELETION refused — enter EXPORT_MODE first");
+                    }
+                }
+#ifdef APEX_DEBUG
+                else if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||
                            strcmp(_cmd_buf, "RADIO_MARKER_441") == 0) {
                     radio_marker_tx(RADIO_FREQ_HZ);
                 } else if (strcmp(_cmd_buf, "RADIO_DATA_TEST") == 0) {
@@ -348,6 +446,7 @@ void loop() {
                     flight_state_disarm();
                     LOG_INFO("Phase now %s", phase_name(g_state.phase));
                 }
+#endif
                 _cmd_len = 0;
             }
         } else if (_cmd_len < sizeof(_cmd_buf) - 1) {
@@ -356,6 +455,8 @@ void loop() {
     }
 #endif
 
+    status_buzzer_update();
+    board_update(millis());
     storage_mtp_loop();
     led_update();
 }

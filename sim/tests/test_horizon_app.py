@@ -59,12 +59,6 @@ def test_branding(app, win):
     assert titles == ["Sensors", "Radio", "HIL", "Logs"]
 
 
-def test_monitor_shim_importable():
-    import monitor
-    assert monitor.main is horizon.main
-    assert "deprecated" in (monitor.__doc__ or "").lower()
-
-
 # ── Line-protocol routing on each data page ──────────────────────────────────
 
 def test_routing_per_page(app, win):

@@ -51,6 +51,21 @@
 
 // Power enables
 #define PIN_3V3_2_EN        23   // AP2112K-3.3 enable — drives radio 3.3V rail
+#define PIN_12V_EN          20   // A6  — 12 V rail high-side enable (on at boot)
+#define PIN_SRV_EN          38   // A14 — servo power high-side switch (NPN+PMOS),
+                                 //       on at ARM / off in IDLE (no pad chatter)
+
+// ── Arm switches (screw switches on the rod; see docs/flight_readiness.md) ────
+// Two switches; the final on-pad arming action. Wired fail-safe: the ARMED
+// position closes the pin to GND (INPUT_PULLUP → reads LOW). A broken/unplugged
+// switch floats HIGH = DISARMED/safe. Both must be ON to arm.
+#define PIN_SWITCH_1        32   // D32
+#define PIN_SWITCH_2        31   // D31
+#define SWITCH_ARMED_LEVEL  LOW  // pin level when the switch is in the armed pos.
+
+// ── Buzzer (on-pad status; the only feedback to an operator with no uplink) ───
+#define PIN_BUZZER          3    // D3 — passive piezo driven with tone()
+#define BUZZER_ACTIVE       0    // 1 = self-driving (active) buzzer → digitalWrite
 
 // ─── Radio ────────────────────────────────────────────────────────────────────
 // RF4463PRO-433 / Si4463 crystal frequency used by POWER_UP and PLL math.
@@ -96,10 +111,22 @@
 #define RATE_BARO_HZ        50
 #define RATE_MAG_HZ         25
 
+// ─── Watchdog ─────────────────────────────────────────────────────────────────
+// Resets the board if the main loop stops feeding for this long, then reboots
+// to a flight-ready state. Must exceed the longest legitimate blocking op
+// (servo arm sweep SERVO_INIT_SWEEP_MS, radio TX, storage flush) with margin.
+// NOTE: a blocking storage write/flush (flaky SD, QSPI NAND program/erase) can
+// exceed this and trip a reset — that is the watchdog doing its job, but it
+// also masks the underlying storage problem. Set WATCHDOG_ENABLE 0 to isolate
+// (bench debugging): if the periodic reboots stop, a storage hang was tripping
+// the watchdog; if they continue, the reset is something else.
+#define WATCHDOG_ENABLE             0        // 0 to disable (bench isolation only)
+#define WATCHDOG_TIMEOUT_S          2
+
 // ─── Arming ───────────────────────────────────────────────────────────────────
-// IDLE → ARMED automatically once the pad reference is captured and this
-// delay has elapsed (airbrakes are not pyro — ARMED only enables launch
-// detection). Debug builds can also force it with the ARM/DISARM commands.
+// IDLE → ARMED once the pad reference is captured, the boot settle has elapsed,
+// AND both arm switches are closed (airbrakes are not pyro — ARMED only enables
+// launch detection). Switch-level gated; debug builds can also use ARM/DISARM.
 #define AUTO_ARM_DELAY_MS           10000
 
 // ─── Launch Detection ─────────────────────────────────────────────────────────
@@ -119,8 +146,8 @@
 #define BOOST_MAX_MS                8000
 
 // ─── Airbrake Gates ───────────────────────────────────────────────────────────
-#define POST_BURNOUT_LOCKOUT_MS     2500
-#define MACH_GATE_MPS               240.0f   // 0.7 Mach — no transonic actuation
+#define POST_BURNOUT_LOCKOUT_MS     1000
+#define MACH_GATE_MPS               260.0f   // ~0.75 Mach — no transonic actuation
 #define MIN_DEPLOY_ALT_M            100.0f
 
 // ─── Apogee Detection ─────────────────────────────────────────────────────────
@@ -155,12 +182,19 @@
 #define PID_U_MAX                    30.0f
 
 // ─── Servo ────────────────────────────────────────────────────────────────────
-#define SERVO_PIN                   6
-#define SERVO_MIN_US                1000     // parameterized — measure from hardware
-#define SERVO_MAX_US                2000
+// Direction is INVERTED: deployment 0 → SERVO_MAX_US (retracted),
+// deployment 1 → SERVO_MIN_US (fully deployed). Endpoints measured from the
+// airframe. Full stroke in SERVO_FULL_TRAVEL_S (rate-limited in control.cpp).
+#define SERVO_PIN                   37       // D37
+#define SERVO_MIN_US                500      // fully deployed
+#define SERVO_MAX_US                1833     // retracted
 #define SERVO_MIN_DEG               0.0f
 #define SERVO_MAX_DEG               180.0f
-#define SERVO_MAX_RATE_DEG_PER_S    (180.0f / 0.24f)   // 0.24s full travel
+#define SERVO_FULL_TRAVEL_S         0.24f    // 0% → 100% travel time
+#define SERVO_MAX_RATE_DEG_PER_S    (180.0f / SERVO_FULL_TRAVEL_S)
+// Smooth start-up sweep: servos pulse to center (~1500 µs) on attach(); sweep
+// from there to retracted over this time so the brake doesn't snap on boot.
+#define SERVO_INIT_SWEEP_MS         800
 
 // ─── Physical Constants ───────────────────────────────────────────────────────
 #define ROCKET_MASS_KG              30.44f

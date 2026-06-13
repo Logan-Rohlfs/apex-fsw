@@ -28,3 +28,10 @@ void control_reset();
 // flight_state_update(). Computes PID + gates, applies the servo rate limit,
 // writes g_state.control and the servo output.
 void control_update(uint32_t now_ms);
+
+// Arm/disarm the actuator. control_arm() powers the servo rail and smoothly
+// sweeps it to retracted (called from flight_state_arm); control_disarm()
+// retracts and unpowers it (called when leaving ARMED on the pad). Both reset
+// the PID state. Servo power stays off through the pad sit until ARM.
+void control_arm();
+void control_disarm();

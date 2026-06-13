@@ -35,6 +35,10 @@ Docs to read before touching the relevant area:
   — radio module, **wire format of record**, bench-validation numbers.
 - [fsw/docs/devices.md](fsw/docs/devices.md) — per-device wiring + library
   snippets (IMU, baro, GPS, NAND, radio quirks).
+- [fsw/docs/flight_readiness.md](fsw/docs/flight_readiness.md) — **phased plan to
+  feature-complete the FC** (pad-hardening, switch-gated arming, watchdog,
+  buzzer, servo profile, mag cal, PID-retune workflow). The source of truth for
+  remaining flight-readiness work; check phase statuses before starting.
 - [sim/README.md](sim/README.md) — HIL/SIL architecture and config YAMLs.
 
 ## Build / test commands

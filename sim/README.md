@@ -188,8 +188,8 @@ python scripts/run_hil.py --fake           # no hardware — in-process fake Tee
 python scripts/run_hil.py --fake --speed 0 # max speed (fake only)
 ```
 
-The HORIZON ground app (`python scripts/horizon.py`; `scripts/monitor.py` is a
-deprecated shim) has the same loop as a source: pick the **HIL** tab (Fake FC checkbox for no-hardware runs) and
+The HORIZON ground app (`python scripts/horizon.py`) has the same loop as a
+source: pick the **HIL** tab (Fake FC checkbox for no-hardware runs) and
 Connect. It shows the injected sensors, FC state estimation vs RocketPy truth,
 state machine phase, loop latency, and a live airbrake deployment gauge.
 

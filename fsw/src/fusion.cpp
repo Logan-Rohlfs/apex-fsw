@@ -166,10 +166,21 @@ void fusion_on_armed() {
 }
 
 void fusion_update() {
+#ifdef APEX_HIL
+    // Sim-authoritative dt from the packet stream (g_hil_dt_s, set by the HIL
+    // loop from consecutive SimPacket.sim_time_ms). Wall-clock micros() here
+    // would let USB packet-delivery jitter (±1–2 ms at speed 1.0) corrupt the
+    // CF predict (vel += a·dt) and, with the high velocity-correction gain,
+    // ring the estimate into a ±100 m/s sawtooth. Advancing on simulated time
+    // makes the estimator deterministic and speed-independent in HIL.
+    const float dt = g_hil_dt_s;
+    _last_us = micros();
+#else
     uint32_t now_us = micros();
     float dt = (now_us - _last_us) * 1e-6f;
     if (dt <= 0.0f || dt > 0.05f) dt = 1.0f / RATE_FUSION_HZ;
     _last_us = now_us;
+#endif
 
     uint32_t now_ms = millis();
 

@@ -5,6 +5,10 @@
 #include <string.h>
 #include <Arduino.h>
 
+// Sim timestep for the current packet (see hil.h). Defaults to the nominal
+// rate until the HIL loop has two SimPacket timestamps to difference.
+float g_hil_dt_s = 1.0f / RATE_HIL_HZ;
+
 // ─── CRC-8 (polynomial 0x07, CRC-8/SMBUS) ────────────────────────────────────
 // Table-driven for consistent latency. Covers all bytes except crc8 field.
 

@@ -26,6 +26,8 @@ enum LogEventId : uint8_t {
     LOG_EVENT_HIL_SESSION_END   = 8,
     LOG_EVENT_GPS_FIX_LOST      = 9,
     LOG_EVENT_GPS_FIX_REGAINED  = 10,
+    LOG_EVENT_EXPORT_MODE       = 11,
+    LOG_EVENT_DELETE_ARMED      = 12,
 };
 
 enum LogFault : uint16_t {
@@ -52,6 +54,11 @@ void storage_log_event(uint8_t event_id, const char* detail);
 void storage_begin_flight(uint32_t now_ms, const char* reason);
 void storage_log_update(uint32_t now_ms);
 void storage_end_session(uint32_t now_ms, const char* reason);
+bool storage_enter_export_mode(uint32_t now_ms);
+bool storage_export_mode_active();
+bool storage_allow_deletion(uint32_t now_ms);
+bool storage_deletion_allowed();
 
-// Call from the main loop to service USB MTP file transfers.
+// Call from the main loop to service USB MTP file transfers. This only does
+// work after storage_enter_export_mode(); normal logging owns storage otherwise.
 void storage_mtp_loop();
