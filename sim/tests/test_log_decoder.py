@@ -121,6 +121,24 @@ def test_decode_file_resyncs_and_parses_payloads(tmp_path):
     assert records[-1].payload["phase"] == "BOOST"
 
 
+def test_decode_files_dedups_by_seq(tmp_path):
+    # Same flight present in two files — e.g. the QSPI black box and the SD
+    # live log + post-landing dump all containing the same (boot_id, seq)
+    # records. decode_files must collapse them to one set of rows.
+    qspi = tmp_path / "BOOT_00042.APXLOG"
+    sd = tmp_path / "BOOT_00042_SD.APXLOG"
+    _write_log(qspi)
+    _write_log(sd)   # identical content → every record duplicated across files
+
+    single, _ = decoder.decode_files([qspi])
+    merged, stats = decoder.decode_files([qspi, sd])
+
+    assert len(merged) == len(single)            # no duplicate rows survive
+    assert stats.duplicates == len(single)       # one dropped per record
+    keys = [(r.boot_id, r.seq) for r in merged]
+    assert len(keys) == len(set(keys))           # unique (boot_id, seq)
+
+
 def test_export_logs_writes_one_wide_csv_per_flight(tmp_path):
     log_path = tmp_path / "BOOT_00042.APXLOG"
     out_dir = tmp_path / "export"

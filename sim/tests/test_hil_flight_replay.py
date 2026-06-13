@@ -61,6 +61,7 @@ def _replay(grid, logic):
             mag_z_gauss=float(grid["mag_z"][i]),
             gps_alt_msl_m=float(grid["gps_alt_msl"][i]),
             gps_valid=1,
+            arm_switch=1,   # recording is an armed flight (operator closed switches)
         )
         reply = logic.step(int(grid["sim_ms"][i]), s)
         t_flight = float(grid["t_grid"][i])     # CSV time: launch at ~0

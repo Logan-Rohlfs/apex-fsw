@@ -123,7 +123,7 @@ void fusion_init() {
     _was_stable      = false;
 
     // On a cold start pad_pressure_pa is 0 (zero-initialised FlightState).
-    // On a warm restart (watchdog reset during pad hold) it may already be
+    // On a warm restart (e.g. a brownout during pad hold) it may already be
     // set — preserve it rather than reverting to open-loop integration.
     if (g_state.pad_pressure_pa == 0.0f) {
         g_state.pad_altitude_msl_m = 0.0f;

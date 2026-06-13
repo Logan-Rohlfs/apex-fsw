@@ -243,11 +243,15 @@ void sensors_inject_hil(const SimPacket& pkt) {
         interrupts();
     }
 
+    // Arm switches are injected in HIL_ARM_SWITCH_BIT of gps_valid — route it
+    // to board_switches_armed() so the sim drives arming like the real switches.
+    g_hil_arm_closed = (pkt.gps_valid & HIL_ARM_SWITCH_BIT) != 0;
+
     // GPS — write directly to g_state (bypasses staging path, async).
     // On an invalid packet the fix flags are cleared and timestamp_ms is NOT
     // advanced, so gps_monitor_update() sees the loss exactly as it would
     // with real hardware going silent (stale solution → fix lost).
-    if (pkt.gps_valid) {
+    if (pkt.gps_valid & HIL_GPS_FIX_BIT) {
         g_state.gps.altitude_msl_m = pkt.gps_alt_msl_m;
         g_state.gps.valid          = true;
         g_state.gps.fix_quality    = 3;

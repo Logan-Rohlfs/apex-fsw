@@ -176,7 +176,10 @@ class FlightLogic:
         # phase field to know when the FC has armed.
         if not self.armed:
             self.pad_baro_sum += s.baro_pa
-            if self.packets >= _SETTLE_PACKETS:
+            # Arm only once the pad reference has settled AND the operator's arm
+            # switches are closed (s.arm_switch) — mirrors the firmware gate
+            # (board_switches_armed + pad_ready). Switches open → stay IDLE.
+            if self.packets >= _SETTLE_PACKETS and s.arm_switch:
                 avg = self.pad_baro_sum / self.packets
                 self.pad_alt_msl = _pressure_to_alt_msl(avg)
                 self.armed = True
@@ -233,6 +236,17 @@ class FlightLogic:
 
         # ── Phase machine ──────────────────────────────────────────────────────
         if self.phase == _PH_ARMED:
+            # Safing: arm switches opening before launch drops back to IDLE
+            # (mirrors flight_state.cpp; only pre-BOOST — once boosted the
+            # flight is latched and a switch glitch must not abort airbrakes).
+            if not s.arm_switch:
+                self.armed = False
+                self.phase = _PH_IDLE
+                self._launch_ms = self._launch_baro_ms = None
+                return TeensyPkt(
+                    magic=0, sim_time_ms=sim_ms, deployment_frac=0.0,
+                    est_alt_agl_m=0.0, est_vel_mps=0.0, pred_apogee_m=0.0,
+                    phase=self.phase, crc=0)
             # Primary: sustained 2 g.  Backup: sustained baro climb (covers a
             # dead accelerometer — Seymour data clears the primary trivially
             # at 14.1 g).

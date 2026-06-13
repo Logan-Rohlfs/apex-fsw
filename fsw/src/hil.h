@@ -30,10 +30,18 @@ struct __attribute__((packed)) SimPacket {
     float    mag_y_gauss;
     float    mag_z_gauss;
     float    gps_alt_msl_m;     // NaN = no fix
-    uint8_t  gps_valid;
+    uint8_t  gps_valid;         // bitfield: see HIL_GPS_FIX_BIT / HIL_ARM_SWITCH_BIT
     uint8_t  crc8;
 };
 static_assert(sizeof(SimPacket) == 64, "SimPacket size mismatch");
+
+// SimPacket.gps_valid is a bitfield (kept in one byte so the wire stays 64 B):
+//   bit 0 — GPS fix valid (the original meaning)
+//   bit 1 — arm switches CLOSED (operator-armed). Lets the sim drive the real
+//           arming gate instead of the firmware hardcoding switches=armed, so a
+//           HIL run exercises the same IDLE→ARMED→disarm path as flight.
+#define HIL_GPS_FIX_BIT     0x01
+#define HIL_ARM_SWITCH_BIT  0x02
 
 // ─── Teensy → Sim (24 bytes) ──────────────────────────────────────────────────
 // Sent every control loop tick.
@@ -69,6 +77,11 @@ static_assert(sizeof(TeensyPacket) == 24, "TeensyPacket size mismatch");
 // real packet, one real step — immune to USB delivery jitter, and correct
 // even if a packet is dropped or the host streams at a different rate.
 extern float g_hil_dt_s;
+
+// Injected arm-switch state (HIL_ARM_SWITCH_BIT of the latest SimPacket).
+// board_switches_armed() returns this in HIL, so the sim drives arming exactly
+// as the operator's screw switches would in flight. Defaults open (false).
+extern bool g_hil_arm_closed;
 
 // ─── CRC-8 ────────────────────────────────────────────────────────────────────
 // Polynomial 0x07 (CRC-8/SMBUS). Covers all bytes except the crc8 field itself.

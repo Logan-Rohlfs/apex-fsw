@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <CrashReport.h>
 #include "config.h"
 #include "debug.h"
 #include "flight_state.h"
@@ -10,7 +11,6 @@
 #include "storage.h"
 #include "control.h"
 #include "board.h"
-#include "watchdog.h"
 
 // APEX_HIL and APEX_DEBUG are mutually exclusive.
 // Interleaved text output causes CRC false-failures in the Python parser.
@@ -60,7 +60,16 @@ void setup() {
     digitalWrite(PIN_3V3_2_EN, HIGH);
 
     led_init();
-    storage_init();
+    const uint8_t sto_health = storage_init();
+    // LOG_* are no-ops in the HIL build, so storage_init()'s mount errors are
+    // otherwise silent. Surface health here: QSPI=0 means no black box opened
+    // (no APXLOG file will exist), and logging_ready=0 means HIL will never arm.
+    Serial.printf("#INFO: storage health=0x%02X QSPI=%d SD=%d boot_id=%lu logging_ready=%d\n",
+                  sto_health,
+                  (sto_health & STORAGE_OK_FLASH) ? 1 : 0,
+                  (sto_health & STORAGE_OK_SD) ? 1 : 0,
+                  (unsigned long)storage_boot_id(),
+                  storage_logging_ready() ? 1 : 0);
     sensors_init_hil();
     fusion_init();   // uses RATE_HIL_HZ internally
 
@@ -82,8 +91,6 @@ void setup() {
     control_init();  // servo runs in HIL too — actuator-in-the-loop on the bench
     g_state.phase = FlightPhase::IDLE;
 
-    watchdog_begin();   // after all slow init
-
     // Signal to the Python replay script that the Teensy is ready.
     Serial.println("#HIL_READY");
 
@@ -97,6 +104,11 @@ void setup() {
 #endif
 
     LOG_INFO("Apex FSW starting");
+#ifdef APEX_DEBUG
+    Serial.println("#INFO: Teensy reset/crash report follows");
+    CrashReport.printTo(Serial);
+    CrashReport.clear();
+#endif
 
     board_init();     // power rails, arm switches, buzzer
     pinMode(PIN_3V3_2_EN, OUTPUT);
@@ -129,8 +141,6 @@ void setup() {
              RATE_FUSION_HZ, RATE_BARO_HZ, RATE_MAG_HZ);
 
     g_state.phase = FlightPhase::IDLE;
-
-    watchdog_begin();   // after all slow init
 #endif
 }
 
@@ -159,7 +169,6 @@ static void status_buzzer_update() {
 #ifdef APEX_HIL
 
 void loop() {
-    watchdog_feed();
     static uint32_t _last_pkt_ms    = 0;     // 0 = no SimPacket yet this session
     static bool     _session_active = false;
 
@@ -233,7 +242,7 @@ void loop() {
                     Serial.println("#INFO: HIL IDLE — capturing pad reference (baro settling)");
                 } else if (!storage_logging_ready()) {
                     Serial.printf("#WARN: HIL cannot arm — 'no log, no arm': storage "
-                                  "not ready (QSPI+SD required). health=0x%02X faults=0x%04X\n",
+                                  "not ready (QSPI primary required). health=0x%02X faults=0x%04X\n",
                                   storage_health(), storage_faults());
                 } else if (millis() < AUTO_ARM_DELAY_MS) {
                     Serial.printf("#INFO: HIL IDLE — auto-arm in %lu ms\n",
@@ -261,6 +270,21 @@ void loop() {
             Serial.printf(">deployment:%.3f\n",  g_state.control.deployment_frac);
             Serial.printf("!phase:%s\n",          phase_name(g_state.phase));
             Serial.printf("!health:%d\n",         sensors_health());
+            Serial.printf("!radio:%d\n",          radio_status());
+
+            // Telemetry TX stats for the HIL Link panel (2 Hz). HIL transmits
+            // real Si4463 downlink packets, so expose the same counters the
+            // debug build shows on the bench.
+            static uint32_t _last_hil_link_ms = 0;
+            if (millis() - _last_hil_link_ms >= 500) {
+                _last_hil_link_ms = millis();
+                uint16_t seq; uint32_t sent, skipped;
+                radio_telemetry_stats(&seq, &sent, &skipped);
+                Serial.printf("!telem:1\n");
+                Serial.printf("!tx_seq:%u\n", seq);
+                Serial.printf("!tx_sent:%lu\n", (unsigned long)sent);
+                Serial.printf("!tx_skipped:%lu\n", (unsigned long)skipped);
+            }
         }
     }
 
@@ -294,9 +318,8 @@ static bool _telem_enabled = true;
 #endif
 
 void loop() {
-    watchdog_feed();
     static uint32_t last_gps_ms = 0;
-    if (!storage_export_mode_active() && millis() - last_gps_ms >= 100) {
+    if (millis() - last_gps_ms >= 100) {
         last_gps_ms = millis();
         gps_update();
         gps_monitor_update(millis());
@@ -306,8 +329,7 @@ void loop() {
     // Fusion runs in the 200 Hz timer ISR; these read its output with brief
     // noInterrupts() snapshots internally.
     static uint32_t last_state_ms = 0;
-    if (!storage_export_mode_active() &&
-        millis() - last_state_ms >= 1000 / RATE_STATE_HZ) {
+    if (millis() - last_state_ms >= 1000 / RATE_STATE_HZ) {
         last_state_ms = millis();
         flight_state_update(millis());
         control_update(millis());
@@ -318,7 +340,7 @@ void loop() {
     // 1 Hz on the pad / after landing, RADIO_TELEM_FLIGHT_HZ once armed.
     // radio_telemetry_tx is non-blocking (~1 ms of SPI; ~42 ms airtime).
     static uint32_t last_telem_ms = 0;
-    if (!storage_export_mode_active() && _telem_enabled) {
+    if (_telem_enabled) {
         const bool quiescent = (g_state.phase == FlightPhase::IDLE ||
                                 g_state.phase == FlightPhase::LANDED);
         const uint32_t period_ms =
@@ -333,7 +355,7 @@ void loop() {
     static uint32_t last_print = 0;
 
     // ── Data output at 50 Hz ──────────────────────────────────────────────────
-    if (!storage_export_mode_active() && millis() - last_print >= 20) {
+    if (millis() - last_print >= 20) {
         last_print = millis();
 
         Serial.printf(">alt_agl:%.2f\n",     g_state.fused.altitude_agl_m);
@@ -389,8 +411,9 @@ void loop() {
 
 #ifdef USB_MTPDISK_SERIAL
     // ── USB command parser ───────────────────────────────────────────────────
-    // EXPORT_MODE is available in debug and flight MTP+Serial builds. Debug-only
-    // bench commands remain inside APEX_DEBUG below.
+    // MTP log download is always live (storage_mtp_loop), so the only command
+    // these MTP builds need is the explicit, GUI-confirmed QSPI format. Debug-
+    // only bench commands remain inside APEX_DEBUG below.
     static char    _cmd_buf[32];
     static uint8_t _cmd_len = 0;
     while (Serial.available()) {
@@ -401,21 +424,13 @@ void loop() {
 #ifdef APEX_DEBUG
                 LOG_INFO("CMD: %s", _cmd_buf);
 #endif
-                if (strcmp(_cmd_buf, "EXPORT_MODE") == 0) {
-                    if (g_state.phase == FlightPhase::IDLE ||
-                        g_state.phase == FlightPhase::LANDED) {
-                        storage_enter_export_mode(millis());
-                        _telem_enabled = false;
-                        Serial.println("#INFO: EXPORT_MODE active — logging closed, MTP download enabled");
+                if (strcmp(_cmd_buf, "FORMAT_QSPI_ERASE_ALL") == 0) {
+                    // storage_format_qspi() prints the before/after used-bytes
+                    // proof line itself; just flag overall pass/fail here.
+                    if (storage_format_qspi(millis())) {
+                        Serial.println("#WARN: QSPI low-level erase complete — logs erased, counters reset, fresh session started");
                     } else {
-                        Serial.printf("#ERROR: EXPORT_MODE refused in phase %s\n",
-                                      phase_name(g_state.phase));
-                    }
-                } else if (strcmp(_cmd_buf, "ALLOW_DELETION") == 0) {
-                    if (storage_allow_deletion(millis())) {
-                        Serial.println("#WARN: Export deletion enabled — MTP writes/deletes are now allowed");
-                    } else {
-                        Serial.println("#ERROR: ALLOW_DELETION refused — enter EXPORT_MODE first");
+                        Serial.println("#ERROR: FORMAT_QSPI_ERASE_ALL failed — QSPI flash not healthy");
                     }
                 }
 #ifdef APEX_DEBUG

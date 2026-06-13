@@ -9,6 +9,10 @@
 // rate until the HIL loop has two SimPacket timestamps to difference.
 float g_hil_dt_s = 1.0f / RATE_HIL_HZ;
 
+// Injected arm-switch state (see hil.h). Set from each SimPacket in
+// sensors_inject_hil(); read by board_switches_armed(). Starts open.
+bool g_hil_arm_closed = false;
+
 // ─── CRC-8 (polynomial 0x07, CRC-8/SMBUS) ────────────────────────────────────
 // Table-driven for consistent latency. Covers all bytes except crc8 field.
 

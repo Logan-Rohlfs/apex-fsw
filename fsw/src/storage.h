@@ -26,8 +26,6 @@ enum LogEventId : uint8_t {
     LOG_EVENT_HIL_SESSION_END   = 8,
     LOG_EVENT_GPS_FIX_LOST      = 9,
     LOG_EVENT_GPS_FIX_REGAINED  = 10,
-    LOG_EVENT_EXPORT_MODE       = 11,
-    LOG_EVENT_DELETE_ARMED      = 12,
 };
 
 enum LogFault : uint16_t {
@@ -39,9 +37,9 @@ enum LogFault : uint16_t {
 };
 
 // Mount and verify both storage media. Returns health bitmask.
-// Storage failure is launch-fatal: flight_state_arm() refuses to arm unless
-// storage_logging_ready() is true. Once airborne, logging faults are recorded
-// but must not block control.
+// Primary QSPI logging failure is launch-fatal: flight_state_arm() refuses to
+// arm unless storage_logging_ready() is true. SD is a redundant mirror and
+// post-landing backup target; SD faults are recorded but do not block control.
 uint8_t storage_init();
 
 uint8_t storage_health();
@@ -54,11 +52,12 @@ void storage_log_event(uint8_t event_id, const char* detail);
 void storage_begin_flight(uint32_t now_ms, const char* reason);
 void storage_log_update(uint32_t now_ms);
 void storage_end_session(uint32_t now_ms, const char* reason);
-bool storage_enter_export_mode(uint32_t now_ms);
-bool storage_export_mode_active();
-bool storage_allow_deletion(uint32_t now_ms);
-bool storage_deletion_allowed();
 
-// Call from the main loop to service USB MTP file transfers. This only does
-// work after storage_enter_export_mode(); normal logging owns storage otherwise.
+// Explicit destructive maintenance: erase/reformat the QSPI filesystem and
+// start a fresh in-place log session. Operator-only — issued from HORIZON's
+// Format QSPI button with typed confirmation; the FC never formats on its own.
+bool storage_format_qspi(uint32_t now_ms);
+
+// Call from the main loop to service USB MTP file transfers. No-op when no USB
+// host is attached; logging keeps running alongside it.
 void storage_mtp_loop();

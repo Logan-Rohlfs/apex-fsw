@@ -20,7 +20,7 @@ Sim → Teensy (64 bytes)::
     float  highg_x/y/z_mss    ADXL375 body frame
     float  mag_x/y/z_gauss    MMC5983MA body frame
     float  gps_alt_msl_m      NaN = no fix
-    uint8  gps_valid
+    uint8  gps_valid          bit0 = GPS fix, bit1 = arm switches closed
     uint8  crc8
 
 Teensy → Sim (24 bytes)::
@@ -49,6 +49,11 @@ HIL_MAGIC_TEENSY_TO_SIM = 0xCDAB   # LE wire: [0xAB, 0xCD]
 HIL_BAUD = 921600                  # ignored by Teensy USB CDC, required by pyserial
 RATE_HIL_HZ = 100
 DT_S = 1.0 / RATE_HIL_HZ
+
+# gps_valid is a bitfield (mirror hil.h): bit0 = GPS fix, bit1 = arm switches
+# closed. Packed into one byte so the wire stays 64 B.
+HIL_GPS_FIX_BIT = 0x01
+HIL_ARM_SWITCH_BIT = 0x02
 
 SIM_STRUCT = struct.Struct("<HI" + "f" * 14 + "BB")
 SIM_SIZE = SIM_STRUCT.size
@@ -105,6 +110,7 @@ class SimSensors(NamedTuple):
     mag_z_gauss: float
     gps_alt_msl_m: float
     gps_valid: int
+    arm_switch: int = 0   # 1 = operator arm switches closed (HIL_ARM_SWITCH_BIT)
 
 
 class TeensyPkt(NamedTuple):
@@ -122,10 +128,15 @@ class TeensyPkt(NamedTuple):
 
 
 def pack_sim(sim_time_ms: int, sensors: SimSensors) -> bytes:
-    """Serialise a SimPacket with a valid CRC-8 trailer."""
+    """Serialise a SimPacket with a valid CRC-8 trailer.
+
+    gps_valid + arm_switch are combined into the single gps_valid wire byte
+    (bit0 = fix, bit1 = arm switches closed)."""
+    gps_byte = ((HIL_GPS_FIX_BIT if sensors.gps_valid else 0)
+                | (HIL_ARM_SWITCH_BIT if sensors.arm_switch else 0))
     body = SIM_STRUCT.pack(
         HIL_MAGIC_SIM_TO_TEENSY, sim_time_ms & 0xFFFFFFFF,
-        *sensors[:-1], sensors.gps_valid & 0xFF, 0)
+        *sensors[:14], gps_byte & 0xFF, 0)
     return body[:-1] + bytes([crc8(body[:-1])])
 
 
@@ -138,7 +149,11 @@ def unpack_sim(data: bytes) -> Optional["tuple"]:
         return None
     if crc8(data[:SIM_SIZE - 1]) != fields[-1]:
         return None
-    return fields[1], SimSensors(*fields[2:16], gps_valid=fields[16])
+    gps_byte = fields[16]
+    return fields[1], SimSensors(
+        *fields[2:16],
+        gps_valid=1 if gps_byte & HIL_GPS_FIX_BIT else 0,
+        arm_switch=1 if gps_byte & HIL_ARM_SWITCH_BIT else 0)
 
 
 def pack_teensy(pkt: TeensyPkt) -> bytes:

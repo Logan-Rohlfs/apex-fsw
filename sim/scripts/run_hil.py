@@ -77,9 +77,14 @@ def main():
     ap.add_argument("--site", default=None)
     ap.add_argument("--model", default="standard_atmosphere",
                     help="atmosphere model, or 'auto' for the forecast ladder")
-    ap.add_argument("--warmup", type=float, default=6.0)
+    ap.add_argument("--pad-time", "--warmup", type=float, default=6.0,
+                    dest="pad_time",
+                    help="seconds to sit on the pad (switches open) before "
+                         "closing them to arm; models real pad time")
     ap.add_argument("--full", action="store_true",
-                    help="simulate past apogee (default: stop at apogee)")
+                    help="fly through descent + landing (default: stop at "
+                         "apogee). Adds a post-landing static tail so LANDED "
+                         "fires and the post-landing QSPI→SD dump runs")
     ap.add_argument("--no-noise", action="store_true",
                     help="disable the per-sensor noise model (deterministic run)")
     ap.add_argument("--sensor-seed", type=int, default=None,
@@ -100,9 +105,16 @@ def main():
                     help="fixed sensor mount rotation x,y,z in degrees")
     ap.add_argument("--sensor-delay-ms", type=float, default=0.0,
                     help="integer-tick sensor delay; rounded to 10 ms HIL ticks")
-    ap.add_argument("--max-time", type=float, default=120.0)
+    ap.add_argument("--max-time", type=float, default=None,
+                    help="sim seconds cap (default: 120 stop-at-apogee, "
+                         "600 for --full so descent reaches the ground)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+
+    # Full flights need a long cap so descent under the main chute reaches the
+    # ground (~7 min real-time at 1×); the post-landing tail is skipped if it
+    # doesn't, so this must be generous or LANDED won't be reached.
+    max_time = args.max_time if args.max_time is not None else (600.0 if args.full else 120.0)
 
     if args.fake and args.compare_fake:
         print(f"{YEL}--compare-fake is ignored when --fake is the primary FC.{RESET}")
@@ -146,8 +158,9 @@ def main():
             print(f"{RED}No #HIL_READY within 15 s. Check the APEX_HIL build "
                   f"is flashed (pio run -e teensy41_hil -t upload).{RESET}")
             sys.exit(1)
-        print(f"{GRN}Flight computer ready.{RESET}  Warming up "
-              f"({args.warmup:.0f} s on pad)...")
+        print(f"{GRN}Flight computer ready.{RESET}  On the pad "
+              f"({args.pad_time:.0f} s, switches open) then arming"
+              f"{' — full flight through landing' if args.full else ''}...")
 
         if args.compare_fake:
             from apex_sim.hil.fake_teensy import FakeTeensy
@@ -182,8 +195,8 @@ def main():
         result = run_closed_loop(
             link, env, rocket, env_cfg,
             airbrakes_cfg=airbrakes_cfg,
-            speed=args.speed, warmup_s=args.warmup,
-            terminate_on_apogee=not args.full, max_time=args.max_time,
+            speed=args.speed, warmup_s=args.pad_time,
+            terminate_on_apogee=not args.full, max_time=max_time,
             noise=not args.no_noise,
             sensor_kwargs=_sensor_kwargs(args),
             shadow_links=shadow_links,

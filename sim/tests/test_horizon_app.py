@@ -102,16 +102,36 @@ def test_routing_per_page(app, win):
 
 # ── Logs page: device → archive → CSV pipeline ───────────────────────────────
 
+def _mtp_mock(log_path: Path, file_id: int = 42):
+    """Fake _run_mtp_tool for the libmtp device path (no real MTP device).
+
+    mtp-files lists log_path; mtp-getfile copies its bytes to the dest;
+    mtp-detect (capacity) reports unavailable. The flight computer only
+    serves logs over libmtp — mounted volumes are not used."""
+    content = log_path.read_bytes()
+    listing = (f"File ID: {file_id}\n"
+               f"   Filename: {log_path.name}\n"
+               f"   File size: {len(content)}\n"
+               f"   Storage ID: 0x00010001\n")
+
+    def run(args, timeout_s=30):
+        if args[0] == "mtp-files":
+            return 0, listing
+        if args[0] == "mtp-getfile":
+            Path(args[2]).write_bytes(content)
+            return 0, ""
+        return None, ""          # mtp-detect / anything else: unavailable
+    return run
+
+
 def test_logs_page_end_to_end(app, win, tmp_path, monkeypatch):
     archive = tmp_path / "raw_logs"
     monkeypatch.setattr(horizon, "_RAW_LOG_ARCHIVE", archive)
 
-    # Fake mounted volume: /Volumes/<VOL>/APEX/BOOT_00042.APXLOG
-    apex_root = tmp_path / "APEXVOL" / "APEX"
-    apex_root.mkdir(parents=True)
-    log_path = apex_root / "BOOT_00042.APXLOG"
+    # Device file served over libmtp (mtp-files / mtp-getfile mocked).
+    log_path = tmp_path / "BOOT_00042.APXLOG"
     _write_log(log_path)
-    monkeypatch.setattr(win, "_find_mounted_apex_log_roots", lambda: [apex_root])
+    monkeypatch.setattr(win, "_run_mtp_tool", _mtp_mock(log_path))
 
     win.tab_bar.setCurrentIndex(3)
     app.processEvents()
@@ -123,7 +143,7 @@ def test_logs_page_end_to_end(app, win, tmp_path, monkeypatch):
     assert win.device_table.item(0, 0).text() == "BOOT_00042.APXLOG"
     assert "KiB" in win.device_table.item(0, 1).text() or \
            "B" in win.device_table.item(0, 1).text()
-    assert "volume" in win.device_table.item(0, 2).text()
+    assert "MTP" in win.device_table.item(0, 2).text()
 
     # Pull Selected copies into the laptop archive
     win.device_table.selectAll()
@@ -167,10 +187,9 @@ def test_logs_pull_all_without_refresh(app, win, tmp_path, monkeypatch):
     """Pull All discovers and pulls in one job when no Refresh was done."""
     archive = tmp_path / "raw_logs"
     monkeypatch.setattr(horizon, "_RAW_LOG_ARCHIVE", archive)
-    apex_root = tmp_path / "VOL" / "APEX"
-    apex_root.mkdir(parents=True)
-    _write_log(apex_root / "BOOT_00007.APXLOG")
-    monkeypatch.setattr(win, "_find_mounted_apex_log_roots", lambda: [apex_root])
+    log_path = tmp_path / "BOOT_00007.APXLOG"
+    _write_log(log_path)
+    monkeypatch.setattr(win, "_run_mtp_tool", _mtp_mock(log_path, file_id=7))
 
     win.tab_bar.setCurrentIndex(3)
     app.processEvents()

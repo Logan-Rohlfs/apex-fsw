@@ -1,5 +1,8 @@
 #include "board.h"
 #include "config.h"
+#ifdef APEX_HIL
+#include "hil.h"          // g_hil_arm_closed — sim-injected arm-switch state
+#endif
 
 #include <Arduino.h>
 
@@ -38,7 +41,7 @@ static void switches_update(uint32_t now_ms) {
 
 bool board_switches_armed() {
 #ifdef APEX_HIL
-    return true;   // no hardware switches in HIL — the sim drives arming
+    return g_hil_arm_closed;   // sim drives the switch state (HIL_ARM_SWITCH_BIT)
 #else
     return _armed_stable;
 #endif
@@ -68,12 +71,18 @@ static void beep_start(uint16_t freq, uint16_t on_ms, uint32_t now_ms) {
 #if BUZZER_ACTIVE
     (void)freq;
     digitalWrite(PIN_BUZZER, HIGH);
-    _beep_off_ms = now_ms + on_ms;
-    _beep_on = true;
 #else
-    tone(PIN_BUZZER, freq, on_ms);   // non-blocking, self-stops
-    (void)now_ms;
+    // Passive piezo via hardware PWM (FlexPWM), NOT tone(). tone() needs a PIT
+    // IntervalTimer, but all PITs are consumed by the fusion/baro/mag timers in
+    // the flight/debug builds, so tone() silently fails there (it ignores
+    // begin() returning false). analogWrite drives the pin's FlexPWM submodule
+    // (D6 = FlexPWM2_2_A, independent of the servo on FlexPWM1_0_A) and works in
+    // every build. ~50% duty at the 12-bit resolution control_init() sets.
+    analogWriteFrequency(PIN_BUZZER, freq);
+    analogWrite(PIN_BUZZER, 2048);
 #endif
+    _beep_off_ms = now_ms + on_ms;   // software on-window; closed in buzzer_update
+    _beep_on = true;
 }
 
 void board_buzzer(uint8_t pattern) {
@@ -89,12 +98,14 @@ void board_buzzer_chirp() {
 }
 
 static void buzzer_update(uint32_t now_ms) {
-#if BUZZER_ACTIVE
     if (_beep_on && (int32_t)(now_ms - _beep_off_ms) >= 0) {
+#if BUZZER_ACTIVE
         digitalWrite(PIN_BUZZER, LOW);
+#else
+        analogWrite(PIN_BUZZER, 0);   // 0% duty → silent
+#endif
         _beep_on = false;
     }
-#endif
     const PatternDef& p = _patterns[_pattern <= BUZZ_ARMED ? _pattern : 0];
     if (p.period_ms == 0) return;
     if (_next_beep_ms == 0 || (int32_t)(now_ms - _next_beep_ms) >= 0) {

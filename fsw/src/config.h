@@ -64,7 +64,7 @@
 #define SWITCH_ARMED_LEVEL  LOW  // pin level when the switch is in the armed pos.
 
 // ── Buzzer (on-pad status; the only feedback to an operator with no uplink) ───
-#define PIN_BUZZER          3    // D3 — passive piezo driven with tone()
+#define PIN_BUZZER          6    // D6 — passive piezo driven with tone()
 #define BUZZER_ACTIVE       0    // 1 = self-driving (active) buzzer → digitalWrite
 
 // ─── Radio ────────────────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@
 #define RADIO_XTAL_HZ       30000000UL
 #define RADIO_FREQ_HZ       441480000UL  // allocated center frequency: 441.480 MHz
 #define RADIO_CHANNEL_BW_HZ 125000UL     // allocated channel bandwidth: 125 kHz
-#define RADIO_MARKER_PA_PWR 0x08         // low bench marker power to avoid SDR overload
+#define RADIO_MARKER_PA_PWR 0x30         // low bench marker power to avoid SDR overload
 
 // 2-GFSK downlink parameters. Carson bandwidth = 2*(dev + bitrate/2) = 60 kHz,
 // inside the 125 kHz allocation. Deviation is large vs. the ±4.4 kHz worst-case
@@ -110,18 +110,6 @@
 #define RATE_CONTROL_HZ     100
 #define RATE_BARO_HZ        50
 #define RATE_MAG_HZ         25
-
-// ─── Watchdog ─────────────────────────────────────────────────────────────────
-// Resets the board if the main loop stops feeding for this long, then reboots
-// to a flight-ready state. Must exceed the longest legitimate blocking op
-// (servo arm sweep SERVO_INIT_SWEEP_MS, radio TX, storage flush) with margin.
-// NOTE: a blocking storage write/flush (flaky SD, QSPI NAND program/erase) can
-// exceed this and trip a reset — that is the watchdog doing its job, but it
-// also masks the underlying storage problem. Set WATCHDOG_ENABLE 0 to isolate
-// (bench debugging): if the periodic reboots stop, a storage hang was tripping
-// the watchdog; if they continue, the reset is something else.
-#define WATCHDOG_ENABLE             0        // 0 to disable (bench isolation only)
-#define WATCHDOG_TIMEOUT_S          2
 
 // ─── Arming ───────────────────────────────────────────────────────────────────
 // IDLE → ARMED once the pad reference is captured, the boot settle has elapsed,
@@ -253,13 +241,23 @@
 #define LOG_RATE_BOOST_HZ           200
 #define LOG_RATE_COAST_HZ           100
 #define LOG_RATE_DESCENT_HZ         25
-#define LOG_RING_BUF_SECONDS        60      // pre-launch ring buffer depth
+#define LOG_RING_BUF_SECONDS        15      // high-rate pre-launch context depth
 
-// Binary flight logger. Storage is launch-critical: arming is refused unless
-// both QSPI flash and microSD are mounted, writable, and the boot log is open.
-// Runtime writes are sampled in the main loop (never sensor ISRs). The RAM ring
-// keeps compact prelaunch samples so the log contains context before BOOST.
-#define LOG_PRELAUNCH_RING_HZ       50
+// Binary flight logger. QSPI flash is launch-critical; microSD is a redundant
+// mirror. Runtime writes are sampled in the main loop (never sensor ISRs). The
+// RAM ring keeps compact recent prelaunch samples so the log can explain launch
+// detection without allowing old pad context to compete with flight data.
+#define LOG_PRELAUNCH_RING_HZ       20
 #define LOG_PAD_FILE_HZ             2
 #define LOG_FLIGHT_FILE_HZ          100     // fastest useful state/control rate
-#define LOG_FILE_FLUSH_INTERVAL_MS  1000
+#define LOG_FILE_FLUSH_INTERVAL_MS  1000     // QSPI black-box flush cadence
+// SD is only a mirror, and its FAT sync can stall 100s of ms (occasionally
+// >1 s) — flushing it every second was freezing the loop. Flush it rarely; the
+// post-apogee force-flush and the post-landing QSPI→SD dump still commit it.
+#define LOG_SD_FLUSH_INTERVAL_MS    30000
+#define LOG_SD_POST_APOGEE_FLUSH_MS 10000    // one extra SD flush this long into DESCENT
+
+// Debug-only storage diagnostics. The flight logger still runs normally; debug
+// builds only add a low-rate timing summary so SD/QSPI stalls are visible.
+#define DEBUG_STORAGE_SUMMARY_MS    1000
+#define DEBUG_STORAGE_SLOW_US       5000

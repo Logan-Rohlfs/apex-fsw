@@ -127,7 +127,7 @@ void flight_state_reset(uint32_t now_ms) {
     g_state.burnout_time_ms = 0;
     // Drop the pad reference so fusion's auto pad capture runs again from a
     // fresh 50-sample baro average (fusion_init() preserves a non-zero pad
-    // reference for watchdog warm restarts — clear it first).
+    // reference across warm restarts — clear it first).
     g_state.pad_pressure_pa    = 0.0f;
     g_state.pad_altitude_msl_m = 0.0f;
     fusion_init();

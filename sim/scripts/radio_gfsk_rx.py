@@ -133,6 +133,18 @@ class FrameResult:
         raise ValueError(f"frame type 0x{self.ftype:02X} has no parser")
 
 
+@dataclass
+class DecodeStats:
+    candidates: int = 0
+    unknown_type: int = 0
+    bad_crc: int = 0
+    good_crc: int = 0
+    best_quality: float = 0.0
+    best_type: int | None = None
+    best_crc_rx: int | None = None
+    best_crc_calc: int | None = None
+
+
 def crc16_ccitt(data: bytes) -> int:
     crc = 0xFFFF
     for byte in data:
@@ -165,7 +177,8 @@ def quadrature_demod(samples: np.ndarray) -> np.ndarray:
 
 def find_frames(samples: np.ndarray, sample_rate: int,
                 bitrate: int = BITRATE_BPS,
-                max_frames: int = 128) -> list[FrameResult]:
+                max_frames: int = 128,
+                stats: DecodeStats | None = None) -> list[FrameResult]:
     """Demodulate and return every decodable frame in the capture, in order."""
     sps = sample_rate // bitrate
     if sps < 2:
@@ -207,6 +220,9 @@ def find_frames(samples: np.ndarray, sample_rate: int,
             break          # order is quality-descending — nothing better left
         if blocked[n0]:
             continue
+        if stats is not None:
+            stats.candidates += 1
+            stats.best_quality = max(stats.best_quality, float(quality[n0]))
 
         # Slicer threshold = mean over the (DC-balanced) template region —
         # this is exactly the carrier frequency offset.
@@ -218,8 +234,12 @@ def find_frames(samples: np.ndarray, sample_rate: int,
         if type_idx[-1] >= len(smoothed):
             continue
         ftype = int(np.packbits((smoothed[type_idx] > center).astype(np.uint8))[0])
+        if stats is not None and stats.best_type is None:
+            stats.best_type = ftype
         body_len = BODY_LEN_BY_TYPE.get(ftype)
         if body_len is None:
+            if stats is not None:
+                stats.unknown_type += 1
             continue
 
         frame_bits = (1 + body_len + 2) * 8
@@ -252,10 +272,17 @@ def find_frames(samples: np.ndarray, sample_rate: int,
             sample_index=int(n0),
         )
         if result.crc_ok:
+            if stats is not None:
+                stats.good_crc += 1
             results.append(result)
             frame_span = (tbits + frame_bits) * sps
             lo = max(0, n0 - frame_span)
             blocked[lo: min(n_pos, n0 + frame_span)] = True
+        elif stats is not None:
+            stats.bad_crc += 1
+            if stats.best_crc_rx is None:
+                stats.best_crc_rx = crc_rx
+                stats.best_crc_calc = crc_calc
 
     results.sort(key=lambda r: r.sample_index)
     return results

@@ -52,6 +52,7 @@ _SIM_ROOT = Path(__file__).resolve().parents[1]
 _RAW_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs"
 _DELETED_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs_deleted"
 _DELETE_CONFIRM_PHRASE = "yes i really do want to delete these files"
+_FORMAT_QSPI_CONFIRM_PHRASE = "yes i really do want to format qspi flash"
 
 import numpy as np
 import serial
@@ -76,6 +77,7 @@ from radio_gfsk_rx import (
     DEFAULT_FREQ_HZ,
     DEFAULT_SAMPLE_RATE_HZ,
     DEVIATION_HZ,
+    DecodeStats,
     FRAME_TYPE_FLIGHT,
     FRAME_TYPE_HK,
     find_frames,
@@ -251,8 +253,7 @@ class HorizonStyle(QProxyStyle):
 KNOWN_COMMANDS = [
     "ARM",
     "DISARM",
-    "EXPORT_MODE",      # IDLE/LANDED only: stop logging, enable MTP log download
-    "ALLOW_DELETION",   # after EXPORT_MODE: permit MTP writes/deletes
+    "FORMAT_QSPI_ERASE_ALL",   # explicit GUI-confirmed QSPI erase/reformat
     "RADIO_DATA_TEST",
     "RADIO_MARKER",
     "RADIO_MARKER_441",
@@ -368,6 +369,7 @@ class RadioWorker(QThread):
         self._recent_seqs: deque = deque(maxlen=50)    # for packet-loss %
         self._frame_times: deque = deque(maxlen=20)    # reception times, for rate
         self._last_telem_log_s = 0.0
+        self._last_radio_diag_s = 0.0
         self._last_spec_s = 0.0
         self._decode_busy = False
         self._fft_window = np.hanning(FFT_BINS).astype(np.float32)
@@ -422,7 +424,9 @@ class RadioWorker(QThread):
             f"RTL-SDR RX {self._freq_hz / 1e6:.3f} MHz @ {self._sample_rate} S/s gain={self._gain}",
             False,
         )
-        self.line_received.emit("#INFO: radio rx waiting for RADIO_DATA_TEST frames (2-GFSK)")
+        self.line_received.emit(
+            "#INFO: radio rx waiting for 2-GFSK packets "
+            "(TELEM_ON telemetry or RADIO_DATA_TEST; RADIO_MARKER is CW spectrum-only)")
 
         raw = bytearray()
         max_bytes = int(self._sample_rate * 2 * 4)   # unsigned 8-bit IQ, ~4 s rolling window
@@ -489,12 +493,25 @@ class RadioWorker(QThread):
         self.spectrum_ready.emit(np.fft.fftshift(db).astype(np.float32))
 
     def _try_decode(self, raw: bytes, now_s: float):
+        stats = DecodeStats()
         try:
             samples = load_u8_iq(raw)
-            frames = find_frames(samples, self._sample_rate)
+            frames = find_frames(samples, self._sample_rate, stats=stats)
         except Exception as exc:
             self.line_received.emit(f"#WARN: radio rx decode error: {exc}")
             return
+
+        if not frames and stats.candidates and now_s - self._last_radio_diag_s >= 3.0:
+            self._last_radio_diag_s = now_s
+            detail = (
+                f"#WARN: radio rx saw sync-like energy but no valid packets: "
+                f"candidates={stats.candidates} bad_crc={stats.bad_crc} "
+                f"unknown_type={stats.unknown_type} best_q={stats.best_quality:.2f}")
+            if stats.best_type is not None:
+                detail += f" best_type=0x{stats.best_type:02X}"
+            if stats.best_crc_rx is not None and stats.best_crc_calc is not None:
+                detail += f" crc_rx=0x{stats.best_crc_rx:04X} crc_calc=0x{stats.best_crc_calc:04X}"
+            self.line_received.emit(detail)
 
         # The rolling buffer re-decodes each frame for several seconds —
         # report each (seq, payload) once, then age the dedupe entries out.
@@ -651,12 +668,15 @@ class HilWorker(QThread):
         self._compare_fake = False
         self._sensor_seed = None
         self._sensor_delay_ms = 0.0
+        self._full_flight = False
+        self._pad_time = 6.0
         self._tick_count = 0
         self._last_gps_fix = 3   # receiver model starts locked on the pad
 
     def configure(self, port: str, fake: bool, speed: float, noise: bool = True,
                   record_csv: bool = True, compare_fake: bool = False,
-                  sensor_seed=None, sensor_delay_ms: float = 0.0):
+                  sensor_seed=None, sensor_delay_ms: float = 0.0,
+                  full_flight: bool = False, pad_time: float = 6.0):
         self._port = port
         self._fake = fake
         self._speed = speed
@@ -665,6 +685,8 @@ class HilWorker(QThread):
         self._compare_fake = compare_fake and not fake
         self._sensor_seed = sensor_seed
         self._sensor_delay_ms = sensor_delay_ms
+        self._full_flight = full_flight
+        self._pad_time = pad_time
 
     def stop(self):
         self._running = False
@@ -893,10 +915,14 @@ class HilWorker(QThread):
                 self._write_csv_row(csv_writer, row, self._compare_fake)
                 self._emit_tick(row, link, last_phase)
 
+            # Full flight: fly through descent + landing (needs a long cap so
+            # the main chute reaches the ground). Otherwise stop at apogee.
             result = run_closed_loop(
                 link, env, rocket, env_cfg, airbrakes_cfg,
-                speed=self._speed, terminate_on_apogee=False,
-                max_time=120.0, noise=self._noise,
+                speed=self._speed, warmup_s=self._pad_time,
+                terminate_on_apogee=not self._full_flight,
+                max_time=600.0 if self._full_flight else 120.0,
+                noise=self._noise,
                 sensor_kwargs=sensor_kwargs,
                 shadow_links=shadow_links,
                 tick_cb=tick)
@@ -1989,11 +2015,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hil_delay_label)
         layout.addWidget(self.hil_delay_spin)
 
+        self.hil_pad_label = QLabel("Pad:")
+        self.hil_pad_spin = QDoubleSpinBox()
+        self.hil_pad_spin.setRange(0.0, 1200.0)   # up to 20 min on the pad
+        self.hil_pad_spin.setDecimals(0)
+        self.hil_pad_spin.setSingleStep(5.0)
+        self.hil_pad_spin.setValue(6.0)
+        self.hil_pad_spin.setSuffix(" s")
+        self.hil_pad_spin.setFixedWidth(80)
+        self.hil_pad_spin.setToolTip(
+            "Seconds the FC sits in IDLE on the pad (arm switches open) before\n"
+            "the switches close to arm and the flight begins. At 1x this is\n"
+            "real time — e.g. 600 = a 10-minute pad sit.")
+        layout.addWidget(self.hil_pad_label)
+        layout.addWidget(self.hil_pad_spin)
+
         self.hil_record_check = QCheckBox("Record CSV")
         self.hil_record_check.setChecked(True)
         self.hil_record_check.setToolTip(
             "Save each HIL run to sim/output/hil_gui_<timestamp>.csv.")
         layout.addWidget(self.hil_record_check)
+
+        self.hil_full_check = QCheckBox("Full flight")
+        self.hil_full_check.setChecked(False)
+        self.hil_full_check.setToolTip(
+            "Fly through descent and landing (DESCENT→LANDED, post-landing "
+            "SD dump) instead of stopping at apogee.\n"
+            "At 1× on real hardware this is several real-time minutes.")
+        layout.addWidget(self.hil_full_check)
 
         self.hil_compare_check = QCheckBox("Compare Fake")
         self.hil_compare_check.setChecked(False)
@@ -2156,10 +2205,17 @@ class MainWindow(QMainWindow):
         device_layout.setContentsMargins(8, 6, 8, 8)
         device_layout.setSpacing(6)
         device_layout.addWidget(section_hint(
-            "Raw .APXLOG files on the Teensy's storage. The flight computer only "
-            "serves files over USB after EXPORT_MODE (IDLE/LANDED only) — connect "
-            "on the Sensors tab, click Enter Export Mode, then Refresh. Refresh "
-            "uses libmtp first, then falls back to mounted APEX volumes."))
+            "Raw .APXLOG files on the Teensy's storage. The flight computer "
+            "serves files over USB (MTP) whenever it is connected — just click "
+            "Refresh. Refresh uses libmtp directly; mounted volumes are "
+            "intentionally ignored because macOS usually does not expose MTP "
+            "devices as drives."))
+
+        self.device_capacity_label = QLabel("Capacity: —")
+        self.device_capacity_label.setFont(mono_font(8))
+        self.device_capacity_label.setStyleSheet(f"color:{TEXT_DIM};")
+        self.device_capacity_label.setWordWrap(True)
+        device_layout.addWidget(self.device_capacity_label)
 
         self.device_table = QTableWidget(0, 3)
         self.device_table.setHorizontalHeaderLabels(["File", "Size", "Source"])
@@ -2175,14 +2231,6 @@ class MainWindow(QMainWindow):
 
         device_row = QHBoxLayout()
         device_row.setSpacing(6)
-        export_mode_btn = QPushButton("Enter Export Mode")
-        export_mode_btn.setFixedWidth(150)
-        export_mode_btn.setToolTip(
-            "Send EXPORT_MODE over USB serial. The flight computer stops logging,\n"
-            "closes its log files and enables MTP download. Allowed only in\n"
-            "IDLE / LANDED. Requires an active serial connection (Sensors tab).")
-        export_mode_btn.clicked.connect(self._enter_export_mode)
-        device_row.addWidget(export_mode_btn)
         refresh_device_btn = QPushButton("Refresh")
         refresh_device_btn.setFixedWidth(110)
         refresh_device_btn.clicked.connect(self._refresh_device_files)
@@ -2211,6 +2259,13 @@ class MainWindow(QMainWindow):
             "Requires local-copy checks and typed confirmation.")
         delete_device_btn.clicked.connect(self._delete_selected_device_files)
         device_row.addWidget(delete_device_btn)
+        format_qspi_btn = QPushButton("Format QSPI")
+        format_qspi_btn.setFixedWidth(120)
+        format_qspi_btn.setToolTip(
+            "Erase and reformat the flight computer's QSPI flash.\n"
+            "Requires local-copy checks and typed confirmation.")
+        format_qspi_btn.clicked.connect(self._format_qspi_flash)
+        device_row.addWidget(format_qspi_btn)
         device_layout.addLayout(device_row)
         layout.addWidget(device_box)
 
@@ -2340,6 +2395,7 @@ class MainWindow(QMainWindow):
         self._log_action_buttons = [
             refresh_device_btn, select_all_device_btn, pull_sel_btn,
             pull_all_btn, pull_all_export_btn, delete_device_btn,
+            format_qspi_btn,
             refresh_archive_btn, select_all_btn, add_external_btn,
             delete_local_btn, export_sel_btn, export_all_btn,
         ]
@@ -2463,11 +2519,12 @@ class MainWindow(QMainWindow):
         logs = mode == "logs"
         hil_fake = hil and self.hil_fake_check.isChecked()
 
-        # Port selector serves both USB serial and HIL-on-hardware
+        # Port selector serves USB serial, HIL-on-hardware, and the Logs tab
+        # (which connects to the flight computer over the same serial link).
         for widget in (self.port_label, self.port_combo, self.refresh_btn):
-            widget.setVisible(mode == "serial" or (hil and not hil_fake))
+            widget.setVisible(mode == "serial" or logs or (hil and not hil_fake))
         for widget in (self.baud_label, self.baud_combo):
-            widget.setVisible(mode == "serial")
+            widget.setVisible(mode == "serial" or logs)
         radio_widgets = [
             self.radio_freq_label, self.radio_freq_spin,
             self.radio_gain_label, self.radio_gain_input,
@@ -2481,7 +2538,8 @@ class MainWindow(QMainWindow):
                        self.hil_speed_spin, self.hil_noise_check,
                        self.hil_seed_label, self.hil_seed_input,
                        self.hil_delay_label, self.hil_delay_spin,
-                       self.hil_record_check):
+                       self.hil_pad_label, self.hil_pad_spin,
+                       self.hil_record_check, self.hil_full_check):
             widget.setVisible(hil)
         self.hil_compare_check.setVisible(hil and not hil_fake)
 
@@ -2501,7 +2559,10 @@ class MainWindow(QMainWindow):
         if logs and hasattr(self, "local_log_list"):
             self._refresh_local_log_choices(select_all=False)
 
-        for widget in (self.connect_btn, self.window_label, self.window_spin, self.clear_btn):
+        # Connect is available on every tab (the FC link is not tab-specific);
+        # the plot-window controls are not meaningful on the Logs tab.
+        self.connect_btn.setVisible(True)
+        for widget in (self.window_label, self.window_spin, self.clear_btn):
             widget.setVisible(not logs)
         if hasattr(self, "logs_hint_label"):
             self.logs_hint_label.setVisible(logs)
@@ -2569,9 +2630,10 @@ class MainWindow(QMainWindow):
                 self._start_radio()
             elif mode == "hil":
                 self._start_hil()
-            elif mode == "logs":
-                return
             else:
+                # serial OR logs — both talk to the flight computer over USB
+                # serial. The connection is independent of which tab is showing,
+                # so the FC can be connected from the Logs tab too (format/ARM).
                 idx  = self.port_combo.currentIndex()
                 port = self.port_combo.itemData(idx) or self.port_combo.currentText().split()[0]
                 baud = int(self.baud_combo.currentText())
@@ -2580,7 +2642,6 @@ class MainWindow(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet(
                 f"background:{BAD}; color:#ffffff; border:1px solid #cc4444;")
-            self.tab_bar.setEnabled(False)   # no page switching mid-session
 
     def _start_hil(self):
         fake = self.hil_fake_check.isChecked()
@@ -2596,6 +2657,8 @@ class MainWindow(QMainWindow):
         delay_ms = float(self.hil_delay_spin.value())
         record_csv = self.hil_record_check.isChecked()
         compare_fake = (not fake) and self.hil_compare_check.isChecked()
+        full_flight = self.hil_full_check.isChecked()
+        pad_time = float(self.hil_pad_spin.value())
         port = ""
         self._clear_data()
         if seed_warning is not None:
@@ -2614,14 +2677,18 @@ class MainWindow(QMainWindow):
             f"seed={sensor_seed if sensor_seed is not None else 'auto'}, "
             f"delay={delay_ms:.0f} ms, "
             f"csv={'on' if record_csv else 'off'}, "
-            f"compare_fake={'on' if compare_fake else 'off'}")
+            f"compare_fake={'on' if compare_fake else 'off'}, "
+            f"full_flight={'on' if full_flight else 'off'}, "
+            f"pad_time={pad_time:.0f}s")
         self._hil_worker.configure(
             port, fake, speed,
             noise=self.hil_noise_check.isChecked(),
             record_csv=record_csv,
             compare_fake=compare_fake,
             sensor_seed=sensor_seed,
-            sensor_delay_ms=delay_ms)
+            sensor_delay_ms=delay_ms,
+            full_flight=full_flight,
+            pad_time=pad_time)
         self._hil_worker.start()
 
     def _start_radio(self):
@@ -2810,7 +2877,8 @@ class MainWindow(QMainWindow):
         return ("volume", entry.get("src"))
 
     def _confirm_dangerous_delete(self, title: str, body: str,
-                                  extra_warning: str = "") -> bool:
+                                  extra_warning: str = "",
+                                  phrase: str = _DELETE_CONFIRM_PHRASE) -> bool:
         lines = [
             body,
             "",
@@ -2820,14 +2888,14 @@ class MainWindow(QMainWindow):
             lines.extend(["", extra_warning])
         lines.extend([
             "",
-            f'Type exactly: "{_DELETE_CONFIRM_PHRASE}"',
+            f'Type exactly: "{phrase}"',
         ])
         QMessageBox.warning(self, title, "\n".join(lines))
         text, ok = QInputDialog.getText(
-            self, title, f'Type exactly:\n{_DELETE_CONFIRM_PHRASE}')
+            self, title, f'Type exactly:\n{phrase}')
         if not ok:
             return False
-        return text.strip() == _DELETE_CONFIRM_PHRASE
+        return text.strip() == phrase
 
     def _add_external_logs(self):
         """Copy .APXLOG files from anywhere on disk into the laptop archive."""
@@ -2859,51 +2927,6 @@ class MainWindow(QMainWindow):
         if folder:
             self.log_output_field.setText(folder)
 
-    def _find_mounted_apex_log_roots(self) -> list[Path]:
-        roots: list[Path] = []
-        candidates: list[Path] = []
-
-        if sys.platform == "darwin":
-            candidates.append(Path("/Volumes"))
-        elif os.name == "nt":
-            candidates.extend(Path(f"{letter}:/") for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-        else:
-            user = os.environ.get("USER", "")
-            candidates.extend([
-                Path("/media") / user,
-                Path("/run/media") / user,
-                Path("/mnt"),
-                Path("/media"),
-            ])
-
-        seen: set[Path] = set()
-        for base in candidates:
-            if not base.exists() or not base.is_dir():
-                continue
-            try:
-                children = list(base.iterdir()) if base.name not in ("APEX", "APEX-FLASH", "APEX-SD") else [base]
-            except OSError:
-                continue
-            for child in children:
-                possible = [child]
-                if child.name.upper() != "APEX":
-                    possible.append(child / "APEX")
-                for path in possible:
-                    try:
-                        resolved = path.resolve()
-                    except OSError:
-                        resolved = path
-                    if resolved in seen or not path.is_dir():
-                        continue
-                    try:
-                        has_logs = any(path.rglob("*.APXLOG"))
-                    except OSError:
-                        has_logs = False
-                    if path.name.upper() == "APEX" and has_logs:
-                        roots.append(path)
-                        seen.add(resolved)
-        return roots
-
     @staticmethod
     def _dedupe_path(dst: Path) -> Path:
         """Free destination path — appends _1, _2, … if dst already exists."""
@@ -2922,14 +2945,15 @@ class MainWindow(QMainWindow):
     #   volume: {"kind","name","size","src","root","source"}
     #   mtp:    {"kind","name","size","id","parent_id","storage_id","source"}
 
-    def _list_device_entries(self, progress) -> tuple[str, list[dict], str]:
+    def _list_device_entries(self, progress) -> tuple[str, list[dict], str, list[dict]]:
         """Worker-thread helper: list .APXLOG files present on the device.
-        libmtp first, mounted APEX volume fallback. Returns
-        (mode, entries, raw_mtp_listing)."""
+        libmtp only. Returns
+        (mode, entries, raw_mtp_listing, capacity rows)."""
 
         progress("Listing via libmtp (close OpenMTP first)…")
         code, listing = self._run_mtp_tool(["mtp-files"], timeout_s=30)
         if code == 0:
+            capacity = self._mtp_capacity(progress)
             entries = []
             for e in self._parse_mtp_files_output(listing):
                 entries.append({
@@ -2942,35 +2966,69 @@ class MainWindow(QMainWindow):
                     "source": "MTP device",
                 })
             if entries:
-                return "libmtp", entries, listing
-            progress("libmtp listed no APXLOG files — scanning mounted APEX volumes…")
+                return "libmtp", entries, listing, capacity
+            progress("libmtp listed no APXLOG files.")
+            return "libmtp", entries, listing, capacity
         else:
             mtp_error = listing if code is None else (
                 listing.strip() or f"mtp-files exited with status {code}")
-            progress("libmtp did not list files — scanning mounted APEX volumes…")
-
-        roots = self._find_mounted_apex_log_roots()
-        entries: list[dict] = []
-        for root in roots:
-            for src in sorted(root.rglob("*.APXLOG")):
-                try:
-                    size = src.stat().st_size
-                except OSError:
-                    size = None
-                entries.append({
-                    "kind": "volume",
-                    "name": str(src.relative_to(root)),
-                    "size": size,
-                    "src": str(src),
-                    "root": str(root),
-                    "source": f"volume {root.parent.name}",
-                })
-        if entries:
-            return "mounted volume", entries, ""
-
-        if code is None or code != 0:
+            progress("libmtp did not list files.")
             raise RuntimeError(mtp_error)
-        return "libmtp", entries, listing
+
+    def _mtp_capacity(self, progress) -> list[dict]:
+        """Read storage capacity/free-space from mtp-detect if available."""
+        code, out = self._run_mtp_tool(["mtp-detect"], timeout_s=30)
+        if code is None or code != 0:
+            progress("libmtp capacity unavailable — mtp-detect did not complete.")
+            return []
+        rows = self._parse_mtp_detect_capacity(out)
+        if not rows:
+            progress("libmtp capacity unavailable — mtp-detect did not report storage sizes.")
+        return rows
+
+    @staticmethod
+    def _parse_intish(value: str) -> int | None:
+        value = value.strip()
+        try:
+            return int(value, 0)
+        except ValueError:
+            return None
+
+    def _parse_mtp_detect_capacity(self, text: str) -> list[dict]:
+        rows: list[dict] = []
+        current: dict[str, object] | None = None
+
+        def finish_current():
+            if current and (current.get("total") is not None or current.get("free") is not None):
+                rows.append(dict(current))
+
+        for line in text.splitlines():
+            storage = re.search(r"\bStorage ID:\s*(0x[0-9a-fA-F]+|\d+)", line, re.IGNORECASE)
+            if storage:
+                finish_current()
+                current = {"storage_id": storage.group(1)}
+                continue
+
+            if current is None:
+                continue
+
+            desc = re.search(r"\b(?:Storage Description|StorageDescription):\s*(.+?)\s*$",
+                             line, re.IGNORECASE)
+            if desc:
+                current["name"] = desc.group(1).strip()
+
+            total = re.search(r"\b(?:Max Capacity|MaxCapacity):\s*(0x[0-9a-fA-F]+|\d+)",
+                              line, re.IGNORECASE)
+            if total:
+                current["total"] = self._parse_intish(total.group(1))
+
+            free = re.search(r"\b(?:Free Space.*?|FreeSpaceInBytes):\s*(0x[0-9a-fA-F]+|\d+)",
+                             line, re.IGNORECASE)
+            if free:
+                current["free"] = self._parse_intish(free.group(1))
+
+        finish_current()
+        return rows
 
     def _pull_entries(self, entries: list[dict], progress) -> dict:
         """Worker-thread helper: copy the given device entries into the local
@@ -3160,7 +3218,9 @@ class MainWindow(QMainWindow):
         return files
 
     def _mtp_archive_destination(self, entry: dict[str, object], archive: Path) -> Path:
-        filename = Path(str(entry.get("filename", "unknown.APXLOG"))).name
+        # The entry stores the device filename under "name" (see _list_device_entries);
+        # "filename" was never a key here, so every pull used to land as unknown.APXLOG.
+        filename = Path(str(entry.get("name") or entry.get("filename") or "unknown.APXLOG")).name
         storage = str(entry.get("storage_id") or "device").replace("/", "_").replace("\\", "_")
         parent = str(entry.get("parent_id") or "root").replace("/", "_").replace("\\", "_")
         return archive / "libmtp" / f"storage_{storage}" / f"parent_{parent}" / filename
@@ -3173,36 +3233,72 @@ class MainWindow(QMainWindow):
         self._set_log_decode_text(busy_msg)
         return True
 
-    def _enter_export_mode(self):
-        """Tell the flight computer to enter EXPORT_MODE over USB serial.
-
-        The current firmware only services MTP (log download) after this
-        command, and only accepts it in IDLE/LANDED. Uses the shared serial
-        link — the user connects on the Sensors tab; this just sends the line.
-        """
+    def _format_qspi_flash(self):
+        """Erase/reformat the flight computer QSPI flash via guarded serial command."""
         if not self._worker.isRunning():
             self._append_log_decode_text(
                 "Not connected over USB serial.\n"
-                "Connect to the flight computer on the Sensors tab first, then "
-                "click Enter Export Mode.")
-            self._log("[horizon] Enter Export Mode: connect serial on the "
-                      "Sensors tab first")
+                "Click Connect (this toolbar) to open the flight computer's USB "
+                "serial link, then format QSPI.")
+            self._log("[horizon] Format QSPI: connect to the flight computer first")
             return
-        self._worker.send_bytes(b"EXPORT_MODE\n")
+
+        local_index = self._local_log_index()
+        extra_parts: list[str] = []
+        if self._device_entries:
+            missing_local = [
+                entry for entry in self._device_entries
+                if self._find_local_copy_for_entry(entry, local_index) is None
+            ]
+            if missing_local:
+                names = "\n".join(
+                    f"  {e['name']} ({self._fmt_size(e.get('size'))})"
+                    for e in missing_local)
+                extra_parts.append(
+                    "WARNING: HORIZON cannot find local archive copies for "
+                    "these onboard files. Pull them to the laptop before "
+                    "formatting unless you are absolutely sure another copy "
+                    f"exists:\n{names}")
+        else:
+            extra_parts.append(
+                "WARNING: The Flight Computer file list is empty or stale. "
+                "Click Refresh if you want HORIZON to check for local archive "
+                "copies before formatting.")
+
+        extra_parts.append(
+            "This runs a full low-level erase of the entire QSPI NAND (every "
+            "block, not just the filesystem header), so it also clears any "
+            "block-level corruption. It wipes all APXLOG files and boot/flight "
+            "counters, then starts a fresh log session. The erase blocks the "
+            "flight computer for several seconds.")
+
+        if not self._confirm_dangerous_delete(
+            "Format QSPI flash",
+            "Full-erase and reformat the flight computer's QSPI flash?",
+            "\n\n".join(extra_parts),
+            phrase=_FORMAT_QSPI_CONFIRM_PHRASE):
+            self._set_log_decode_text("QSPI format canceled.")
+            return
+
+        self._worker.send_bytes(b"FORMAT_QSPI_ERASE_ALL\n")
         self._append_log_decode_text(
-            "Sent EXPORT_MODE. Watch the Sensors-tab log for "
-            "'#INFO: EXPORT_MODE active' (refused unless the FC is in "
-            "IDLE/LANDED), then click Refresh to list device files.")
-        self._log("[horizon] Sent EXPORT_MODE to flight computer")
+            "Sent FORMAT_QSPI_ERASE_ALL.\n"
+            "Watch the log panel for the firmware's proof line:\n"
+            "  '#INFO: QSPI erased — used N -> M KB of T KB ...'\n"
+            "M should be near-zero (a near-empty chip). Then click Refresh — "
+            "the Capacity readout should show used space dropped to almost "
+            "nothing and only the fresh BOOT_00001 session listed.")
+        self._log("[horizon] Sent QSPI low-level format command")
 
     def _refresh_device_files(self):
         """List .APXLOG files present on the flight computer — in the worker
         thread (mtp-files alone can block for tens of seconds)."""
 
         def job(progress):
-            mode, entries, listing = self._list_device_entries(progress)
+            mode, entries, listing, capacity = self._list_device_entries(progress)
             return {"kind": "device_list", "mode": mode,
-                    "entries": entries, "listing": listing}
+                    "entries": entries, "listing": listing,
+                    "capacity": capacity}
 
         self._start_log_job(job, "Listing files on flight computer…")
 
@@ -3217,6 +3313,33 @@ class MainWindow(QMainWindow):
                 if col == 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.device_table.setItem(i, col, item)
+
+    def _set_device_capacity(self, rows: list[dict] | None):
+        rows = rows or []
+        if not rows:
+            self.device_capacity_label.setText(
+                "Capacity: unavailable from device (QSPI nominal: 128 MiB / 1 Gbit)")
+            return
+        parts = []
+        for row in rows:
+            total = row.get("total")
+            free = row.get("free")
+            used = (total - free
+                    if isinstance(total, int) and isinstance(free, int)
+                    else None)
+            label = str(row.get("name") or row.get("storage_id") or "storage")
+            sid = row.get("storage_id")
+            if sid and sid != label:
+                label = f"{label} ({sid})"
+            if isinstance(total, int) and isinstance(free, int):
+                parts.append(
+                    f"{label}: {self._fmt_size(used)} used / {self._fmt_size(total)} total "
+                    f"({self._fmt_size(free)} free)")
+            elif isinstance(total, int):
+                parts.append(f"{label}: {self._fmt_size(total)} total")
+            elif isinstance(free, int):
+                parts.append(f"{label}: {self._fmt_size(free)} free")
+        self.device_capacity_label.setText("Capacity: " + "   |   ".join(parts))
 
     def _selected_device_entries(self) -> list[dict]:
         rows = sorted({idx.row() for idx in self.device_table.selectedIndexes()})
@@ -3252,13 +3375,15 @@ class MainWindow(QMainWindow):
         self._log_export_after_pull = export_after
 
         def job(progress):
-            mode, entries, listing = self._list_device_entries(progress)
+            mode, entries, listing, capacity = self._list_device_entries(progress)
             if not entries:
                 return {"kind": "pull", "mode": mode, "copied": [],
-                        "skipped": [], "listing": listing, "n_requested": 0}
+                        "skipped": [], "listing": listing, "n_requested": 0,
+                        "capacity": capacity}
             result = self._pull_entries(entries, progress)
             result["mode"] = mode
             result["listing"] = listing
+            result["capacity"] = capacity
             return result
 
         self._start_log_job(job, "Pulling logs from flight computer…")
@@ -3393,6 +3518,7 @@ class MainWindow(QMainWindow):
         if result["kind"] == "device_list":
             entries = result["entries"]
             self._populate_device_table(entries)
+            self._set_device_capacity(result.get("capacity"))
             lines = [f"Found {len(entries)} .APXLOG file(s) on the device "
                      f"via {result['mode']}."]
             if not entries and result["mode"] == "libmtp":
@@ -3405,6 +3531,8 @@ class MainWindow(QMainWindow):
 
         if result["kind"] == "pull":
             copied = result["copied"]
+            if "capacity" in result:
+                self._set_device_capacity(result.get("capacity"))
             lines = [
                 f"Pulled logs via {result['mode']}: "
                 f"copied {len(copied)} new/changed file(s), "
@@ -3493,7 +3621,6 @@ class MainWindow(QMainWindow):
     def _set_disconnected(self):
         self.connect_btn.setText("Connect")
         self.connect_btn.setStyleSheet("")
-        self.tab_bar.setEnabled(True)
 
     def _on_worker_finished(self):
         if (not self._worker.isRunning() and not self._radio_worker.isRunning()

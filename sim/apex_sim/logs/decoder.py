@@ -92,6 +92,7 @@ class DecodeStats:
     resync_bytes: int = 0
     truncated: int = 0
     unsupported: int = 0
+    duplicates: int = 0     # records dropped as (boot_id, seq) duplicates
     files: list[str] = field(default_factory=list)
 
     def merge(self, other: "DecodeStats") -> None:
@@ -102,6 +103,7 @@ class DecodeStats:
         self.resync_bytes += other.resync_bytes
         self.truncated += other.truncated
         self.unsupported += other.unsupported
+        self.duplicates += other.duplicates
         self.files.extend(other.files)
 
 
@@ -177,7 +179,22 @@ def decode_files(paths: Iterable[Union[Path, str]]) -> tuple[list[LogRecord], De
         all_records.extend(records)
         stats.merge(one)
     all_records.sort(key=lambda r: (r.boot_id, r.seq, r.time_ms, str(r.path), r.offset))
-    return all_records, stats
+
+    # De-duplicate by (boot_id, seq). seq is monotonic per boot, so the same
+    # record appearing in more than one file — the QSPI black box, the SD live
+    # log, and the post-landing SD dump can all contain it — collapses to one
+    # row. This lets the firmware mirror/dump to SD freely with no bookkeeping
+    # to avoid overlap; correctness is resolved here at decode.
+    deduped: list[LogRecord] = []
+    seen: set = set()
+    for rec in all_records:
+        key = (rec.boot_id, rec.seq)
+        if key in seen:
+            stats.duplicates += 1
+            continue
+        seen.add(key)
+        deduped.append(rec)
+    return deduped, stats
 
 
 def export_logs(paths: Iterable[Union[Path, str]], out_dir: Union[Path, str],

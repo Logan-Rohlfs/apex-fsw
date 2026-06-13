@@ -154,6 +154,7 @@ class TestFakeTeensyLoop:
         fake, link = fake_link
         assert link.wait_for_line("HIL_READY", timeout=3.0)
         em, pad = _pad_sensors()
+        pad = pad._replace(arm_switch=1)          # operator closes arm switches
         for i in range(60):                       # settle window is 50 packets
             link.send(i * 10, pad)
             time.sleep(0.001)
@@ -172,6 +173,7 @@ class TestFakeTeensyLoop:
         fake, link = fake_link
         assert link.wait_for_line("HIL_READY", timeout=3.0)
         em, pad = _pad_sensors()
+        pad = pad._replace(arm_switch=1)          # switches closed → will arm after settle
 
         # First packet must already get a reply, and it must read IDLE.
         first = link.transact(0, pad, timeout=1.0)
@@ -196,7 +198,7 @@ class TestFakeTeensyLoop:
         assert link.wait_for_line("HIL_READY", timeout=3.0)
         em = SensorEmulator(_isa_pressure, pad_elevation_m=0.0)
 
-        pad = em.pad_sensors()
+        pad = em.pad_sensors()._replace(arm_switch=1)
         sim_ms = 0
         for _ in range(60):
             link.send(sim_ms, pad)
@@ -216,7 +218,7 @@ class TestFakeTeensyLoop:
             vel += a * dt
             alt += vel * dt
             state = [0, 0, alt, 0, 0, vel, 1, 0, 0, 0, 0, 0, 0]
-            s = em.flight_sensors(state, np.array([0.0, 0.0, a]))
+            s = em.flight_sensors(state, np.array([0.0, 0.0, a]))._replace(arm_switch=1)
             reply = link.transact(sim_ms, s, timeout=0.5)
             assert reply is not None, f"no reply at t={t:.2f}"
             phases.add(protocol.PHASE_NAMES[reply.phase])
