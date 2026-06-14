@@ -76,7 +76,7 @@
 #define RADIO_XTAL_HZ       30000000UL
 #define RADIO_FREQ_HZ       441480000UL  // allocated center frequency: 441.480 MHz
 #define RADIO_CHANNEL_BW_HZ 125000UL     // allocated channel bandwidth: 125 kHz
-#define RADIO_MARKER_PA_PWR 0x30         // low bench marker power to avoid SDR overload
+#define RADIO_MARKER_PA_PWR 0x7F         // low bench marker power to avoid SDR overload
 
 // 2-GFSK downlink parameters. Carson bandwidth = 2*(dev + bitrate/2) = 60 kHz,
 // inside the 125 kHz allocation. Deviation is large vs. the ±4.4 kHz worst-case
@@ -118,13 +118,14 @@
 #define AUTO_ARM_DELAY_MS           10000
 
 // ─── Launch Detection ─────────────────────────────────────────────────────────
-// Primary: sustained accel (Seymour TX boost peaked at 14.1 g — 7× margin).
-// Backup: sustained baro climb, covers a dead accelerometer. Same dual-gate
-// scheme as commercial altimeters (TeleMetrum accel + baro launch detect).
+// Sustained accel starts a launch candidate and powers the servo rail. A
+// sustained 30 m barometric rise validates flight before burnout/airbrake
+// control may proceed. Baro can also detect and validate launch by itself.
 #define LAUNCH_ACCEL_THRESH_MSS     19.62f   // 2g
 #define LAUNCH_CONFIRM_MS           150
 #define LAUNCH_BARO_BACKUP_M        30.0f    // baro AGL backup gate
 #define LAUNCH_BARO_CONFIRM_MS      200
+#define LAUNCH_ABORT_CONFIRM_MS     500      // settled handling bump -> ARMED
 
 // ─── Burnout Detection ────────────────────────────────────────────────────────
 // Primary: axial specific force flips negative (−0.78 g early coast on the
@@ -180,9 +181,8 @@
 #define SERVO_MAX_DEG               180.0f
 #define SERVO_FULL_TRAVEL_S         0.24f    // 0% → 100% travel time
 #define SERVO_MAX_RATE_DEG_PER_S    (180.0f / SERVO_FULL_TRAVEL_S)
-// Smooth start-up sweep: servos pulse to center (~1500 µs) on attach(); sweep
-// from there to retracted over this time so the brake doesn't snap on boot.
-#define SERVO_INIT_SWEEP_MS         800
+#define SERVO_BOOT_TEST_FRAC        0.05f    // restrained rail-safe wiggle
+#define SERVO_BOOT_TEST_HOLD_MS     250
 
 // ─── Physical Constants ───────────────────────────────────────────────────────
 #define ROCKET_MASS_KG              30.44f
@@ -236,10 +236,6 @@
 #define REZERO_BARO_SAMPLES         50      // rolling average depth (~1s at 50Hz)
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
-#define LOG_RATE_IDLE_HZ            1
-#define LOG_RATE_ARMED_HZ           25
-#define LOG_RATE_BOOST_HZ           200
-#define LOG_RATE_COAST_HZ           100
 #define LOG_RATE_DESCENT_HZ         25
 #define LOG_RING_BUF_SECONDS        15      // high-rate pre-launch context depth
 
@@ -250,12 +246,23 @@
 #define LOG_PRELAUNCH_RING_HZ       20
 #define LOG_PAD_FILE_HZ             2
 #define LOG_FLIGHT_FILE_HZ          100     // fastest useful state/control rate
-#define LOG_FILE_FLUSH_INTERVAL_MS  1000     // QSPI black-box flush cadence
+// QSPI logging uses PJRC's supported LittleFS_QPINAND file path. The storage
+// layer still batches records into NAND-page-sized writes so the firmware does
+// not feed LittleFS a stream of tiny appends.
+// HIL-only escape hatch. Flight/debug builds still enforce "no log, no arm";
+// HIL can continue so sim/control tests are not blocked by storage bring-up.
+#define HIL_ALLOW_STORAGE_FAULT_ARM 1
+// QSPI NAND writes are staged into page-sized chunks before LittleFS writes.
+// This bounds the power-loss window for records that have not filled a page yet.
+#define LOG_FLASH_PAGE_BUFFER_BYTES 2048
+#define LOG_FLASH_FLUSH_INTERVAL_MS 5000
+#define LOG_FLASH_MAX_FAULTS        3        // suspend QSPI after this many consecutive failures
 // SD is only a mirror, and its FAT sync can stall 100s of ms (occasionally
 // >1 s) — flushing it every second was freezing the loop. Flush it rarely; the
-// post-apogee force-flush and the post-landing QSPI→SD dump still commit it.
+// post-landing QSPI→SD dump still commits the full log.
 #define LOG_SD_FLUSH_INTERVAL_MS    30000
-#define LOG_SD_POST_APOGEE_FLUSH_MS 10000    // one extra SD flush this long into DESCENT
+#define LOG_SD_MAX_FAULTS           1        // suspend live SD mirror after first fault
+#define LOG_SD_SLOW_DISABLE_US      250000   // or after one very slow write/flush
 
 // Debug-only storage diagnostics. The flight logger still runs normally; debug
 // builds only add a low-rate timing summary so SD/QSPI stalls are visible.

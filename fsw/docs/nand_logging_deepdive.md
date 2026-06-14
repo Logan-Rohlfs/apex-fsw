@@ -10,8 +10,8 @@ Status legend: [ ] todo  [~] in progress  [x] done
 ## Progress
 - [x] Quick fix: SD flush 1 s → 30 s (+ one-shot 10 s into DESCENT, + post-landing dump). config.h `LOG_SD_FLUSH_INTERVAL_MS`/`LOG_SD_POST_APOGEE_FLUSH_MS`, storage.cpp flush_logs decoupled flash/SD. Builds on all 3 envs.
 - [~] Deep-dive research (this file)
-- [ ] Reference design
-- [ ] Refactor
+- [x] Reference design
+- [x] Refactor: supported LittleFS_QPINAND logger + page-sized batching + SD slow-path mirror.
 
 ## Hardware facts (from this session)
 - Chip: Winbond **W25N01GVZEIG**, 1 Gbit (128 MiB) SPI NAND. On Teensy 4.1 it's
@@ -108,42 +108,57 @@ Our write pattern is near worst-case for LittleFS-on-NAND:
 This matches "it got worse as the system grew" (more record types + flushes).
 
 ## Reference design (clean, APEX-specific flash logger)
-Principle: feed LittleFS **page-aligned, batched** writes and flush on a bounded
-policy, not per-record. Keep one writer (main loop). Back off on faults.
+Principle: start from the known-good, PJRC-supported Teensy 4.1 path:
+`LittleFS_QPINAND` on QSPI NAND. Do not hand-drive FlexSPI/NAND commands in the
+flight logger until the supported path is proven inadequate. Keep one writer
+(main loop), batch records into NAND-page-sized writes, and back off on faults.
 
 1. **RAM page buffer (2048 B).** `storage_log_*` append serialized records into
-   a page buffer. When it reaches a full page, write the whole 2048 B to the
-   LittleFS file in one `write()` → full-page programs, ~zero amplification.
-2. **Bounded flush policy.** Flush (fsync) the file when (a) a page was just
-   written, or (b) a max interval elapsed (default **2 s**) — whichever first.
-   This bounds power-cut data loss to ≤ one partial page + 2 s, while removing
-   the per-second partial-page churn. Phase boundaries (BOOST entry, LANDED)
-   still force a flush.
-3. **Fault back-off.** Count consecutive `LFS_ERR_IO`/short writes; after N
-   (e.g. 5) suspend QSPI writes for the session (stop the repeated ~200 ms
-   freezes on a dead chip), latch `LOG_FAULT_FLASH_WRITE`, keep buzzer FAULT.
+   a 2048 B page buffer. Full buffers are written to the LittleFS APXLOG file in
+   one `File.write()`. Partial buffers are padded with `0xFF` on forced/bounded
+   flushes; the decoder already resynchronizes by APXL magic and skips padding.
+2. **Supported filesystem path.** Boot/flight counters and log files live in the
+   normal LittleFS volume, so QSPI remains visible over MTP and uses PJRC's
+   tested bad-block/ECC/wear-leveling behavior.
+3. **Fault back-off.** Count consecutive failed writes; after N suspend QSPI
+   writes for the session, latch `LOG_FAULT_FLASH_WRITE`, keep buzzer FAULT.
    Re-enabled only by reboot/format.
-4. **Single writer + MTP gate.** Never write the NAND from an ISR. Don't service
-   MTP while a high-rate log is mid-flight (or at least never inside a NAND op).
-5. **(Optional, bigger)** raw page-structured append log bypassing LittleFS for
-   the flight black box — eliminates FS write amplification entirely but loses
-   MTP/file access. Defer; revisit if batching is insufficient.
+4. **Single writer.** Never write the NAND from an ISR. `MTP.loop()` is only
+   serviced explicitly from the main loop (not from `yield()`), so no extra MTP
+   gate was added in this refactor.
+5. **SD policy.** SD remains a removable mirror, not a real-time control-path
+   dependency. It may receive quiet-phase live records, flushes every 30 s, and
+   gets the complete QSPI APXLOG dump after landing.
 
-Trade-off needing sign-off: batching introduces a **data-loss window** (records
-in the RAM page buffer not yet written). Default proposal bounds it to ≤ ~2 s +
-one partial page. Acceptable for a black box? (Flight rate fills a page in ~0.1 s
-so in-flight loss is tiny; IDLE loss is irrelevant.)
+Trade-off accepted: batching introduces a **data-loss window** (records in the
+RAM page buffer not yet written). The policy bounds it to ≤ ~5 s + one partial
+page. Flight rate fills a page quickly, so the in-flight window is usually much
+smaller; low-rate pad/idle loss is less important.
+
+## Format trade study
+- **Keep binary APXL records in LittleFS files (implemented):** APXL sample
+  records are ~154 B on the wire. Page batching adds only occasional `0xFF`
+  padding on forced/bounded flushes. This preserves MTP/offload compatibility and
+  uses PJRC's supported NAND stack while avoiding a stream of tiny appends.
+- **CSV/text on QSPI:** A comparable row is roughly 250-450 B depending on float
+  precision and UTC/detail fields, about 1.6-3x larger than binary. Formatting
+  floats also costs CPU in the main loop, and the larger stream fills pages/blocks
+  faster, so it causes more page programs and erases. It is more human-readable
+  but less consistent.
+- **Raw QSPI page journal:** removes filesystem overhead, but it hand-drives
+  FlexSPI/NAND commands and produced immediate program timeouts on hardware.
+  Park it until the supported LittleFS baseline is stable and measured.
 
 ## Refactor plan / where I left off
 DONE: SD flush decoupled to 30 s + post-apogee one-shot (config.h + storage.cpp).
-NEXT (the flash logger refactor):
-1. Add a 2048 B page buffer + append in `write_raw`/`write_record` (QSPI side).
-2. Replace per-write flush with the bounded policy (page-fill OR 2 s OR forced).
-3. Add the consecutive-fault back-off counter + suspend.
-4. Keep SD path as-is (mirror, already de-amplified by rare flush).
-5. Build all 3 envs; HIL flight on hardware; pull log, decode, verify integrity;
-   watch the debug `Storage dbg` line: flash max_us should drop and stay low,
-   no climbing latency, far fewer page programs.
+DONE: flash logger refactor:
+1. Replaced the raw FlexSPI/NAND path with PJRC-supported `LittleFS_QPINAND`.
+2. Kept APXL binary records as the payload schema so decoder/export semantics do
+   not change.
+3. Added page-sized QSPI batching plus consecutive-fault back-off.
+4. Kept SD as the quiet-phase live mirror plus post-landing full QSPI APXLOG dump.
+NEXT validation: HIL/bench run on hardware; watch `Storage dbg` for QSPI max_us
+and verify APXLOG files decode from both QSPI and SD.
 RESOLVED: MTP_Teensy does NOT register a yield/EventResponder hook — `MTP.loop()`
 is only invoked explicitly from the main loop. So the NAND `wait()`→`yield()`
 cannot re-enter MTP, and logging vs MTP are sequential (single-threaded). No

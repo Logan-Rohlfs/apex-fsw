@@ -50,6 +50,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _SIM_ROOT = Path(__file__).resolve().parents[1]
 _RAW_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs"
+_FC_LOG_ARCHIVE = _RAW_LOG_ARCHIVE / "flight_computer"
 _DELETED_LOG_ARCHIVE = _SIM_ROOT / "output" / "raw_logs_deleted"
 _DELETE_CONFIRM_PHRASE = "yes i really do want to delete these files"
 _FORMAT_QSPI_CONFIRM_PHRASE = "yes i really do want to format qspi flash"
@@ -140,6 +141,13 @@ HIL_PLOT_GROUPS = [
     ("Fake Shadow Delta", ["fake_delta_alt", "fake_delta_vel", "fake_delta_deployment"],
                           ["#ff44aa", "#44ffaa", "#ffaa44"]),
 ]
+
+HIL_EVENT_STYLES = {
+    "launch":          ("Launch", "#44dd88"),
+    "burnout":         ("Burnout", "#ff9933"),
+    "first_airbrake":  ("First airbrake", "#00d4ff"),
+    "apogee":          ("Apogee", "#ff44aa"),
+}
 
 # Flight-info reference values — mirror fsw/src/config.h / airbrakes.yaml
 TARGET_APOGEE_M = 3048.0    # 10,000 ft AGL
@@ -254,6 +262,7 @@ KNOWN_COMMANDS = [
     "ARM",
     "DISARM",
     "FORMAT_QSPI_ERASE_ALL",   # explicit GUI-confirmed QSPI erase/reformat
+    "LIST_LOGS",
     "RADIO_DATA_TEST",
     "RADIO_MARKER",
     "RADIO_MARKER_441",
@@ -606,6 +615,15 @@ class RadioWorker(QThread):
         emit(f">gps_lon:{t['gps_lon_deg']:.6f}")
         emit(f"!phase:{t['phase_name']}")
         emit(f"!health:{t['health']}")
+        emit(f"!airbrakes_authorized:{int(t['airbrakes_authorized'])}")
+        emit(f"!servo_powered:{int(t['servo_powered'])}")
+        emit(f"!arm_switches_closed:{int(t['arm_switches_closed'])}")
+        emit(f"!logging_ready:{int(t['logging_ready'])}")
+        emit(f"!gps_time_valid:{int(t['gps_time_valid'])}")
+        emit(f"!gps_healthy:{int(t['gps_healthy'])}")
+        emit(f"!radio_healthy:{int(t['radio_healthy'])}")
+        emit(f"!qspi_healthy:{int(t['qspi_healthy'])}")
+        emit(f"!sd_healthy:{int(t['sd_healthy'])}")
         emit(f"!gps_fix:{t['gps_fix']}")
         emit(f"!gps_sats:{t['gps_sats']}")
         emit("!radio:0")   # receiving telemetry proves the TX radio is alive
@@ -670,13 +688,16 @@ class HilWorker(QThread):
         self._sensor_delay_ms = 0.0
         self._full_flight = False
         self._pad_time = 6.0
+        self._post_landed_time = 5.0
         self._tick_count = 0
         self._last_gps_fix = 3   # receiver model starts locked on the pad
+        self._first_deployment_seen = False
 
     def configure(self, port: str, fake: bool, speed: float, noise: bool = True,
                   record_csv: bool = True, compare_fake: bool = False,
                   sensor_seed=None, sensor_delay_ms: float = 0.0,
-                  full_flight: bool = False, pad_time: float = 6.0):
+                  full_flight: bool = False, pad_time: float = 6.0,
+                  post_landed_time: float = 5.0):
         self._port = port
         self._fake = fake
         self._speed = speed
@@ -687,6 +708,7 @@ class HilWorker(QThread):
         self._sensor_delay_ms = sensor_delay_ms
         self._full_flight = full_flight
         self._pad_time = pad_time
+        self._post_landed_time = post_landed_time
 
     def stop(self):
         self._running = False
@@ -795,6 +817,17 @@ class HilWorker(QThread):
             if phase != last_phase[0]:
                 last_phase[0] = phase
                 lines.append(f"!phase:{phase}")
+                event = {
+                    "BOOST": "launch",
+                    "COAST": "burnout",
+                    "DESCENT": "apogee",
+                }.get(phase)
+                if event is not None:
+                    lines.append(f"!hil_event:{event}")
+            if (not self._first_deployment_seen
+                    and row.reply.deployment_frac > 0.005):
+                self._first_deployment_seen = True
+                lines.append("!hil_event:first_airbrake")
         # GPS fix state from the receiver model (drops >4 g, reacquires) —
         # emitted on change so the state-panel badge tracks boost blackouts.
         gps_fix = 3 if row.sensors.gps_valid else 0
@@ -828,6 +861,7 @@ class HilWorker(QThread):
     # ── session ───────────────────────────────────────────────────────────────
 
     def run(self):
+        self._first_deployment_seen = False
         self._running = True
         self._tick_count = 0
         self._last_gps_fix = 3
@@ -922,6 +956,7 @@ class HilWorker(QThread):
                 speed=self._speed, warmup_s=self._pad_time,
                 terminate_on_apogee=not self._full_flight,
                 max_time=600.0 if self._full_flight else 120.0,
+                post_landed_s=self._post_landed_time,
                 noise=self._noise,
                 sensor_kwargs=sensor_kwargs,
                 shadow_links=shadow_links,
@@ -1309,6 +1344,7 @@ class PlotGroupWidget(QGroupBox):
         self._dirty: set[str] = set()      # keys with data since last refresh
         self._last_window = window_s
         self._was_offscreen = False        # skipped while scrolled out / on another page
+        self._event_lines = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1400,6 +1436,30 @@ class PlotGroupWidget(QGroupBox):
         self._t0 = None
         self._last_push = None
         self._dirty.clear()
+        for line in self._event_lines:
+            self.plot.removeItem(line)
+        self._event_lines.clear()
+
+    def add_event(self, event_t: float, label: str, color: str):
+        """Add a labeled vertical event marker using the group's time axis."""
+        if self._t0 is None:
+            return
+        line = pg.InfiniteLine(
+            pos=event_t - self._t0,
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(color, width=1.25, style=Qt.DotLine),
+            label=label,
+            labelOpts={
+                "color": color,
+                "position": 0.92,
+                "fill": pg.mkBrush("#13132acc"),
+                "movable": False,
+            },
+        )
+        line.setZValue(20)
+        self.plot.addItem(line)
+        self._event_lines.append(line)
 
     def add_key(self, key: str, color: str = "#ffffff"):
         """Dynamically add a key not in the original definition."""
@@ -1535,6 +1595,45 @@ class StatePanel(QWidget):
             health_layout.addWidget(dot)
         layout.addWidget(health_box)
 
+        # System health occupies the upper nibble of the radio health byte.
+        # Keep it separate from physical sensors and hide it outside Radio mode.
+        self.system_health_box = QGroupBox("Systems")
+        system_health_layout = QHBoxLayout(self.system_health_box)
+        system_health_layout.setContentsMargins(6, 4, 6, 4)
+        system_health_layout.setSpacing(3)
+        self.system_health_dots: dict[str, QLabel] = {}
+        for name in ("GPS", "RAD", "QSPI", "SD"):
+            dot = QLabel(name)
+            dot.setAlignment(Qt.AlignCenter)
+            dot.setFont(mono_font(8, bold=True))
+            dot.setFixedSize(52, 22)
+            dot.setStyleSheet(badge_style("#444", TEXT_DIM))
+            self.system_health_dots[name] = dot
+            system_health_layout.addWidget(dot)
+        layout.addWidget(self.system_health_box)
+
+        # Operational flags share the upper five bits of phase_status.
+        self.radio_ops_box = QGroupBox("Flight Interlocks")
+        radio_ops_grid = QGridLayout(self.radio_ops_box)
+        radio_ops_grid.setContentsMargins(6, 4, 6, 4)
+        radio_ops_grid.setHorizontalSpacing(3)
+        radio_ops_grid.setVerticalSpacing(3)
+        self.radio_ops_dots: dict[str, QLabel] = {}
+        for i, (key, label) in enumerate((
+                ("airbrakes_authorized", "BRAKES"),
+                ("servo_powered", "SERVO"),
+                ("arm_switches_closed", "ARM SW"),
+                ("logging_ready", "LOG"),
+                ("gps_time_valid", "UTC"))):
+            dot = QLabel(label)
+            dot.setAlignment(Qt.AlignCenter)
+            dot.setFont(mono_font(8, bold=True))
+            dot.setMinimumSize(68, 22)
+            dot.setStyleSheet(badge_style("#444", TEXT_DIM))
+            self.radio_ops_dots[key] = dot
+            radio_ops_grid.addWidget(dot, i // 3, i % 3)
+        layout.addWidget(self.radio_ops_box)
+
         # Radio status
         radio_box = QGroupBox("Radio")
         radio_layout = QHBoxLayout(radio_box)
@@ -1660,6 +1759,12 @@ class StatePanel(QWidget):
             w.setVisible(mode == "radio")
         for w in self._link_hil_widgets:
             w.setVisible(mode == "hil")
+        self.system_health_box.setVisible(mode == "radio")
+        self.radio_ops_box.setVisible(mode == "radio")
+
+    @staticmethod
+    def _set_status_dot(dot: QLabel, ok: bool):
+        dot.setStyleSheet(badge_style(GOOD if ok else BAD))
 
     def update_phase(self, phase: str):
         phase = phase.strip().upper()
@@ -1694,6 +1799,10 @@ class StatePanel(QWidget):
             self._flight_labels[key].setText("—")
             self._flight_labels[key].setStyleSheet("color:#ffffff;")
         self.deploy_gauge.set_fraction(0.0)
+        for dot in self.system_health_dots.values():
+            dot.setStyleSheet(badge_style("#444", TEXT_DIM))
+        for dot in self.radio_ops_dots.values():
+            dot.setStyleSheet(badge_style("#444", TEXT_DIM))
 
     def _flush_flight(self):
         if self._flight_alt_m is not None:
@@ -1744,6 +1853,20 @@ class StatePanel(QWidget):
         elif key == "health":
             try:
                 self.update_health(int(value))
+            except ValueError:
+                pass
+        elif key in ("gps_healthy", "radio_healthy", "qspi_healthy", "sd_healthy"):
+            names = {
+                "gps_healthy": "GPS", "radio_healthy": "RAD",
+                "qspi_healthy": "QSPI", "sd_healthy": "SD",
+            }
+            try:
+                self._set_status_dot(self.system_health_dots[names[key]], int(value) != 0)
+            except ValueError:
+                pass
+        elif key in self.radio_ops_dots:
+            try:
+                self._set_status_dot(self.radio_ops_dots[key], int(value) != 0)
             except ValueError:
                 pass
         elif key == "gps_fix":
@@ -1817,6 +1940,7 @@ class MainWindow(QMainWindow):
         # Device file listing from the last Refresh (plain dicts — safe to
         # hand to the LogOpsWorker job closures)
         self._device_entries: list[dict] = []
+        self._visible_device_entries: list[dict] = []
         self._local_log_info_cache: dict[str, tuple[tuple[int, int], dict]] = {}
 
         # Debounced restart so gain/freq/ppm changes apply while connected
@@ -2015,20 +2139,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hil_delay_label)
         layout.addWidget(self.hil_delay_spin)
 
-        self.hil_pad_label = QLabel("Pad:")
+        self.hil_pad_label = QLabel("Pre:")
         self.hil_pad_spin = QDoubleSpinBox()
         self.hil_pad_spin.setRange(0.0, 1200.0)   # up to 20 min on the pad
         self.hil_pad_spin.setDecimals(0)
         self.hil_pad_spin.setSingleStep(5.0)
         self.hil_pad_spin.setValue(6.0)
         self.hil_pad_spin.setSuffix(" s")
-        self.hil_pad_spin.setFixedWidth(80)
+        self.hil_pad_spin.setFixedWidth(90)
         self.hil_pad_spin.setToolTip(
-            "Seconds the FC sits in IDLE on the pad (arm switches open) before\n"
-            "the switches close to arm and the flight begins. At 1x this is\n"
-            "real time — e.g. 600 = a 10-minute pad sit.")
+            "Seconds the FC sits on the pad with arm switches closed before\n"
+            "liftoff. The FC arms itself a few seconds in (its own\n"
+            "IDLE→ARMED gate) and then sits ARMED on real sensor data for\n"
+            "the rest of this time. At 1x this is real time — e.g. 1200 =\n"
+            "a 20-minute wait on the pad before launch.")
         layout.addWidget(self.hil_pad_label)
         layout.addWidget(self.hil_pad_spin)
+
+        self.hil_post_label = QLabel("Post:")
+        self.hil_post_spin = QDoubleSpinBox()
+        self.hil_post_spin.setRange(0.0, 1200.0)
+        self.hil_post_spin.setDecimals(0)
+        self.hil_post_spin.setSingleStep(5.0)
+        self.hil_post_spin.setValue(5.0)
+        self.hil_post_spin.setSuffix(" s")
+        self.hil_post_spin.setFixedWidth(80)
+        self.hil_post_spin.setToolTip(
+            "Seconds of stationary post-touchdown samples to stream after a\n"
+            "full-flight HIL landing. This exercises LANDED handling and\n"
+            "post-landing storage behavior.")
+        layout.addWidget(self.hil_post_label)
+        layout.addWidget(self.hil_post_spin)
 
         self.hil_record_check = QCheckBox("Record CSV")
         self.hil_record_check.setChecked(True)
@@ -2205,11 +2346,9 @@ class MainWindow(QMainWindow):
         device_layout.setContentsMargins(8, 6, 8, 8)
         device_layout.setSpacing(6)
         device_layout.addWidget(section_hint(
-            "Raw .APXLOG files on the Teensy's storage. The flight computer "
-            "serves files over USB (MTP) whenever it is connected — just click "
-            "Refresh. Refresh uses libmtp directly; mounted volumes are "
-            "intentionally ignored because macOS usually does not expose MTP "
-            "devices as drives."))
+            "Raw .APXLOG files on the Teensy's storage. Refresh lists the FC "
+            "over MTP and marks which files are already archived locally. Pull "
+            "actions skip archived files and only transfer missing APXLOGs."))
 
         self.device_capacity_label = QLabel("Capacity: —")
         self.device_capacity_label.setFont(mono_font(8))
@@ -2217,8 +2356,8 @@ class MainWindow(QMainWindow):
         self.device_capacity_label.setWordWrap(True)
         device_layout.addWidget(self.device_capacity_label)
 
-        self.device_table = QTableWidget(0, 3)
-        self.device_table.setHorizontalHeaderLabels(["File", "Size", "Source"])
+        self.device_table = QTableWidget(0, 4)
+        self.device_table.setHorizontalHeaderLabels(["File", "Size", "Local", "Source"])
         self.device_table.verticalHeader().setVisible(False)
         self.device_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.device_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2235,21 +2374,30 @@ class MainWindow(QMainWindow):
         refresh_device_btn.setFixedWidth(110)
         refresh_device_btn.clicked.connect(self._refresh_device_files)
         device_row.addWidget(refresh_device_btn)
+        device_row.addWidget(QLabel("Storage:"))
+        self.device_filter_combo = QComboBox()
+        self.device_filter_combo.addItem("All", "all")
+        self.device_filter_combo.addItem("QSPI", "qspi")
+        self.device_filter_combo.addItem("SD", "sd")
+        self.device_filter_combo.setFixedWidth(100)
+        self.device_filter_combo.currentIndexChanged.connect(
+            self._render_device_table)
+        device_row.addWidget(self.device_filter_combo)
         select_all_device_btn = QPushButton("Select All")
         select_all_device_btn.setFixedWidth(110)
         select_all_device_btn.clicked.connect(self.device_table.selectAll)
         device_row.addWidget(select_all_device_btn)
         device_row.addStretch()
-        pull_sel_btn = QPushButton("Pull Selected")
-        pull_sel_btn.setFixedWidth(130)
+        pull_sel_btn = QPushButton("Pull Selected Missing")
+        pull_sel_btn.setFixedWidth(170)
         pull_sel_btn.clicked.connect(self._pull_selected_device_files)
         device_row.addWidget(pull_sel_btn)
-        pull_all_btn = QPushButton("Pull All")
-        pull_all_btn.setFixedWidth(130)
+        pull_all_btn = QPushButton("Pull All Missing")
+        pull_all_btn.setFixedWidth(150)
         pull_all_btn.clicked.connect(lambda: self._pull_all_device_files(export_after=False))
         device_row.addWidget(pull_all_btn)
-        pull_all_export_btn = QPushButton("Pull All + Export")
-        pull_all_export_btn.setFixedWidth(130)
+        pull_all_export_btn = QPushButton("Pull Missing + Export")
+        pull_all_export_btn.setFixedWidth(180)
         pull_all_export_btn.clicked.connect(lambda: self._pull_all_device_files(export_after=True))
         device_row.addWidget(pull_all_export_btn)
         delete_device_btn = QPushButton("Delete Selected")
@@ -2308,8 +2456,9 @@ class MainWindow(QMainWindow):
         archive_row.addWidget(delete_local_btn)
         archive_layout.addLayout(archive_row)
         archive_layout.addWidget(section_hint(
-            "Files keep their on-board names; HORIZON reads APXLOG contents "
-            "and sorts this list by the first valid UTC timestamp in the data."))
+            "FC pulls are saved under output/raw_logs/flight_computer by "
+            "storage/parent/file name. HORIZON still recognizes older archive "
+            "copies anywhere under raw_logs and sorts by first valid UTC."))
 
         self.local_log_list = QListWidget()
         self.local_log_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2395,7 +2544,7 @@ class MainWindow(QMainWindow):
         self._log_action_buttons = [
             refresh_device_btn, select_all_device_btn, pull_sel_btn,
             pull_all_btn, pull_all_export_btn, delete_device_btn,
-            format_qspi_btn,
+            format_qspi_btn, self.device_filter_combo,
             refresh_archive_btn, select_all_btn, add_external_btn,
             delete_local_btn, export_sel_btn, export_all_btn,
         ]
@@ -2539,6 +2688,7 @@ class MainWindow(QMainWindow):
                        self.hil_seed_label, self.hil_seed_input,
                        self.hil_delay_label, self.hil_delay_spin,
                        self.hil_pad_label, self.hil_pad_spin,
+                       self.hil_post_label, self.hil_post_spin,
                        self.hil_record_check, self.hil_full_check):
             widget.setVisible(hil)
         self.hil_compare_check.setVisible(hil and not hil_fake)
@@ -2659,6 +2809,7 @@ class MainWindow(QMainWindow):
         compare_fake = (not fake) and self.hil_compare_check.isChecked()
         full_flight = self.hil_full_check.isChecked()
         pad_time = float(self.hil_pad_spin.value())
+        post_landed_time = float(self.hil_post_spin.value())
         port = ""
         self._clear_data()
         if seed_warning is not None:
@@ -2679,7 +2830,8 @@ class MainWindow(QMainWindow):
             f"csv={'on' if record_csv else 'off'}, "
             f"compare_fake={'on' if compare_fake else 'off'}, "
             f"full_flight={'on' if full_flight else 'off'}, "
-            f"pad_time={pad_time:.0f}s")
+            f"pre_launch={pad_time:.0f}s, "
+            f"post_landed={post_landed_time:.0f}s")
         self._hil_worker.configure(
             port, fake, speed,
             noise=self.hil_noise_check.isChecked(),
@@ -2688,7 +2840,8 @@ class MainWindow(QMainWindow):
             sensor_seed=sensor_seed,
             sensor_delay_ms=delay_ms,
             full_flight=full_flight,
-            pad_time=pad_time)
+            pad_time=pad_time,
+            post_landed_time=post_landed_time)
         self._hil_worker.start()
 
     def _start_radio(self):
@@ -2833,6 +2986,8 @@ class MainWindow(QMainWindow):
             if select_all or str(path.resolve()) in focus:
                 item.setSelected(True)
         self.local_log_list.blockSignals(False)
+        if hasattr(self, "device_table") and self._device_entries:
+            self._populate_device_table(self._device_entries)
         return len(infos)
 
     def _select_all_local_logs(self):
@@ -2854,14 +3009,57 @@ class MainWindow(QMainWindow):
             index.setdefault((path.name, size), []).append(path)
         return index
 
+    @staticmethod
+    def _safe_archive_part(value: object, fallback: str) -> str:
+        text = str(value or fallback).strip() or fallback
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+
+    def _entry_archive_path(self, entry: dict, archive: Path = _RAW_LOG_ARCHIVE) -> Path:
+        filename = Path(str(entry.get("name") or entry.get("filename") or "unknown.APXLOG")).name
+        if entry.get("kind") == "mtp":
+            storage = self._safe_archive_part(entry.get("storage_id"), "device")
+            parent = self._safe_archive_part(entry.get("parent_id"), "root")
+            return archive / "flight_computer" / f"storage_{storage}" / f"parent_{parent}" / filename
+
+        src = Path(str(entry.get("src", filename)))
+        root = Path(str(entry.get("root", src.parent)))
+        try:
+            rel = src.relative_to(root)
+        except ValueError:
+            rel = Path(filename)
+        volume = self._safe_archive_part(root.parent.name, "mounted_volume")
+        return archive / "flight_computer" / volume / rel
+
     def _find_local_copy_for_entry(self, entry: dict,
                                    index: dict[tuple[str, int], list[Path]] | None = None) -> Path | None:
         size = entry.get("size")
+        expected = self._entry_archive_path(entry)
+        if expected.exists():
+            if not isinstance(size, int) or expected.stat().st_size == size:
+                return expected
         if not isinstance(size, int):
             return None
         name = Path(str(entry.get("name", ""))).name
         matches = (index or self._local_log_index()).get((name, size), [])
         return matches[0] if matches else None
+
+    def _annotate_device_entries(self, entries: list[dict]) -> list[dict]:
+        local_index = self._local_log_index()
+        annotated: list[dict] = []
+        for entry in entries:
+            item = dict(entry)
+            archive_path = self._entry_archive_path(item)
+            local_copy = self._find_local_copy_for_entry(item, local_index)
+            item["archive_path"] = str(archive_path)
+            item["local_path"] = str(local_copy) if local_copy else ""
+            item["local_status"] = "archived" if local_copy else "missing"
+            annotated.append(item)
+        return annotated
+
+    def _missing_device_entries(self, entries: list[dict]) -> list[dict]:
+        local_index = self._local_log_index()
+        return [entry for entry in entries
+                if self._find_local_copy_for_entry(entry, local_index) is None]
 
     def _device_entry_matches_local_path(self, entry: dict, path: Path) -> bool:
         try:
@@ -2952,18 +3150,23 @@ class MainWindow(QMainWindow):
 
         progress("Listing via libmtp (close OpenMTP first)…")
         code, listing = self._run_mtp_tool(["mtp-files"], timeout_s=30)
+        mtp_failure = self._mtp_listing_failure(listing)
+        if mtp_failure:
+            progress("libmtp did not find a usable MTP device.")
+            raise RuntimeError(mtp_failure)
         if code == 0:
             capacity = self._mtp_capacity(progress)
             entries = []
             for e in self._parse_mtp_files_output(listing):
+                storage_id = e.get("storage_id")
                 entries.append({
                     "kind": "mtp",
                     "name": str(e.get("filename", e.get("id"))),
                     "size": e.get("size"),
                     "id": e.get("id"),
                     "parent_id": e.get("parent_id"),
-                    "storage_id": e.get("storage_id"),
-                    "source": "MTP device",
+                    "storage_id": storage_id,
+                    "source": self._mtp_storage_label(storage_id),
                 })
             if entries:
                 return "libmtp", entries, listing, capacity
@@ -2974,6 +3177,60 @@ class MainWindow(QMainWindow):
                 listing.strip() or f"mtp-files exited with status {code}")
             progress("libmtp did not list files.")
             raise RuntimeError(mtp_error)
+
+    @staticmethod
+    def _mtp_storage_label(storage_id: object) -> str:
+        try:
+            value = int(str(storage_id), 0)
+        except (TypeError, ValueError):
+            return f"MTP {storage_id or 'unknown'}"
+        store_index = (value >> 16) - 1
+        if store_index == 0:
+            return "APEX-FLASH (QSPI)"
+        if store_index == 1:
+            return "APEX-SD"
+        return f"MTP storage {storage_id}"
+
+    @staticmethod
+    def _mtp_listing_failure(text: str) -> str:
+        if not text:
+            return ""
+        interface_claim_failed = "libusb_claim_interface" in text
+        no_device = "No Devices have been found" in text
+        failure_patterns = [
+            "No Devices have been found",
+            "LIBMTP PANIC",
+            "Unable to open raw device",
+            "Unable to initialize device",
+            "libusb_claim_interface",
+        ]
+        if not any(pattern in text for pattern in failure_patterns):
+            return ""
+        if interface_claim_failed:
+            specific = [
+                "libmtp found the Teensy, but macOS/libusb refused to claim the MTP interface.",
+                "",
+                "Most likely another process has the MTP/PTP interface open. If HORIZON is connected over serial, click Disconnect before refreshing Logs; MTP does not need the serial link. Also close OpenMTP, Android File Transfer, Image Capture, Finder import windows, or any other camera/media-transfer app. If it still sticks, unplug the FC, wait a few seconds, plug it back in, and refresh again.",
+            ]
+        elif no_device:
+            specific = [
+                "libmtp did not see any MTP device.",
+                "",
+                "Make sure the FC is powered, the USB cable supports data, and the firmware was built with USB_MTPDISK_SERIAL.",
+            ]
+        else:
+            specific = [
+                "libmtp could not open the flight computer as an MTP device.",
+            ]
+        hints = [
+            *specific,
+            "",
+            "This is a USB/MTP connection failure, not an empty APXLOG folder.",
+            "",
+            "Raw mtp-files output:",
+            text.strip(),
+        ]
+        return "\n".join(hints)
 
     def _mtp_capacity(self, progress) -> list[dict]:
         """Read storage capacity/free-space from mtp-detect if available."""
@@ -3031,41 +3288,46 @@ class MainWindow(QMainWindow):
         return rows
 
     def _pull_entries(self, entries: list[dict], progress) -> dict:
-        """Worker-thread helper: copy the given device entries into the local
-        archive. Skips files already archived with a matching size."""
+        """Copy only device logs that are not already present locally."""
         archive = _RAW_LOG_ARCHIVE
-        archive.mkdir(parents=True, exist_ok=True)
+        _FC_LOG_ARCHIVE.mkdir(parents=True, exist_ok=True)
         copied: list[Path] = []
         skipped: list[str] = []
         errors: list[str] = []
         mode = "mounted volume"
         local_index = self._local_log_index()
+        pending: list[dict] = []
 
-        for i, entry in enumerate(entries):
-            progress(f"Pulling {entry['name']} ({i + 1}/{len(entries)})…")
+        for entry in entries:
             existing = self._find_local_copy_for_entry(entry, local_index)
             if existing is not None:
                 skipped.append(str(existing))
-                continue
+            else:
+                pending.append(entry)
+
+        if not pending:
+            progress("All selected FC logs are already archived locally; nothing to pull.")
+
+        for i, entry in enumerate(pending):
+            progress(f"Pulling missing log {entry['name']} ({i + 1}/{len(pending)})…")
+            dst = self._entry_archive_path(entry, archive)
+            dst.parent.mkdir(parents=True, exist_ok=True)
 
             if entry["kind"] == "volume":
                 src = Path(entry["src"])
-                root = Path(entry["root"])
-                dst = archive / root.parent.name / src.relative_to(root)
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if dst.exists() and dst.stat().st_size == src.stat().st_size:
-                    skipped.append(str(dst))
-                    continue
-                dst = self._dedupe_path(dst)
+                expected_size = entry.get("size")
+                if dst.exists():
+                    if isinstance(expected_size, int) and dst.stat().st_size == expected_size:
+                        skipped.append(str(dst))
+                        continue
+                    dst = self._dedupe_path(dst)
                 shutil.copy2(src, dst)
                 copied.append(dst)
                 local_index.setdefault((dst.name, dst.stat().st_size), []).append(dst)
                 continue
 
-            # MTP entry — mtp-getfile can block for minutes per file
+            # MTP entry — mtp-getfile can block for minutes per file.
             mode = "libmtp"
-            dst = self._mtp_archive_destination(entry, archive)
-            dst.parent.mkdir(parents=True, exist_ok=True)
             expected_size = entry.get("size")
             if dst.exists():
                 if isinstance(expected_size, int) and dst.stat().st_size == expected_size:
@@ -3087,6 +3349,12 @@ class MainWindow(QMainWindow):
                     f"{entry['name']}: "
                     f"{out.strip() or f'mtp-getfile exited with status {code}'}")
                 continue
+            if isinstance(expected_size, int) and tmp.stat().st_size != expected_size:
+                got = tmp.stat().st_size
+                tmp.unlink()
+                errors.append(
+                    f"{entry['name']}: downloaded {got} bytes, expected {expected_size}")
+                continue
             tmp.replace(dst)
             copied.append(dst)
             local_index.setdefault((dst.name, dst.stat().st_size), []).append(dst)
@@ -3094,7 +3362,8 @@ class MainWindow(QMainWindow):
         if errors:
             raise RuntimeError("Some MTP downloads failed:\n" + "\n".join(errors))
         return {"kind": "pull", "mode": mode, "copied": copied,
-                "skipped": skipped, "listing": "", "n_requested": len(entries)}
+                "skipped": skipped, "listing": "",
+                "n_requested": len(entries), "n_missing": len(pending)}
 
     def _trash_local_paths(self, paths: list[Path], progress) -> dict:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -3217,14 +3486,6 @@ class MainWindow(QMainWindow):
         finish_current()
         return files
 
-    def _mtp_archive_destination(self, entry: dict[str, object], archive: Path) -> Path:
-        # The entry stores the device filename under "name" (see _list_device_entries);
-        # "filename" was never a key here, so every pull used to land as unknown.APXLOG.
-        filename = Path(str(entry.get("name") or entry.get("filename") or "unknown.APXLOG")).name
-        storage = str(entry.get("storage_id") or "device").replace("/", "_").replace("\\", "_")
-        parent = str(entry.get("parent_id") or "root").replace("/", "_").replace("\\", "_")
-        return archive / "libmtp" / f"storage_{storage}" / f"parent_{parent}" / filename
-
     def _start_log_job(self, job, busy_msg: str) -> bool:
         if not self._log_ops.start_job(job):
             self._log("[horizon] A log operation is already running")
@@ -3284,15 +3545,21 @@ class MainWindow(QMainWindow):
         self._append_log_decode_text(
             "Sent FORMAT_QSPI_ERASE_ALL.\n"
             "Watch the log panel for the firmware's proof line:\n"
-            "  '#INFO: QSPI erased — used N -> M KB of T KB ...'\n"
-            "M should be near-zero (a near-empty chip). Then click Refresh — "
-            "the Capacity readout should show used space dropped to almost "
-            "nothing and only the fresh BOOT_00001 session listed.")
+            "  '#INFO: QSPI LittleFS erased — fresh BOOT_00001 ...'\n"
+            "Then click Refresh. APEX-FLASH should contain only the fresh "
+            "session; APEX-SD is not erased and may still list older logs.")
         self._log("[horizon] Sent QSPI low-level format command")
 
     def _refresh_device_files(self):
         """List .APXLOG files present on the flight computer — in the worker
         thread (mtp-files alone can block for tens of seconds)."""
+
+        # The table is only the latest mtp-files snapshot. Clear the previous
+        # snapshot while refreshing; never substitute laptop archive entries.
+        self._device_entries = []
+        self._visible_device_entries = []
+        self.device_table.clearContents()
+        self.device_table.setRowCount(0)
 
         def job(progress):
             mode, entries, listing, capacity = self._list_device_entries(progress)
@@ -3303,15 +3570,36 @@ class MainWindow(QMainWindow):
         self._start_log_job(job, "Listing files on flight computer…")
 
     def _populate_device_table(self, entries: list[dict]):
-        self._device_entries = entries
-        self.device_table.setRowCount(len(entries))
-        for i, entry in enumerate(entries):
+        self._device_entries = self._annotate_device_entries(entries)
+        self._render_device_table()
+
+    def _render_device_table(self, *_args):
+        mode = (self.device_filter_combo.currentData()
+                if hasattr(self, "device_filter_combo") else "all")
+        if mode == "qspi":
+            visible = [entry for entry in self._device_entries
+                       if entry.get("source") == "APEX-FLASH (QSPI)"]
+        elif mode == "sd":
+            visible = [entry for entry in self._device_entries
+                       if entry.get("source") == "APEX-SD"]
+        else:
+            visible = list(self._device_entries)
+
+        self._visible_device_entries = visible
+        self.device_table.clearContents()
+        self.device_table.setRowCount(len(visible))
+        for i, entry in enumerate(visible):
+            status = str(entry.get("local_status", "missing"))
             cells = [str(entry["name"]), self._fmt_size(entry.get("size")),
-                     str(entry.get("source", ""))]
+                     status, str(entry.get("source", ""))]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if col == 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if col == 2:
+                    item.setForeground(QColor(GOOD if status == "archived" else AMBER))
+                    tooltip = entry.get("local_path") or entry.get("archive_path") or ""
+                    item.setToolTip(str(tooltip))
                 self.device_table.setItem(i, col, item)
 
     def _set_device_capacity(self, rows: list[dict] | None):
@@ -3343,20 +3631,31 @@ class MainWindow(QMainWindow):
 
     def _selected_device_entries(self) -> list[dict]:
         rows = sorted({idx.row() for idx in self.device_table.selectedIndexes()})
-        return [self._device_entries[r] for r in rows
-                if 0 <= r < len(self._device_entries)]
+        return [self._visible_device_entries[r] for r in rows
+                if 0 <= r < len(self._visible_device_entries)]
 
     def _start_pull_job(self, entries: list[dict], export_after: bool):
-        """Pull the given device entries into the local archive — in the
-        worker thread. MTP transfers can take minutes; the UI thread must
-        never wait on them."""
+        """Pull missing copies of the given device entries into the archive."""
         self._log_export_after_pull = export_after
         snapshot = [dict(e) for e in entries]
+        missing = self._missing_device_entries(snapshot)
+        if not missing:
+            local_paths = [self._find_local_copy_for_entry(entry) for entry in snapshot]
+            focus_paths = [path for path in local_paths if path is not None]
+            self._set_log_decode_text(
+                f"All {len(snapshot)} selected FC log file(s) are already archived locally.\n"
+                f"Laptop archive: {_RAW_LOG_ARCHIVE}")
+            self._populate_device_table(self._device_entries)
+            self._refresh_local_log_choices(focus_paths=focus_paths or None)
+            if export_after:
+                self._log_export_after_pull = False
+                self._export_logs(summary_only=False, all_files=False)
+            return
 
         def job(progress):
             return self._pull_entries(snapshot, progress)
 
-        self._start_log_job(job, "Pulling logs from flight computer…")
+        self._start_log_job(job, f"Pulling {len(missing)} missing log(s) from flight computer…")
 
     def _pull_selected_device_files(self):
         entries = self._selected_device_entries()
@@ -3369,7 +3668,7 @@ class MainWindow(QMainWindow):
 
     def _pull_all_device_files(self, export_after: bool = False):
         if self._device_entries:
-            self._start_pull_job(self._device_entries, export_after)
+            self._start_pull_job(self._visible_device_entries, export_after)
             return
         # No Refresh yet — discover and pull everything in one job.
         self._log_export_after_pull = export_after
@@ -3379,11 +3678,12 @@ class MainWindow(QMainWindow):
             if not entries:
                 return {"kind": "pull", "mode": mode, "copied": [],
                         "skipped": [], "listing": listing, "n_requested": 0,
-                        "capacity": capacity}
+                        "n_missing": 0, "capacity": capacity, "entries": []}
             result = self._pull_entries(entries, progress)
             result["mode"] = mode
             result["listing"] = listing
             result["capacity"] = capacity
+            result["entries"] = entries
             return result
 
         self._start_log_job(job, "Pulling logs from flight computer…")
@@ -3519,24 +3819,43 @@ class MainWindow(QMainWindow):
             entries = result["entries"]
             self._populate_device_table(entries)
             self._set_device_capacity(result.get("capacity"))
+            missing = [e for e in self._device_entries if e.get("local_status") != "archived"]
+            qspi_count = sum(e.get("source") == "APEX-FLASH (QSPI)"
+                             for e in self._device_entries)
+            sd_count = sum(e.get("source") == "APEX-SD"
+                           for e in self._device_entries)
             lines = [f"Found {len(entries)} .APXLOG file(s) on the device "
-                     f"via {result['mode']}."]
+                     f"via {result['mode']}.",
+                     f"Device storage: QSPI={qspi_count}, SD={sd_count}",
+                     f"Local archive: {_RAW_LOG_ARCHIVE}",
+                     f"Already archived: {len(entries) - len(missing)}; missing: {len(missing)}"]
+            if missing:
+                lines.append("Missing on laptop:")
+                lines.extend(f"  {e['name']} ({self._fmt_size(e.get('size'))})"
+                             for e in missing[:20])
+                if len(missing) > 20:
+                    lines.append(f"  … {len(missing) - 20} more")
             if not entries and result["mode"] == "libmtp":
                 lines += ["", "libmtp connected but listed no .APXLOG files.",
                           "Raw mtp-files output:", result["listing"].strip()]
             self._append_log_decode_text("\n".join(lines))
-            self._log(f"[horizon] Device listing: {len(entries)} log file(s) "
-                      f"via {result['mode']}")
+            self._log(f"[horizon] Device listing: {len(entries)} log file(s), "
+                      f"{len(missing)} missing locally via {result['mode']}")
             return
 
         if result["kind"] == "pull":
             copied = result["copied"]
             if "capacity" in result:
                 self._set_device_capacity(result.get("capacity"))
+            if result.get("entries"):
+                self._populate_device_table(result["entries"])
+            else:
+                self._populate_device_table(self._device_entries)
             lines = [
                 f"Pulled logs via {result['mode']}: "
-                f"copied {len(copied)} new/changed file(s), "
-                f"skipped {len(result['skipped'])} existing",
+                f"copied {len(copied)} missing file(s), "
+                f"skipped {len(result['skipped'])} already archived",
+                f"Requested: {result.get('n_requested', 0)}; missing before pull: {result.get('n_missing', len(copied))}",
                 f"Laptop archive: {_RAW_LOG_ARCHIVE}",
             ]
             if copied:
@@ -3545,15 +3864,16 @@ class MainWindow(QMainWindow):
             elif result["mode"] == "libmtp" and not result["skipped"]:
                 lines += ["", "libmtp connected but listed no .APXLOG files.",
                           "Raw mtp-files output:", result["listing"].strip()]
+            else:
+                lines.append("No transfers needed; every requested FC log already has a local copy.")
             self._set_log_decode_text("\n".join(lines))
-            self._log(f"[horizon] Pulled {len(copied)} log file(s)")
-            # Select what just arrived (or everything if nothing new) so the
-            # follow-up export has inputs without stealing a manual selection.
-            self._refresh_local_log_choices(
-                select_all=not copied, focus_paths=copied or None)
+            self._log(f"[horizon] Pulled {len(copied)} missing log file(s), "
+                      f"skipped {len(result['skipped'])}")
+            focus_paths = copied or [Path(p) for p in result["skipped"]]
+            self._refresh_local_log_choices(focus_paths=focus_paths or None)
             if self._log_export_after_pull:
                 self._log_export_after_pull = False
-                self._export_logs(summary_only=False)
+                self._export_logs(summary_only=False, all_files=False)
             return
 
         if result["kind"] == "delete_local":
@@ -3681,7 +4001,12 @@ class MainWindow(QMainWindow):
             # State / flag
             try:
                 key, value = line[1:].split(":", 1)
-                self.state_panel.update_state(key.strip(), value.strip())
+                key = key.strip()
+                value = value.strip()
+                if key == "hil_event" and self._source_mode() == "hil":
+                    self._add_hil_event(value, t)
+                else:
+                    self.state_panel.update_state(key, value)
             except (ValueError, IndexError):
                 self._log(line)
 
@@ -3696,6 +4021,14 @@ class MainWindow(QMainWindow):
             self._plot_layout.insertWidget(self._plot_layout.count() - 1, self._overflow_group)
             self._plot_groups.append(self._overflow_group)
         return self._overflow_group
+
+    def _add_hil_event(self, event: str, t: float):
+        style = HIL_EVENT_STYLES.get(event)
+        if style is None:
+            return
+        label, color = style
+        for group in self._hil_groups:
+            group.add_event(t, label, color)
 
     # Log level → (color, bold)
     _LOG_STYLES = {

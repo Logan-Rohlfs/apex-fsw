@@ -10,10 +10,15 @@
 // Deployment gates (all must pass, see config.h "Airbrake Gates"):
 //   phase == COAST, ≥ POST_BURNOUT_LOCKOUT_MS after burnout, ascending,
 //   velocity < MACH_GATE_MPS, altitude > MIN_DEPLOY_ALT_M.
-// Brakes retract on DESCENT entry and hold position while gated in COAST.
+// Brakes command fully retracted on DESCENT entry and hold position while
+// gated in COAST.
 
 // Configure servo PWM and drive to the retracted position. Call from setup().
 void control_init();
+
+// Briefly power the actuator at boot, move 5% out and back, then disable its
+// dedicated power rail. This is a visible pre-installation health check.
+void control_boot_self_test();
 
 // Reset the controller to the fresh-flight condition: clears the PID
 // integral, the rate-limited deployment command, the dt anchor and the
@@ -24,14 +29,19 @@ void control_init();
 // suppresses u → late deployment and early close.
 void control_reset();
 
+// Immediately command and publish the fail-safe retracted position. This
+// bypasses the normal deployment rate limiter so the first DESCENT telemetry
+// sample cannot retain a stale deployed command. The servo remains powered.
+void control_safe_retract(uint32_t now_ms);
+
 // Run one control tick. Call at RATE_CONTROL_HZ from the main loop, after
 // flight_state_update(). Computes PID + gates, applies the servo rate limit,
 // writes g_state.control and the servo output.
 void control_update(uint32_t now_ms);
 
-// Arm/disarm the actuator. control_arm() powers the servo rail and smoothly
-// sweeps it to retracted (called from flight_state_arm); control_disarm()
-// retracts and unpowers it (called when leaving ARMED on the pad). Both reset
-// the PID state. Servo power stays off through the pad sit until ARM.
+// Prepare the actuator state. Arming leaves the dedicated servo rail off;
+// launch detection powers it and commands retracted. Disarming retracts and
+// removes power. The 12 V video rail is independent and remains on.
 void control_arm();
+void control_launch_detected(uint32_t now_ms);
 void control_disarm();

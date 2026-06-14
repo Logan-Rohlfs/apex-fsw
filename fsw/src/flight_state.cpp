@@ -35,6 +35,7 @@ const char* phase_name(FlightPhase p) {
 // never advance a phase.
 static uint32_t _launch_since      = 0;
 static uint32_t _launch_baro_since = 0;
+static uint32_t _launch_abort_since = 0;
 static uint32_t _burnout_since     = 0;
 static uint32_t _apogee_since      = 0;
 static uint32_t _apogee_baro_since = 0;
@@ -68,7 +69,8 @@ static bool confirm(uint32_t now_ms, uint32_t& since_ms, bool cond,
 }
 
 static void reset_windows() {
-    _launch_since = _launch_baro_since = _burnout_since = 0;
+    _launch_since = _launch_baro_since = _launch_abort_since = 0;
+    _burnout_since = 0;
     _apogee_since = _apogee_baro_since = _landed_since = 0;
     _max_alt_agl  = 0.0f;
     _ring_idx = 0; _ring_full = false; _ring_last_ms = 0;
@@ -78,7 +80,12 @@ static void reset_windows() {
 static void enter(FlightPhase p, uint32_t now_ms, const char* how) {
     g_state.phase          = p;
     g_state.phase_entry_ms = now_ms;
-    if (p == FlightPhase::BOOST) {
+    if (p == FlightPhase::DESCENT) {
+        // Apogee is a hard actuator boundary: command the safe position now,
+        // without leaving one rate-limited packet at the prior deployment.
+        control_safe_retract(now_ms);
+    }
+    if (p == FlightPhase::BOOST && g_state.airbrakes_enabled) {
         storage_begin_flight(now_ms, how);
     } else {
         storage_log_event(LOG_EVENT_PHASE, how);
@@ -99,16 +106,21 @@ bool flight_state_arm(uint32_t now_ms) {
     }
     if (!storage_logging_ready()) {
         storage_log_event(LOG_EVENT_STORAGE_FAULT, "arm refused: logging not ready");
+#if defined(APEX_HIL) && HIL_ALLOW_STORAGE_FAULT_ARM
+        (void)now_ms;
+#else
         LOG_ERROR("ARM refused: logging storage not ready");
         return false;
+#endif
     }
     if (!board_switches_armed()) {
         LOG_WARN("ARM refused: arm switches not closed");
         return false;
     }
     reset_windows();
+    g_state.airbrakes_enabled = false;
     fusion_on_armed();
-    control_arm();     // power servo + smooth retract; clears PID state
+    control_arm();     // clear PID state; servo rail stays off until launch
     g_state.phase          = FlightPhase::ARMED;
     g_state.phase_entry_ms = now_ms;
     storage_log_event(LOG_EVENT_ARMED, "armed");
@@ -125,6 +137,7 @@ void flight_state_reset(uint32_t now_ms) {
     g_state.phase           = FlightPhase::IDLE;
     g_state.phase_entry_ms  = now_ms;
     g_state.burnout_time_ms = 0;
+    g_state.airbrakes_enabled = false;
     // Drop the pad reference so fusion's auto pad capture runs again from a
     // fresh 50-sample baro average (fusion_init() preserves a non-zero pad
     // reference across warm restarts — clear it first).
@@ -138,6 +151,7 @@ void flight_state_reset(uint32_t now_ms) {
 void flight_state_disarm() {
     if (g_state.phase == FlightPhase::ARMED) {
         g_state.phase = FlightPhase::IDLE;
+        g_state.airbrakes_enabled = false;
         reset_windows();
         control_disarm();   // retract + unpower servo
         storage_log_event(LOG_EVENT_DISARMED, "disarmed");
@@ -150,6 +164,9 @@ void flight_state_update(uint32_t now_ms) {
     const float ax      = g_state.imu.accel_x_mss;
     const float ay      = g_state.imu.accel_y_mss;
     const float az      = g_state.imu.accel_z_mss;
+    const float gx      = g_state.imu.gyro_x_rads;
+    const float gy      = g_state.imu.gyro_y_rads;
+    const float gz      = g_state.imu.gyro_z_rads;
     const float baro_pa = g_state.baro.pressure_pa;
     const float vel     = g_state.fused.velocity_mps;
     interrupts();
@@ -159,6 +176,7 @@ void flight_state_update(uint32_t now_ms) {
         ? pressure_to_alt_msl(baro_pa) - g_state.pad_altitude_msl_m
         : 0.0f;
     const float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
+    const float gyro_mag  = sqrtf(gx * gx + gy * gy + gz * gz);
 
     if (baro_agl > _max_alt_agl) _max_alt_agl = baro_agl;
 
@@ -203,12 +221,56 @@ void flight_state_update(uint32_t now_ms) {
             const bool bar = confirm(now_ms, _launch_baro_since,
                 pad_ready && baro_agl > LAUNCH_BARO_BACKUP_M,
                 LAUNCH_BARO_CONFIRM_MS);
-            if (acc || bar)
-                enter(FlightPhase::BOOST, now_ms, acc ? "accel" : "baro backup");
+            if (acc || bar) {
+                // Acceleration wakes the actuator, but only a sustained 30 m
+                // barometric rise authorizes airbrake-capable flight. A hard
+                // handling bump therefore cannot progress into COAST/control.
+                g_state.airbrakes_enabled = bar;
+                control_launch_detected(now_ms);
+                enter(FlightPhase::BOOST, now_ms,
+                      bar ? "baro validated" : "accel candidate");
+            }
             break;
         }
 
         case FlightPhase::BOOST: {
+            if (!g_state.airbrakes_enabled) {
+                if (!board_switches_armed()) {
+                    reset_windows();
+                    control_disarm();
+                    g_state.phase = FlightPhase::IDLE;
+                    g_state.phase_entry_ms = now_ms;
+                    storage_log_event(LOG_EVENT_DISARMED,
+                                      "launch candidate disarmed");
+                    break;
+                }
+                const bool validated = confirm(now_ms, _launch_baro_since,
+                    pad_ready && baro_agl > LAUNCH_BARO_BACKUP_M,
+                    LAUNCH_BARO_CONFIRM_MS);
+                const bool stationary = confirm(now_ms, _launch_abort_since,
+                    accel_mag >= REZERO_ACCEL_MIN_MSS &&
+                    accel_mag <= REZERO_ACCEL_MAX_MSS &&
+                    gyro_mag <= REZERO_GYRO_MAX_RADS,
+                    LAUNCH_ABORT_CONFIRM_MS);
+
+                if (validated) {
+                    g_state.airbrakes_enabled = true;
+                    _burnout_since = 0;
+                    storage_begin_flight(now_ms, "baro validated");
+                    LOG_INFO("Launch validated at %.1f m AGL", baro_agl);
+                } else if (stationary) {
+                    // Candidate was handling shock, not flight. Re-establish
+                    // the pad reference and return to armed standby.
+                    reset_windows();
+                    fusion_on_armed();
+                    control_arm();
+                    g_state.phase = FlightPhase::ARMED;
+                    g_state.phase_entry_ms = now_ms;
+                    storage_log_event(LOG_EVENT_PHASE, "launch candidate rejected");
+                    LOG_WARN("Launch candidate rejected — vehicle stationary");
+                }
+                break;
+            }
             const bool acc = confirm(now_ms, _burnout_since,
                 ax < 0.0f, BURNOUT_CONFIRM_MS);
             const bool timeout =

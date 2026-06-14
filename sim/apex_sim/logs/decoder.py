@@ -6,6 +6,7 @@ import csv
 import json
 import shutil
 import struct
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Iterable, Iterator, Optional, Union
 
 MAGIC = 0x4C585041  # "APXL" little-endian
 VERSION = 1
+RAW_PAGE_MAGIC = 0x52585041  # "APXR" little-endian
+RAW_PAGE_VERSION = 1
 
 REC_BOOT = 1
 REC_EVENT = 2
@@ -45,6 +48,7 @@ PHASE_NAMES = {
 }
 
 HEADER = struct.Struct("<IBBHIIIIH")
+RAW_PAGE = struct.Struct("<IHHIIIIHHI")
 BOOT_V1 = struct.Struct("<IIIIIIIIIIIB3x")
 BOOT_V0 = struct.Struct("<IIIIIIB3x")
 EVENT = struct.Struct("<BBBBH48s")
@@ -93,6 +97,7 @@ class DecodeStats:
     truncated: int = 0
     unsupported: int = 0
     duplicates: int = 0     # records dropped as (boot_id, seq) duplicates
+    raw_pages: int = 0
     files: list[str] = field(default_factory=list)
 
     def merge(self, other: "DecodeStats") -> None:
@@ -104,6 +109,7 @@ class DecodeStats:
         self.truncated += other.truncated
         self.unsupported += other.unsupported
         self.duplicates += other.duplicates
+        self.raw_pages += other.raw_pages
         self.files.extend(other.files)
 
 
@@ -122,6 +128,7 @@ def decode_file(path: Union[Path, str]) -> tuple[list[LogRecord], DecodeStats]:
     path = Path(path)
     data = path.read_bytes()
     stats = DecodeStats(bytes_read=len(data), files=[str(path)])
+    data = _unwrap_raw_pages(data, stats)
     records: list[LogRecord] = []
     i = 0
     while i + HEADER.size <= len(data):
@@ -169,6 +176,39 @@ def decode_file(path: Union[Path, str]) -> tuple[list[LogRecord], DecodeStats]:
         stats.records += 1
         i += total
     return records, stats
+
+
+def _unwrap_raw_pages(data: bytes, stats: DecodeStats) -> bytes:
+    if len(data) < RAW_PAGE.size:
+        return data
+    first_magic = struct.unpack_from("<I", data, 0)[0]
+    if first_magic != RAW_PAGE_MAGIC:
+        return data
+
+    payload = bytearray()
+    page_size = 2048
+    for offset in range(0, len(data) - RAW_PAGE.size + 1, page_size):
+        page = data[offset:offset + page_size]
+        if page[:16] == b"\xff" * 16:
+            break
+        (magic, version, header_size, _boot_id, _flight_id, _page_seq,
+         _time_ms, payload_len, _flags, crc32) = RAW_PAGE.unpack_from(page, 0)
+        if magic != RAW_PAGE_MAGIC:
+            break
+        if version != RAW_PAGE_VERSION or header_size != RAW_PAGE.size:
+            stats.bad_version += 1
+            break
+        if payload_len > page_size - header_size:
+            stats.truncated += 1
+            break
+        check = bytearray(page[:header_size + payload_len])
+        struct.pack_into("<I", check, RAW_PAGE.size - 4, 0)
+        if zlib.crc32(check) & 0xFFFFFFFF != crc32:
+            stats.bad_crc += 1
+            break
+        payload.extend(page[header_size:header_size + payload_len])
+        stats.raw_pages += 1
+    return bytes(payload)
 
 
 def decode_files(paths: Iterable[Union[Path, str]]) -> tuple[list[LogRecord], DecodeStats]:

@@ -56,6 +56,18 @@ FLIGHT_STRUCT = struct.Struct("<6sHBBbBff7hBHb")   # 38 bytes
 HK_STRUCT = struct.Struct("<H3h3h2hH")             # 20 bytes
 PHASE_NAMES = ("IDLE", "ARMED", "BOOST", "COAST", "DESCENT", "LANDED")
 
+PHASE_MASK = 0x07
+STATUS_AIRBRAKES_OK = 1 << 3
+STATUS_SERVO_POWER = 1 << 4
+STATUS_ARM_SWITCHES = 1 << 5
+STATUS_LOGGING_READY = 1 << 6
+STATUS_GPS_TIME_VALID = 1 << 7
+
+HEALTH_GPS = 1 << 4
+HEALTH_RADIO = 1 << 5
+HEALTH_QSPI = 1 << 6
+HEALTH_SD = 1 << 7
+
 BODY_LEN_BY_TYPE = {
     FRAME_TYPE_TEST: 1 + PAYLOAD_LEN,        # seq + ASCII payload
     FRAME_TYPE_FLIGHT: FLIGHT_STRUCT.size,
@@ -65,15 +77,26 @@ MIN_BODY_LEN = min(BODY_LEN_BY_TYPE.values())
 
 
 def parse_flight(body: bytes) -> dict:
-    (callsign, seq, phase, health, gps_fix, gps_sats, lat, lon,
+    (callsign, seq, phase_status, health, gps_fix, gps_sats, lat, lon,
      gps_alt, alt, vel, apogee, vacc, accel_z, roll, deploy,
      baro2, btemp) = FLIGHT_STRUCT.unpack(body)
+    phase = phase_status & PHASE_MASK
     return {
         "callsign": callsign.decode("ascii", "replace").strip("\x00 "),
         "seq": seq,
         "phase": phase,
         "phase_name": PHASE_NAMES[phase] if phase < len(PHASE_NAMES) else "UNKNOWN",
+        "phase_status": phase_status,
+        "airbrakes_authorized": bool(phase_status & STATUS_AIRBRAKES_OK),
+        "servo_powered": bool(phase_status & STATUS_SERVO_POWER),
+        "arm_switches_closed": bool(phase_status & STATUS_ARM_SWITCHES),
+        "logging_ready": bool(phase_status & STATUS_LOGGING_READY),
+        "gps_time_valid": bool(phase_status & STATUS_GPS_TIME_VALID),
         "health": health,
+        "gps_healthy": bool(health & HEALTH_GPS),
+        "radio_healthy": bool(health & HEALTH_RADIO),
+        "qspi_healthy": bool(health & HEALTH_QSPI),
+        "sd_healthy": bool(health & HEALTH_SD),
         "gps_fix": gps_fix,
         "gps_sats": gps_sats,
         "gps_lat_deg": lat,

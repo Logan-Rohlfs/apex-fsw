@@ -62,8 +62,9 @@ void setup() {
     led_init();
     const uint8_t sto_health = storage_init();
     // LOG_* are no-ops in the HIL build, so storage_init()'s mount errors are
-    // otherwise silent. Surface health here: QSPI=0 means no black box opened
-    // (no APXLOG file will exist), and logging_ready=0 means HIL will never arm.
+    // otherwise silent. Surface health here: QSPI=0 means no black box APXLOG
+    // opened, and logging_ready=0 means HIL will never arm unless the HIL
+    // override is enabled.
     Serial.printf("#INFO: storage health=0x%02X QSPI=%d SD=%d boot_id=%lu logging_ready=%d\n",
                   sto_health,
                   (sto_health & STORAGE_OK_FLASH) ? 1 : 0,
@@ -130,6 +131,7 @@ void setup() {
 
     radio_init();
     control_init();
+    control_boot_self_test();
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
 
@@ -241,9 +243,15 @@ void loop() {
                 if (g_state.pad_pressure_pa <= 0.0f) {
                     Serial.println("#INFO: HIL IDLE — capturing pad reference (baro settling)");
                 } else if (!storage_logging_ready()) {
+#if HIL_ALLOW_STORAGE_FAULT_ARM
+                    Serial.printf("#WARN: HIL storage fault override active — continuing despite "
+                                  "health=0x%02X faults=0x%04X\n",
+                                  storage_health(), storage_faults());
+#else
                     Serial.printf("#WARN: HIL cannot arm — 'no log, no arm': storage "
                                   "not ready (QSPI primary required). health=0x%02X faults=0x%04X\n",
                                   storage_health(), storage_faults());
+#endif
                 } else if (millis() < AUTO_ARM_DELAY_MS) {
                     Serial.printf("#INFO: HIL IDLE — auto-arm in %lu ms\n",
                                   (unsigned long)(AUTO_ARM_DELAY_MS - millis()));
@@ -432,6 +440,8 @@ void loop() {
                     } else {
                         Serial.println("#ERROR: FORMAT_QSPI_ERASE_ALL failed — QSPI flash not healthy");
                     }
+                } else if (strcmp(_cmd_buf, "LIST_LOGS") == 0) {
+                    storage_print_log_directory(millis());
                 }
 #ifdef APEX_DEBUG
                 else if (strcmp(_cmd_buf, "RADIO_MARKER") == 0 ||

@@ -85,6 +85,8 @@ def main():
                     help="fly through descent + landing (default: stop at "
                          "apogee). Adds a post-landing static tail so LANDED "
                          "fires and the post-landing QSPI→SD dump runs")
+    ap.add_argument("--post-landed-time", type=float, default=5.0,
+                    help="seconds of stationary samples after touchdown during --full")
     ap.add_argument("--no-noise", action="store_true",
                     help="disable the per-sensor noise model (deterministic run)")
     ap.add_argument("--sensor-seed", type=int, default=None,
@@ -160,7 +162,7 @@ def main():
             sys.exit(1)
         print(f"{GRN}Flight computer ready.{RESET}  On the pad "
               f"({args.pad_time:.0f} s, switches open) then arming"
-              f"{' — full flight through landing' if args.full else ''}...")
+              f"{f' — full flight through landing + {args.post_landed_time:.0f}s tail' if args.full else ''}...")
 
         if args.compare_fake:
             from apex_sim.hil.fake_teensy import FakeTeensy
@@ -197,6 +199,7 @@ def main():
             airbrakes_cfg=airbrakes_cfg,
             speed=args.speed, warmup_s=args.pad_time,
             terminate_on_apogee=not args.full, max_time=max_time,
+            post_landed_s=args.post_landed_time,
             noise=not args.no_noise,
             sensor_kwargs=_sensor_kwargs(args),
             shadow_links=shadow_links,

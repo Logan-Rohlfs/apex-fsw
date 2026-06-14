@@ -71,13 +71,22 @@ def warm_up(link: HilLink, emulator: SensorEmulator,
             shadow_links: Optional[Dict[str, HilLink]] = None,
             result: "Optional[HilResult]" = None,
             tick_cb: Optional[Callable] = None) -> int:
-    """Sit on the pad with arm switches OPEN, then CLOSE them to arm.
+    """Sit on the pad with arm switches CLOSED for ``duration_s``, then launch.
 
-    This mirrors the real launch sequence with no HIL-specific arming: the FC
-    sits in IDLE on the pad (capturing its baro pad reference and converging the
-    Mahony filter) while the arm switches are open, exactly as during pad ops.
-    After ``duration_s`` of pad time we close the switches (HIL_ARM_SWITCH_BIT),
-    and the FC's normal IDLE→ARMED gate fires — same code as flight.
+    Mirrors the real sequence: the operator closes the arm switches during pad
+    setup, walks away (no comms), and the rocket launches on its own schedule
+    later. So switches close from tick 0 — the FC's normal IDLE→ARMED gate
+    (``board_switches_armed() && pad_ready && now_ms >= AUTO_ARM_DELAY_MS``,
+    same code as flight) fires on its own a few seconds in, and the FC then
+    sits ARMED on the pad — fed a live, jittering stationary sensor feed (with
+    noise, if enabled) — for the rest of ``duration_s`` before the RocketPy
+    trajectory (liftoff) begins. Nothing here predicts or schedules the arm;
+    it's the FC's own gate reacting to real injected data.
+
+    If ``duration_s`` is shorter than the FC's boot-settle delay, we keep
+    sending pad data past it (up to ``arm_timeout`` extra seconds) until the FC
+    genuinely reports ARMED — a real board wouldn't launch before it arms
+    either.
 
     Pad ticks are streamed at 100 Hz and (if ``result`` is given) recorded as
     HilRows with negative ``t_s`` (time-to-launch), so the on-pad period appears
@@ -85,10 +94,8 @@ def warm_up(link: HilLink, emulator: SensorEmulator,
     the binary flight log throughout, so a HIL log carries real pad context.
 
     Returns the last sim_time_ms sent (the flight phase continues from it).
-    Raises RuntimeError if the FC never reports ARMED after the switches close.
+    Raises RuntimeError if the FC never reports ARMED.
     """
-    pad_open = emulator.pad_sensors(rail_inclination_deg, rail_heading_deg)
-    pad_armed = pad_open._replace(arm_switch=1)   # switches closed
     shadows = shadow_links or {}
     wall0 = time.monotonic()
     pad_ticks = max(int(duration_s * 100), 0)
@@ -117,22 +124,35 @@ def warm_up(link: HilLink, emulator: SensorEmulator,
         state["sim_ms"] = state["i"] * 10
         return reply
 
-    # Phase 1 — pad sit with switches OPEN. The FC stays IDLE (it cannot arm
-    # without the switches), capturing its pad reference and converging fusion.
-    for _ in range(pad_ticks):
-        _tick(pad_open)
+    def _pad_tick() -> Optional[TeensyPkt]:
+        sensors = emulator.pad_sensors(
+            rail_inclination_deg, rail_heading_deg)._replace(arm_switch=1)
+        return _tick(sensors)
 
-    # Phase 2 — close the switches; the FC's real IDLE→ARMED gate now fires.
-    deadline = time.monotonic() + arm_timeout
+    # Pad sit with switches CLOSED for the whole duration. Each tick draws a
+    # fresh stationary reading (with noise, if enabled) — a real FC sees a
+    # live, jittering sensor feed on the pad, not one frozen frame replayed.
     armed = False
     last_phase = None
-    while time.monotonic() < deadline:
-        reply = _tick(pad_armed)
+    for _ in range(pad_ticks):
+        reply = _pad_tick()
         if reply is not None:
             last_phase = PHASE_NAMES.get(reply.phase, reply.phase)
             if last_phase == "ARMED":
                 armed = True
-                break
+
+    # If the FC hasn't armed yet (duration_s shorter than its boot-settle
+    # delay), keep feeding pad data until it does — same real gate, just more
+    # time for it to fire.
+    if not armed:
+        deadline = time.monotonic() + arm_timeout
+        while time.monotonic() < deadline:
+            reply = _pad_tick()
+            if reply is not None:
+                last_phase = PHASE_NAMES.get(reply.phase, reply.phase)
+                if last_phase == "ARMED":
+                    armed = True
+                    break
     if not armed:
         # Surface the firmware's own diagnostic (#INFO/#WARN lines explaining
         # why it has not armed — pad capture, storage-not-ready, auto-arm
@@ -155,6 +175,7 @@ def warm_up(link: HilLink, emulator: SensorEmulator,
 def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
                     speed: float = 1.0, warmup_s: float = 6.0,
                     terminate_on_apogee: bool = True, max_time: float = 120.0,
+                    post_landed_s: float = 5.0,
                     noise: bool = False,
                     sensor_kwargs: Optional[dict] = None,
                     shadow_links: Optional[Dict[str, HilLink]] = None,
@@ -326,7 +347,8 @@ def run_closed_loop(link: HilLink, env, rocket, env_cfg, airbrakes_cfg: dict,
         last_ms = result.rows[-1].sim_ms if result.rows else pad_ms
         last_t = result.rows[-1].t_s if result.rows else 0.0
         wall0 = time.monotonic()
-        for k in range(int(5.0 * 100)):       # 5 s ≥ LANDED_CONFIRM_MS
+        tail_ticks = max(int(post_landed_s * 100), 0)
+        for k in range(tail_ticks):
             sim_ms = last_ms + (k + 1) * 10
             t_send = time.monotonic()
             reply = link.transact(sim_ms, tail, timeout=0.05)

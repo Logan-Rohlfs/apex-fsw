@@ -46,7 +46,6 @@ uint8_t storage_health();
 uint16_t storage_faults();
 bool storage_logging_ready();
 uint32_t storage_boot_id();
-uint32_t storage_flight_id();
 
 void storage_log_event(uint8_t event_id, const char* detail);
 void storage_begin_flight(uint32_t now_ms, const char* reason);
@@ -57,6 +56,9 @@ void storage_end_session(uint32_t now_ms, const char* reason);
 // start a fresh in-place log session. Operator-only — issued from HORIZON's
 // Format QSPI button with typed confirmation; the FC never formats on its own.
 bool storage_format_qspi(uint32_t now_ms);
+
+// Serial diagnostic: print QSPI/SD log directory contents without using MTP.
+void storage_print_log_directory(uint32_t now_ms);
 
 // Call from the main loop to service USB MTP file transfers. No-op when no USB
 // host is attached; logging keeps running alongside it.

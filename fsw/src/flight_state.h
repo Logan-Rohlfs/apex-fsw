@@ -144,7 +144,7 @@ struct FlightState {
     FlightPhase phase;
     uint32_t    phase_entry_ms;
     uint32_t    burnout_time_ms;    // recorded when burnout detected
-    bool        airbrakes_enabled;
+    bool        airbrakes_enabled;  // true only after 30 m baro launch validation
 
     // Control output
     ControlState control;

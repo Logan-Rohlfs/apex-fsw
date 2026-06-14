@@ -4,6 +4,8 @@
 #include "flight_state.h"
 #include "sensors.h"
 #include "gps.h"
+#include "board.h"
+#include "storage.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -35,6 +37,21 @@ static int8_t _status = -1;
 #define RADIO_FRAME_TYPE_FLIGHT 0x02
 #define RADIO_FRAME_TYPE_HK     0x03
 
+// Zero-cost status packing. The low three phase bits still encode the six
+// FlightPhase values; upper bits carry live operational state. The health byte
+// similarly extends the existing four sensor bits with system health.
+#define RADIO_PHASE_MASK              0x07
+#define RADIO_STATUS_AIRBRAKES_OK     (1 << 3)
+#define RADIO_STATUS_SERVO_POWER      (1 << 4)
+#define RADIO_STATUS_ARM_SWITCHES     (1 << 5)
+#define RADIO_STATUS_LOGGING_READY    (1 << 6)
+#define RADIO_STATUS_GPS_TIME_VALID   (1 << 7)
+
+#define RADIO_HEALTH_GPS              (1 << 4)
+#define RADIO_HEALTH_RADIO            (1 << 5)
+#define RADIO_HEALTH_QSPI             (1 << 6)
+#define RADIO_HEALTH_SD               (1 << 7)
+
 // Downlink bodies — little-endian, mirrored by scripts/radio_gfsk_rx.py.
 // FLIGHT carries everything HORIZON needs to track plus the live-plot set,
 // every beat. HOUSEKEEPING carries slow diagnostic channels once per second.
@@ -44,8 +61,8 @@ static int8_t _status = -1;
 struct __attribute__((packed)) TelemFlight {
     char     callsign[6];   // "KG5LDI" — Part 97 ID in every frame
     uint16_t seq;
-    uint8_t  phase;         // FlightPhase enum value
-    uint8_t  health;        // sensor health bitmask
+    uint8_t  phase_status;  // bits 0-2 phase; bits 3-7 operational flags
+    uint8_t  health;        // bits 0-3 sensors; bits 4-7 GPS/radio/QSPI/SD
     int8_t   gps_fix;       // gps_fix_state(): -1 offline … 4 3D+DR
     uint8_t  gps_sats;
     float    gps_lat_deg;   // f32 — int scaling would cost position precision
@@ -610,8 +627,18 @@ bool radio_telemetry_tx() {
         memset(&body, 0, sizeof(body));
         memcpy(body.callsign, RADIO_CALLSIGN, min(sizeof(body.callsign), strlen(RADIO_CALLSIGN)));
         body.seq         = _telem_seq++;
-        body.phase       = (uint8_t)g_state.phase;
-        body.health      = sensors_health();
+        body.phase_status = (uint8_t)g_state.phase & RADIO_PHASE_MASK;
+        if (g_state.airbrakes_enabled) body.phase_status |= RADIO_STATUS_AIRBRAKES_OK;
+        if (board_servo_powered())     body.phase_status |= RADIO_STATUS_SERVO_POWER;
+        if (board_switches_armed())    body.phase_status |= RADIO_STATUS_ARM_SWITCHES;
+        if (storage_logging_ready())   body.phase_status |= RADIO_STATUS_LOGGING_READY;
+        if (g_state.gps.time_valid)    body.phase_status |= RADIO_STATUS_GPS_TIME_VALID;
+
+        body.health = sensors_health();
+        if (gps_fix_state() >= 0)                body.health |= RADIO_HEALTH_GPS;
+        if (_status >= 0)                        body.health |= RADIO_HEALTH_RADIO;
+        if (storage_health() & STORAGE_OK_FLASH) body.health |= RADIO_HEALTH_QSPI;
+        if (storage_health() & STORAGE_OK_SD)    body.health |= RADIO_HEALTH_SD;
         body.gps_fix     = gps_fix_state();
         body.gps_sats    = g_state.gps.satellites;
         body.gps_lat_deg = g_state.gps.lat_deg;

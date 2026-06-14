@@ -22,6 +22,8 @@ bool radio_data_test_tx();
 // seq, phase, health, GPS, fused state, accel_z/roll/airbrake/baro. One beat
 // per second sends HOUSEKEEPING (type 0x03) instead: mag, high-g, off-axis
 // gyro, uptime. Non-blocking — skips the beat if a frame is still on air.
+// Phase and health retain their byte positions while upper bits carry
+// operational and system-health flags decoded by radio_gfsk_rx.py.
 // Callsign in every FLIGHT frame satisfies FCC §97.119 station ID.
 bool radio_telemetry_tx();
 

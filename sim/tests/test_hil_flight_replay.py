@@ -157,19 +157,23 @@ class TestSeymourReplay:
 
         first_deploy = None
         max_deploy = 0.0
+        first_descent_reply = None
         for t, reply in hist:
             if reply is None:
                 continue
+            if t >= t_desc and first_descent_reply is None:
+                first_descent_reply = reply
             if reply.deployment_frac > 0.005:
                 if first_deploy is None:
                     first_deploy = (t, reply.est_vel_mps)
                 if t < t_desc:
                     max_deploy = max(max_deploy, reply.deployment_frac)
-            # retracted again within servo travel time of DESCENT entry
-            if t > t_desc + 0.5:
+            if t >= t_desc:
                 assert reply.deployment_frac < 0.005, (
                     f"brakes not retracted at t={t:.2f}s")
 
+        assert first_descent_reply is not None
+        assert first_descent_reply.deployment_frac < 0.005
         assert first_deploy is not None, "controller never commanded the brakes"
         t_first, vel_first = first_deploy
         # Post-burnout lockout: nothing before burnout + 2.5 s

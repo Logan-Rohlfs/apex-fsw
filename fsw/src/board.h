@@ -16,8 +16,8 @@ void board_init();
 // no hardware, so this always returns true (HIL arms via the sim).
 bool board_switches_armed();
 
-// Servo power high-side switch. ON at ARM, OFF in IDLE so the servo does not
-// hold/chatter (and drain the pack) through the long pad sit.
+// Servo power high-side switch. OFF through the armed pad sit; launch detection
+// enables it so the actuator is ready before burnout.
 void board_servo_power(bool on);
 bool board_servo_powered();
 

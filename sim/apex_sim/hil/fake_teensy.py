@@ -13,9 +13,10 @@ Serves two purposes:
 State machine hardening (validated against the Seymour TX 2026-05-24
 recordings, see tests/test_hil_flight_replay.py):
 
-* Every transition has a primary gate with a confirmation window (counter
-  resets on any sample that fails — a single spike cannot advance a phase)
-  and an independent backup gate so a failed sensor cannot strand a phase:
+* Launch acceleration creates a candidate, but a sustained 30 m barometric
+  rise is required before burnout progression or airbrake control is allowed.
+  A candidate that settles back near 1 g with low rotation returns to ARMED.
+  Other transitions retain confirmation windows and independent backups:
 
   ARMED→BOOST    accel > 2 g for 150 ms          | baro AGL > 30 m for 200 ms
   BOOST→COAST    axial specific force < 0, 200 ms| time in BOOST > 8 s
@@ -60,6 +61,7 @@ _LAUNCH_ACCEL_THRESH_MSS = 19.62      # 2 g
 _LAUNCH_CONFIRM_MS = 150
 _LAUNCH_BARO_BACKUP_M = 30.0          # baro-only launch detect (accel failure)
 _LAUNCH_BARO_CONFIRM_MS = 200
+_LAUNCH_ABORT_CONFIRM_MS = 500
 _BURNOUT_CONFIRM_MS = 200
 _BOOST_MAX_MS = 8000                  # forced burnout (N3355 burns ~4.6 s)
 _POST_BURNOUT_LOCKOUT_MS = 1000
@@ -94,6 +96,9 @@ _CF_COAST_ALPHA = 0.02
 _CF_BOOST_BETA = 0.10
 _CF_COAST_BETA = 1.00
 _CF_ALT_ERR_CLAMP_M = 5.0
+_STATIONARY_ACCEL_MIN_MSS = 9.3
+_STATIONARY_ACCEL_MAX_MSS = 10.3
+_STATIONARY_GYRO_MAX_RADS = 0.05
 
 _PH_IDLE, _PH_ARMED, _PH_BOOST, _PH_COAST, _PH_DESCENT, _PH_LANDED = range(6)
 
@@ -129,6 +134,8 @@ class FlightLogic:
         self._prev_ms = None
         self._launch_ms = None      # confirmation-window start timestamps
         self._launch_baro_ms = None
+        self._launch_abort_ms = None
+        self._launch_validated = False
         self._burnout_ms_start = None
         self._apogee_ms = None
         self._apogee_baro_ms = None
@@ -184,6 +191,7 @@ class FlightLogic:
                 self.pad_alt_msl = _pressure_to_alt_msl(avg)
                 self.armed = True
                 self.phase = _PH_ARMED
+                self._launch_validated = False
                 # Arm = fresh flight: clear PID state (parity with the
                 # firmware's control_reset() called from flight_state_arm()).
                 self._integral = 0.0
@@ -200,6 +208,8 @@ class FlightLogic:
         vert_accel = s.accel_x_mss - _G
         accel_mag = math.sqrt(s.accel_x_mss ** 2 + s.accel_y_mss ** 2
                               + s.accel_z_mss ** 2)
+        gyro_mag = math.sqrt(s.gyro_x_rads ** 2 + s.gyro_y_rads ** 2
+                             + s.gyro_z_rads ** 2)
 
         # ── Estimator: α-β complementary filter (mirrors fusion.cpp) ──────────
         in_flight = self.phase in (_PH_BOOST, _PH_COAST, _PH_DESCENT)
@@ -242,6 +252,7 @@ class FlightLogic:
             if not s.arm_switch:
                 self.armed = False
                 self.phase = _PH_IDLE
+                self._launch_validated = False
                 self._launch_ms = self._launch_baro_ms = None
                 return TeensyPkt(
                     magic=0, sim_time_ms=sim_ms, deployment_frac=0.0,
@@ -259,6 +270,7 @@ class FlightLogic:
             if fired or fired_b:
                 self.phase = _PH_BOOST
                 self._boost_entry_ms = sim_ms
+                self._launch_validated = fired_b
                 # Seed velocity — rocket is already moving when confirmed
                 # (mirrors fusion.cpp launch seeding).
                 self.vel = 0.5 * vert_accel * (_LAUNCH_CONFIRM_MS * 1e-3)
@@ -266,6 +278,38 @@ class FlightLogic:
                           % ("accel" if fired else "baro backup"))
 
         elif self.phase == _PH_BOOST:
+            if not self._launch_validated:
+                validated, self._launch_baro_ms = self._confirm(
+                    sim_ms, self._launch_baro_ms,
+                    baro_agl > _LAUNCH_BARO_BACKUP_M,
+                    _LAUNCH_BARO_CONFIRM_MS)
+                stationary, self._launch_abort_ms = self._confirm(
+                    sim_ms, self._launch_abort_ms,
+                    (_STATIONARY_ACCEL_MIN_MSS <= accel_mag
+                     <= _STATIONARY_ACCEL_MAX_MSS
+                     and gyro_mag <= _STATIONARY_GYRO_MAX_RADS),
+                    _LAUNCH_ABORT_CONFIRM_MS)
+                if validated:
+                    self._launch_validated = True
+                    self._burnout_ms_start = None
+                    self._say("#INFO: Launch validated at 30 m AGL")
+                elif stationary:
+                    self.phase = _PH_ARMED
+                    self.alt = baro_agl
+                    self.vel = 0.0
+                    self.max_alt = max(0.0, baro_agl)
+                    self.deploy = 0.0
+                    self._launch_ms = None
+                    self._launch_baro_ms = None
+                    self._launch_abort_ms = None
+                    self._burnout_ms_start = None
+                    self._launch_validated = False
+                    self._say("#WARN: Launch candidate rejected - vehicle stationary")
+                return TeensyPkt(
+                    magic=0, sim_time_ms=sim_ms, deployment_frac=0.0,
+                    est_alt_agl_m=self.alt, est_vel_mps=self.vel,
+                    pred_apogee_m=self.alt, phase=self.phase, crc=0)
+
             # Primary: axial specific force flips negative (drag deceleration;
             # −0.78 g early coast on the Seymour flight).  Backup: max burn
             # time — the N3355 burns ~4.6 s, a stuck gate can't hold BOOST.
@@ -320,6 +364,7 @@ class FlightLogic:
 
         # ── Airbrake control (PID, COAST only, all gates must pass) ───────────
         active = (self.phase == _PH_COAST
+                  and self._launch_validated
                   and self._burnout_ms is not None
                   and sim_ms - self._burnout_ms >= _POST_BURNOUT_LOCKOUT_MS
                   and self.vel > 0.0

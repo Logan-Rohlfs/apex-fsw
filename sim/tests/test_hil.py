@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from apex_sim.hil import protocol  # noqa: E402
 from apex_sim.hil.emulator import SensorEmulator, rail_quaternion  # noqa: E402
-from apex_sim.hil.fake_teensy import FakeTeensy  # noqa: E402
+from apex_sim.hil.fake_teensy import FakeTeensy, FlightLogic  # noqa: E402
 from apex_sim.hil.link import HilLink  # noqa: E402
 from apex_sim.hil.protocol import SimSensors, TeensyPkt  # noqa: E402
 
@@ -150,6 +150,30 @@ def fake_link():
 
 
 class TestFakeTeensyLoop:
+    def test_handling_bump_cannot_authorize_airbrakes(self):
+        logic = FlightLogic()
+        _, pad = _pad_sensors()
+        pad = pad._replace(arm_switch=1)
+
+        reply = None
+        for i in range(60):
+            reply = logic.step(i * 10, pad)
+        assert protocol.PHASE_NAMES[reply.phase] == "ARMED"
+
+        bump = pad._replace(
+            accel_x_mss=30.0, accel_y_mss=0.0, accel_z_mss=0.0)
+        for i in range(60, 80):
+            reply = logic.step(i * 10, bump)
+        assert protocol.PHASE_NAMES[reply.phase] == "BOOST"
+        assert reply.deployment_frac == 0.0
+
+        # With no 30 m baro rise, settling back on the pad rejects the launch
+        # candidate and restores armed standby without ever enabling brakes.
+        for i in range(80, 150):
+            reply = logic.step(i * 10, pad)
+            assert reply.deployment_frac == 0.0
+        assert protocol.PHASE_NAMES[reply.phase] == "ARMED"
+
     def test_ready_banner_and_arming(self, fake_link):
         fake, link = fake_link
         assert link.wait_for_line("HIL_READY", timeout=3.0)

@@ -51,36 +51,52 @@ void control_init() {
              SERVO_MIN_US, SERVO_MAX_US);
 }
 
+void control_boot_self_test() {
+#ifndef APEX_HIL
+    board_servo_power(true);
+    servo_write_us(deploy_to_us(0.0f));
+    delay(SERVO_BOOT_TEST_HOLD_MS);
+    servo_write_us(deploy_to_us(SERVO_BOOT_TEST_FRAC));
+    delay(SERVO_BOOT_TEST_HOLD_MS);
+    servo_write_us(deploy_to_us(0.0f));
+    delay(SERVO_BOOT_TEST_HOLD_MS);
+    board_servo_power(false);
+    analogWrite(SERVO_PIN, 0);
+    LOG_INFO("Servo boot self-test complete (%.0f%% wiggle)",
+             SERVO_BOOT_TEST_FRAC * 100.0f);
+#endif
+}
+
 void control_reset() {
+    control_safe_retract(0);
+}
+
+void control_safe_retract(uint32_t now_ms) {
     _integral   = 0.0f;
     _deploy     = 0.0f;
-    _last_ms    = 0;        // dt anchor — first tick after reset uses 1/RATE
+    _last_ms    = now_ms;
     _was_active = false;
     g_state.control = ControlState{};
     g_state.control.servo_angle_deg = deploy_to_deg(0.0f);
+    g_state.control.timestamp_ms = now_ms;
     servo_write_us(deploy_to_us(0.0f));   // hold retracted command
 }
 
 void control_arm() {
-    // Power the servo (off through the pad sit), then bring it to retracted
-    // with a smooth sweep from the assumed center pulse so it does not snap on
-    // power-up. The sweep is a one-time blocking move at the deliberate ARM
-    // event; skipped in HIL (no hardware, and it must not stall the packet loop).
-    board_servo_power(true);
-#ifndef APEX_HIL
-    const int steps = SERVO_INIT_SWEEP_MS / 20;
-    for (int i = 1; i <= steps; i++) {
-        const float frac = 0.5f * (1.0f - (float)i / (float)steps);  // 0.5 → 0
-        servo_write_us(deploy_to_us(frac));
-        delay(20);
-    }
-#endif
     control_reset();
+    board_servo_power(false);
+    analogWrite(SERVO_PIN, 0);
+}
+
+void control_launch_detected(uint32_t now_ms) {
+    board_servo_power(true);
+    control_safe_retract(now_ms);
 }
 
 void control_disarm() {
     control_reset();
     board_servo_power(false);   // unpower servo when not armed
+    analogWrite(SERVO_PIN, 0);  // avoid phantom-powering through PWM input
 }
 
 void control_update(uint32_t now_ms) {
@@ -109,6 +125,7 @@ void control_update(uint32_t now_ms) {
     // ── Deployment gates ──────────────────────────────────────────────────────
     const bool in_coast = (g_state.phase == FlightPhase::COAST);
     const bool active = in_coast
+        && g_state.airbrakes_enabled
         && (now_ms - g_state.burnout_time_ms) >= POST_BURNOUT_LOCKOUT_MS
         && vel > 0.0f
         && vel < MACH_GATE_MPS
@@ -144,7 +161,9 @@ void control_update(uint32_t now_ms) {
     delta = fmaxf(-max_delta, fminf(max_delta, delta));
     _deploy = fmaxf(0.0f, fminf(1.0f, _deploy + delta));
 
-    servo_write_us(deploy_to_us(_deploy));
+    if (board_servo_powered()) {
+        servo_write_us(deploy_to_us(_deploy));
+    }
 
     // ── Publish ───────────────────────────────────────────────────────────────
     g_state.control.deployment_frac = _deploy;
