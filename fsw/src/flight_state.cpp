@@ -113,8 +113,8 @@ bool flight_state_arm(uint32_t now_ms) {
         return false;
 #endif
     }
-    if (!board_switches_armed()) {
-        LOG_WARN("ARM refused: arm switches not closed");
+    if (!board_arm_switch_closed()) {
+        LOG_WARN("ARM refused: arm switch not closed");
         return false;
     }
     reset_windows();
@@ -191,15 +191,15 @@ void flight_state_update(uint32_t now_ms) {
 
     switch (g_state.phase) {
         case FlightPhase::IDLE: {
-            // Arm when the operator's screw switches are closed and the FC is
+            // Arm when the operator's arm switch is closed and the FC is
             // ready (pad reference captured, past the boot settle). Switch-LEVEL
             // gated, not latched: it re-arms if disarmed then re-closed, so the
             // switch position always reflects armed state. flight_state_arm()
             // enforces sensor/storage/switch gates and logs any refusal — the
             // throttle just stops a refused arm from spamming. Launch detection
-            // only runs in ARMED, so while the switches are OFF the FC is inert
+            // only runs in ARMED, so while the switch is OFF the FC is inert
             // during the hour of pad handling (rotation/bumps can't false-launch).
-            if (board_switches_armed() && pad_ready &&
+            if (board_arm_switch_closed() && pad_ready &&
                 now_ms >= AUTO_ARM_DELAY_MS &&
                 now_ms - _last_auto_arm_try_ms >= 1000) {
                 _last_auto_arm_try_ms = now_ms;
@@ -209,10 +209,10 @@ void flight_state_update(uint32_t now_ms) {
         }
 
         case FlightPhase::ARMED: {
-            // Safing: if a switch leaves the armed position before launch, drop
-            // back to IDLE. Only pre-BOOST — once boost is detected the flight
-            // is latched and a switch vibrating open must never abort airbrakes.
-            if (!board_switches_armed()) {
+            // Safing: if the arm switch opens before launch, drop back to IDLE.
+            // Only pre-BOOST — once boost is detected the flight is latched and
+            // a switch vibrating open must never abort airbrakes.
+            if (!board_arm_switch_closed()) {
                 flight_state_disarm();
                 break;
             }
@@ -235,7 +235,7 @@ void flight_state_update(uint32_t now_ms) {
 
         case FlightPhase::BOOST: {
             if (!g_state.airbrakes_enabled) {
-                if (!board_switches_armed()) {
+                if (!board_arm_switch_closed()) {
                     reset_windows();
                     control_disarm();
                     g_state.phase = FlightPhase::IDLE;

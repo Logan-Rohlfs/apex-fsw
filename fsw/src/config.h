@@ -51,17 +51,23 @@
 
 // Power enables
 #define PIN_3V3_2_EN        23   // AP2112K-3.3 enable — drives radio 3.3V rail
-#define PIN_12V_EN          20   // A6  — 12 V rail high-side enable (on at boot)
+#define PIN_12V_EN          20   // A6  — 12 V rail enable, powers an external
+                                 //       video TX. Follows PIN_RADIO_SWITCH.
 #define PIN_SRV_EN          38   // A14 — servo power high-side switch (NPN+PMOS),
                                  //       on at ARM / off in IDLE (no pad chatter)
 
-// ── Arm switches (screw switches on the rod; see docs/flight_readiness.md) ────
-// Two switches; the final on-pad arming action. Wired fail-safe: the ARMED
-// position closes the pin to GND (INPUT_PULLUP → reads LOW). A broken/unplugged
-// switch floats HIGH = DISARMED/safe. Both must be ON to arm.
-#define PIN_SWITCH_1        32   // D32
-#define PIN_SWITCH_2        31   // D31
-#define SWITCH_ARMED_LEVEL  LOW  // pin level when the switch is in the armed pos.
+// ── Switches (screw switches on the rod; see docs/flight_readiness.md) ────────
+// Two independent purely-software switches — simple bridges to GND, read via
+// INPUT_PULLUP (closed = GND = LOW, open/broken floats HIGH = safe default).
+// PIN_ARM_SWITCH:   closed = arming interlock satisfied (one of several AND'd
+//                   conditions in flight_state_arm()/IDLE auto-arm — closing
+//                   it does not arm by itself).
+// PIN_RADIO_SWITCH: closed = radio transmissions enabled. While open the FC is
+//                   radio-silent: firmware withholds onboard Si4463 TX and
+//                   drives PIN_12V_EN low (external video TX off).
+#define PIN_ARM_SWITCH      32   // D32
+#define PIN_RADIO_SWITCH    31   // D31
+#define SWITCH_CLOSED_LEVEL LOW  // pin level when a switch is closed (to GND).
 
 // ── Buzzer (on-pad status; the only feedback to an operator with no uplink) ───
 #define PIN_BUZZER          6    // D6 — passive piezo driven with tone()
@@ -90,6 +96,7 @@
 
 // Telemetry beacon rates by phase. FLIGHT frame = 51 B / ~41 ms airtime at
 // 10 kbps; one beat per second is replaced by the HOUSEKEEPING frame (33 B).
+// At 20 Hz that's ~82% airtime duty.
 #define RADIO_TELEM_IDLE_HZ     20   // IDLE / LANDED
 #define RADIO_TELEM_FLIGHT_HZ   20   // ARMED / BOOST / COAST / DESCENT
 
@@ -113,7 +120,7 @@
 
 // ─── Arming ───────────────────────────────────────────────────────────────────
 // IDLE → ARMED once the pad reference is captured, the boot settle has elapsed,
-// AND both arm switches are closed (airbrakes are not pyro — ARMED only enables
+// AND the arm switch is closed (airbrakes are not pyro — ARMED only enables
 // launch detection). Switch-level gated; debug builds can also use ARM/DISARM.
 #define AUTO_ARM_DELAY_MS           10000
 
@@ -263,6 +270,12 @@
 #define LOG_SD_FLUSH_INTERVAL_MS    30000
 #define LOG_SD_MAX_FAULTS           1        // suspend live SD mirror after first fault
 #define LOG_SD_SLOW_DISABLE_US      250000   // or after one very slow write/flush
+
+// Delay the one-shot post-landing QSPI->SD dump so a couple more seconds of
+// settling/impact high-g samples land in the QSPI log before it's copied.
+// The dump is a single blocking pass (storage.cpp dump_qspi_file_to_sd) —
+// fine since the FC isn't used for recovery.
+#define LOG_LANDING_DUMP_DELAY_MS   3000
 
 // Debug-only storage diagnostics. The flight logger still runs normally; debug
 // builds only add a low-rate timing summary so SD/QSPI stalls are visible.

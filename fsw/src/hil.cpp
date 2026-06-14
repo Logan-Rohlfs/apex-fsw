@@ -10,7 +10,7 @@
 float g_hil_dt_s = 1.0f / RATE_HIL_HZ;
 
 // Injected arm-switch state (see hil.h). Set from each SimPacket in
-// sensors_inject_hil(); read by board_switches_armed(). Starts open.
+// sensors_inject_hil(); read by board_arm_switch_closed(). Starts open.
 bool g_hil_arm_closed = false;
 
 // ─── CRC-8 (polynomial 0x07, CRC-8/SMBUS) ────────────────────────────────────

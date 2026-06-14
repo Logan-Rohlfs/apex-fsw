@@ -243,8 +243,8 @@ void sensors_inject_hil(const SimPacket& pkt) {
         interrupts();
     }
 
-    // Arm switches are injected in HIL_ARM_SWITCH_BIT of gps_valid — route it
-    // to board_switches_armed() so the sim drives arming like the real switches.
+    // Arm switch state is injected in HIL_ARM_SWITCH_BIT of gps_valid — route it
+    // to board_arm_switch_closed() so the sim drives arming like the real switch.
     g_hil_arm_closed = (pkt.gps_valid & HIL_ARM_SWITCH_BIT) != 0;
 
     // GPS — write directly to g_state (bypasses staging path, async).

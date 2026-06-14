@@ -397,6 +397,11 @@ static bool sd_flush_buffer(uint32_t now_ms, bool force) {
 }
 
 static bool sd_live_allowed() {
+    // SD is normally withheld during BOOST/COAST/DESCENT — its flush stalls
+    // (>1s) would wreck launch-detection timing. But if QSPI has truly
+    // suspended (LOG_FLASH_MAX_FAULTS consecutive failures), SD is the only
+    // logging path left; better degraded in-flight data than none.
+    if (_qspi_suspended) return true;
     const FlightPhase p = g_state.phase;
     return p == FlightPhase::IDLE || p == FlightPhase::ARMED || p == FlightPhase::LANDED;
 }
@@ -717,7 +722,8 @@ void storage_log_update(uint32_t now_ms) {
 
     flush_logs(now_ms, false);
 
-    if (_flight_started && phase == FlightPhase::LANDED) {
+    if (_flight_started && phase == FlightPhase::LANDED &&
+        now_ms - g_state.phase_entry_ms >= LOG_LANDING_DUMP_DELAY_MS) {
         dump_qspi_file_to_sd(now_ms);
     }
 #ifdef APEX_DEBUG

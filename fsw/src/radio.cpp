@@ -586,6 +586,10 @@ bool radio_telemetry_tx() {
 
     if (_status < 0) return false;
 
+    // Radio silence (radio switch open): withhold TX entirely. The onboard
+    // Si4463 stays initialized; firmware just never keys it.
+    if (!board_radio_enabled()) return false;
+
     SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     if (!radio_ensure_gfsk()) {
         SPI1.endTransaction();
@@ -630,7 +634,7 @@ bool radio_telemetry_tx() {
         body.phase_status = (uint8_t)g_state.phase & RADIO_PHASE_MASK;
         if (g_state.airbrakes_enabled) body.phase_status |= RADIO_STATUS_AIRBRAKES_OK;
         if (board_servo_powered())     body.phase_status |= RADIO_STATUS_SERVO_POWER;
-        if (board_switches_armed())    body.phase_status |= RADIO_STATUS_ARM_SWITCHES;
+        if (board_arm_switch_closed()) body.phase_status |= RADIO_STATUS_ARM_SWITCHES;
         if (storage_logging_ready())   body.phase_status |= RADIO_STATUS_LOGGING_READY;
         if (g_state.gps.time_valid)    body.phase_status |= RADIO_STATUS_GPS_TIME_VALID;
 

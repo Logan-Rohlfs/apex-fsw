@@ -62,8 +62,8 @@ Carries everything HORIZON needs to track plus the live-plot set.
 replaces one beat per second:** seq, mag xyz (1e-4 G), high-g xyz (0.1 m/s²),
 off-axis gyro xy (0.002 rad/s), uptime.
 
-Beacon rates set in config.h (`RADIO_TELEM_IDLE_HZ` / `RADIO_TELEM_FLIGHT_HZ`);
-at 10 Hz flight rate duty is ~44 %. Toggled with `TELEM_ON` / `TELEM_OFF` in
+Beacon rates set in config.h (`RADIO_TELEM_IDLE_HZ` / `RADIO_TELEM_FLIGHT_HZ`,
+both 20 Hz); at 20 Hz duty is ~82 %. Toggled with `TELEM_ON` / `TELEM_OFF` in
 monitor builds (default off on the bench); flight builds beacon by default.
 The monitor's radio source shows a dedicated ground-station layout (altitude /
 velocity / roll & airbrake / link quality with packet-loss from seq gaps).

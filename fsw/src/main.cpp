@@ -92,6 +92,20 @@ void setup() {
     control_init();  // servo runs in HIL too — actuator-in-the-loop on the bench
     g_state.phase = FlightPhase::IDLE;
 
+    // Audible go/no-go checklist (non-blocking; plays out over the first
+    // loop() iterations). System 1: IMU+baro, 2: GPS fix, 3: logging ready,
+    // 4: radio switch, 5: arm switch.
+    {
+        const bool st_ok[5] = {
+            (sensors_health() & (SENSOR_OK_IMU | SENSOR_OK_BARO)) == (SENSOR_OK_IMU | SENSOR_OK_BARO),
+            g_state.gps.valid,
+            storage_logging_ready(),
+            board_radio_enabled(),
+            board_arm_switch_closed(),
+        };
+        board_buzzer_selftest(st_ok, 5);
+    }
+
     // Signal to the Python replay script that the Teensy is ready.
     Serial.println("#HIL_READY");
 
@@ -143,6 +157,20 @@ void setup() {
              RATE_FUSION_HZ, RATE_BARO_HZ, RATE_MAG_HZ);
 
     g_state.phase = FlightPhase::IDLE;
+
+    // Audible go/no-go checklist (non-blocking; plays out over the first
+    // loop() iterations). System 1: IMU+baro, 2: GPS fix, 3: logging ready,
+    // 4: radio switch, 5: arm switch.
+    {
+        const bool st_ok[5] = {
+            (sensors_health() & (SENSOR_OK_IMU | SENSOR_OK_BARO)) == (SENSOR_OK_IMU | SENSOR_OK_BARO),
+            g_state.gps.valid,
+            storage_logging_ready(),
+            board_radio_enabled(),
+            board_arm_switch_closed(),
+        };
+        board_buzzer_selftest(st_ok, 5);
+    }
 #endif
 }
 

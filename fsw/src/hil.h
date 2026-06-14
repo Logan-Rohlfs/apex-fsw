@@ -79,8 +79,10 @@ static_assert(sizeof(TeensyPacket) == 24, "TeensyPacket size mismatch");
 extern float g_hil_dt_s;
 
 // Injected arm-switch state (HIL_ARM_SWITCH_BIT of the latest SimPacket).
-// board_switches_armed() returns this in HIL, so the sim drives arming exactly
-// as the operator's screw switches would in flight. Defaults open (false).
+// board_arm_switch_closed() returns this in HIL, so the sim drives arming
+// exactly as the operator's arm switch would in flight. Defaults open (false).
+// The radio switch has no HIL equivalent — board_radio_enabled() is always
+// true in HIL (no external video TX / radio-silence concern in sim).
 extern bool g_hil_arm_closed;
 
 // ─── CRC-8 ────────────────────────────────────────────────────────────────────
