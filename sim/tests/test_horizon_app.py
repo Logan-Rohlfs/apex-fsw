@@ -126,7 +126,7 @@ def _mtp_mock(log_path: Path, file_id: int = 42):
 
 def test_logs_page_end_to_end(app, win, tmp_path, monkeypatch):
     archive = tmp_path / "raw_logs"
-    monkeypatch.setattr(horizon, "_RAW_LOG_ARCHIVE", archive)
+    monkeypatch.setattr("horizon_app.paths._RAW_LOG_ARCHIVE", archive)
 
     # Device file served over libmtp (mtp-files / mtp-getfile mocked).
     log_path = tmp_path / "BOOT_00042.APXLOG"
@@ -143,7 +143,10 @@ def test_logs_page_end_to_end(app, win, tmp_path, monkeypatch):
     assert win.device_table.item(0, 0).text() == "BOOT_00042.APXLOG"
     assert "KiB" in win.device_table.item(0, 1).text() or \
            "B" in win.device_table.item(0, 1).text()
-    assert "MTP" in win.device_table.item(0, 2).text()
+    # col 2 = archive status (missing until pulled); col 3 = source storage
+    # label, here the QSPI flash served over libmtp.
+    assert win.device_table.item(0, 2).text() == "missing"
+    assert "APEX-FLASH" in win.device_table.item(0, 3).text()
 
     # Pull Selected copies into the laptop archive
     win.device_table.selectAll()
@@ -186,7 +189,7 @@ def test_logs_page_end_to_end(app, win, tmp_path, monkeypatch):
 def test_logs_pull_all_without_refresh(app, win, tmp_path, monkeypatch):
     """Pull All discovers and pulls in one job when no Refresh was done."""
     archive = tmp_path / "raw_logs"
-    monkeypatch.setattr(horizon, "_RAW_LOG_ARCHIVE", archive)
+    monkeypatch.setattr("horizon_app.paths._RAW_LOG_ARCHIVE", archive)
     log_path = tmp_path / "BOOT_00007.APXLOG"
     _write_log(log_path)
     monkeypatch.setattr(win, "_run_mtp_tool", _mtp_mock(log_path, file_id=7))

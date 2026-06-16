@@ -171,9 +171,9 @@
 // All three gains rescale — the D-term is Kd × velocity and velocity has
 // units too (ft/s in MATLAB, m/s here). Matches apex_sim/sim/airbrakes.py.
 // D-term uses velocity directly as proxy — matches sim, do not change.
-#define PID_KP                      (0.4f   / 0.3048f)
+#define PID_KP                      (0.6f   / 0.3048f)
 #define PID_KI                      (-0.004f / 0.3048f)
-#define PID_KD                      (-0.04f / 0.3048f)
+#define PID_KD                      (-0.05f / 0.3048f)
 #define PID_U_MIN                   -15.0f
 #define PID_U_MAX                    30.0f
 
