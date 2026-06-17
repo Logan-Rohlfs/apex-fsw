@@ -119,6 +119,15 @@ void setup() {
 #endif
 
     LOG_INFO("Apex FSW starting");
+
+    // PSRAM detection — Teensyduino's boot probe sets external_psram_size (MB)
+    // for an APS6404L on either FlexSPI2 expansion footprint. Expect 8 with the
+    // APS6404L-3SQR installed; 0 means it isn't seen (solder/joint or wrong pads).
+    {
+        extern uint8_t external_psram_size;   // Teensy core global, megabytes
+        Serial.printf("#INFO: PSRAM external_psram_size=%u MB\n", external_psram_size);
+    }
+
 #ifdef APEX_DEBUG
     Serial.println("#INFO: Teensy reset/crash report follows");
     CrashReport.printTo(Serial);

@@ -246,35 +246,39 @@
 #define LOG_RATE_DESCENT_HZ         25
 #define LOG_RING_BUF_SECONDS        15      // high-rate pre-launch context depth
 
-// Binary flight logger. QSPI flash is launch-critical; microSD is a redundant
-// mirror. Runtime writes are sampled in the main loop (never sensor ISRs). The
-// RAM ring keeps compact recent prelaunch samples so the log can explain launch
-// detection without allowing old pad context to compete with flight data.
+// Binary flight logger. The QSPI NAND died and was replaced by an undetected
+// PSRAM, so microSD (the only non-volatile medium left) is now the primary
+// recorder. Runtime writes are sampled in the main loop (never sensor ISRs).
+// The RAM ring keeps compact recent prelaunch samples so the log can explain
+// launch detection without allowing old pad context to compete with flight data.
 #define LOG_PRELAUNCH_RING_HZ       20
 #define LOG_PAD_FILE_HZ             2
 #define LOG_FLIGHT_FILE_HZ          100     // fastest useful state/control rate
-// QSPI logging uses PJRC's supported LittleFS_QPINAND file path. The storage
-// layer still batches records into NAND-page-sized writes so the firmware does
-// not feed LittleFS a stream of tiny appends.
 // HIL-only escape hatch. Flight/debug builds still enforce "no log, no arm";
 // HIL can continue so sim/control tests are not blocked by storage bring-up.
 #define HIL_ALLOW_STORAGE_FAULT_ARM 1
-// QSPI NAND writes are staged into page-sized chunks before LittleFS writes.
-// This bounds the power-loss window for records that have not filled a page yet.
-#define LOG_FLASH_PAGE_BUFFER_BYTES 2048
-#define LOG_FLASH_FLUSH_INTERVAL_MS 5000
-#define LOG_FLASH_MAX_FAULTS        3        // suspend QSPI after this many consecutive failures
-// SD is only a mirror, and its FAT sync can stall 100s of ms (occasionally
-// >1 s) — flushing it every second was freezing the loop. Flush it rarely; the
-// post-landing QSPI→SD dump still commits the full log.
+
+// ── Ascent RAM black box ──────────────────────────────────────────────────────
+// SD FAT syncs can stall 100s of ms (occasionally >1 s) — fatal to burnout/
+// apogee detection if they hit during BOOST/COAST. So the ascent is logged into
+// this RAM buffer (zero stalls, deterministic), then dumped to SD once under
+// canopy. Sized to hold the whole ascent of framed records at LOG_FLIGHT_FILE_HZ
+// in OCRAM (DMAMEM): 384 KiB ≈ ~29 s at 100 Hz × ~132 B/record. If a flight's
+// ascent exceeds it, the buffer overflows gracefully to SD-live (logged once).
+#define LOG_ASCENT_BUF_BYTES        (384 * 1024)
+// Flush the ascent RAM buffer to SD this long after apogee (DESCENT entry) — a
+// few seconds under drogue, before any hard-landing / power-loss risk. The dump
+// is a single blocking pass (storage.cpp flush_ascent_to_sd); fine in descent.
+#define LOG_APOGEE_DUMP_DELAY_MS    5000
+
+// SD flush cadence on the pad / in descent. Its FAT sync can stall 100s of ms,
+// so flush rarely; the ascent RAM dump commits the launch-critical window.
 #define LOG_SD_FLUSH_INTERVAL_MS    30000
-#define LOG_SD_MAX_FAULTS           1        // suspend live SD mirror after first fault
+#define LOG_SD_MAX_FAULTS           1        // suspend live SD after first fault
 #define LOG_SD_SLOW_DISABLE_US      250000   // or after one very slow write/flush
 
-// Delay the one-shot post-landing QSPI->SD dump so a couple more seconds of
-// settling/impact high-g samples land in the QSPI log before it's copied.
-// The dump is a single blocking pass (storage.cpp dump_qspi_file_to_sd) —
-// fine since the FC isn't used for recovery.
+// Landing fallback: if DESCENT was skipped (e.g. false launch → LANDED) and the
+// ascent buffer was never flushed, dump it this long after LANDED.
 #define LOG_LANDING_DUMP_DELAY_MS   3000
 
 // Debug-only storage diagnostics. The flight logger still runs normally; debug

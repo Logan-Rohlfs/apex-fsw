@@ -43,6 +43,7 @@ RADIO_PLOT_GROUPS = [
                          ["#ff6b35", "#44ff44", "#4488ff"]),
     ("Roll / Airbrake",  ["roll_rate", "deployment"],
                          ["#ff8844", "#00d4ff"]),
+    ("Attitude",         ["tilt_deg", "azimuth_deg"], ["#ffaa44", "#44aaff"]),
     ("Link",             ["packet_loss_pct", "radio_rx_quality", "radio_freq_offset_khz"],
                          ["#ff4444", "#44ffaa", "#ffdd44"]),
 ]

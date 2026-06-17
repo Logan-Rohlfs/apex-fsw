@@ -77,8 +77,10 @@ struct __attribute__((packed)) TelemFlight {
     uint8_t  deployment;    // airbrake 0..255 = 0..1
     uint16_t baro_pa;       // 2 Pa units (0–131070 Pa)
     int8_t   baro_temp;     // 1 °C
+    int8_t   tilt_deg;      // 1°, 0..127 — angle off world-vertical
+    uint16_t azimuth;       // 0.1° (0..3600) — compass direction of the tilt
 };
-static_assert(sizeof(TelemFlight) == 38, "flight body layout drifted");
+static_assert(sizeof(TelemFlight) == 41, "flight body layout drifted");
 
 struct __attribute__((packed)) TelemHousekeeping {
     uint16_t seq;           // shares the telemetry seq counter
@@ -657,6 +659,8 @@ bool radio_telemetry_tx() {
         body.deployment  = (uint8_t)constrain(g_state.control.deployment_frac * 255.0f, 0.0f, 255.0f);
         body.baro_pa     = (uint16_t)constrain(g_state.baro.pressure_pa * 0.5f, 0.0f, 65535.0f);
         body.baro_temp   = (int8_t)constrain(g_state.baro.temperature_c, -128.0f, 127.0f);
+        body.tilt_deg    = (int8_t)constrain(lroundf(g_state.fused.tilt_deg), 0, 127);
+        body.azimuth     = (uint16_t)constrain(lroundf(g_state.fused.azimuth_deg * 10.0f), 0, 3600);
 
         frame_len = radio_build_frame(frame, RADIO_FRAME_TYPE_FLIGHT,
                                       (const uint8_t*)&body, sizeof(body));

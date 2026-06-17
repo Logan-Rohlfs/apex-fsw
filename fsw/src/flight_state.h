@@ -104,6 +104,8 @@ struct FusedState {
     float    accel_mps2;          // vertical
     float    predicted_apogee_m;
     float    attitude_q[4];       // quaternion [w, x, y, z]
+    float    tilt_deg;            // angle off world-vertical (0 = straight up)
+    float    azimuth_deg;         // compass direction of the tilt, 0..360 (mag-referenced)
     float    air_density_kgm3;    // ISA model from altitude
     uint32_t timestamp_ms;
 };

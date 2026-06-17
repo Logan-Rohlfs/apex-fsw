@@ -6,7 +6,6 @@
 #include "sensors.h"
 
 #include <Arduino.h>
-#include <LittleFS.h>
 #include <SD.h>
 #include <string.h>
 
@@ -14,10 +13,14 @@
 #include <MTP_Teensy.h>
 #endif
 
-// Supported-path logger:
-// - QSPI uses PJRC/Teensy LittleFS_QPINAND files.
-// - Firmware batches APXL records into 2048 B NAND-page-sized writes.
-// - SD is a buffered mirror/offload target, never a high-rate flight sink.
+// SD-primary logger (the QSPI NAND died; the replacement APS6404L PSRAM is not
+// detected, so microSD is the only non-volatile medium):
+//  - IDLE/ARMED (pad) and DESCENT/LANDED  → buffered SD writes (stalls harmless).
+//  - BOOST/COAST (ascent, timing-critical) → an OCRAM "black box" RAM buffer, so
+//    an SD FAT stall can never delay burnout/apogee detection.
+//  - At apogee + LOG_APOGEE_DUMP_DELAY_MS (under canopy) the RAM buffer is
+//    dumped to SD in one blocking pass. Record/wire formats are unchanged, so
+//    the ground decoder is unaffected — only *where* the bytes go changed.
 
 struct __attribute__((packed)) LogHeader {
     uint32_t magic;
@@ -98,14 +101,11 @@ struct __attribute__((packed)) SamplePayload {
 
 static_assert(sizeof(LogHeader) == 26, "LogHeader wire size changed");
 static_assert(sizeof(SamplePayload) <= 128, "SamplePayload ring budget changed");
-static_assert(LOG_FLASH_PAGE_BUFFER_BYTES == 2048,
-              "QSPI buffer should match W25N01 page size");
 
 #define LOG_DIR "APEX"
 #define LOG_NEXT_BOOT_PATH   LOG_DIR "/NEXTBOOT.TXT"
 #define LOG_NEXT_FLIGHT_PATH LOG_DIR "/NEXTFLT.TXT"
 
-static constexpr size_t QSPI_PAGE_BYTES = LOG_FLASH_PAGE_BUFFER_BYTES;
 static constexpr size_t SD_BUFFER_BYTES = 8192;
 static constexpr uint16_t RING_RECORDS =
     LOG_RING_BUF_SECONDS * LOG_PRELAUNCH_RING_HZ;
@@ -120,8 +120,6 @@ struct BufferedFileSink {
     bool suspended = false;
 };
 
-static LittleFS_QPINAND _flash;
-static File _flash_log;
 static BufferedFileSink _sd;
 static char _log_path[40] = {0};
 
@@ -134,19 +132,20 @@ static uint32_t _seq = 0;
 
 static bool _flight_started = false;
 static bool _ring_flushed = false;
-static bool _sd_dumped = false;
+static bool _ascent_flushed = false;
 static uint32_t _last_ring_ms = 0;
 static uint32_t _last_sample_ms = 0;
-static uint32_t _last_qspi_flush_ms = 0;
-static uint8_t _qspi_consecutive_failures = 0;
-static bool _qspi_suspended = false;
 
-static uint8_t _qspi_buf[QSPI_PAGE_BYTES];
-static size_t _qspi_len = 0;
-
+// Prelaunch context ring (compact, last LOG_RING_BUF_SECONDS before launch).
 DMAMEM SamplePayload _ring[RING_RECORDS];
 static uint16_t _ring_head = 0;
 static uint16_t _ring_count = 0;
+
+// Ascent RAM "black box" — framed records for BOOST/COAST live here (no SD
+// stalls), then dump to SD under canopy. OCRAM via DMAMEM; not zero-inited.
+DMAMEM uint8_t _ascent_buf[LOG_ASCENT_BUF_BYTES];
+static size_t _ascent_len = 0;
+static bool _ascent_overflow = false;
 
 #ifdef APEX_DEBUG
 struct StorageDebugStats {
@@ -154,11 +153,9 @@ struct StorageDebugStats {
     uint32_t samples_logged = 0;
     uint32_t events_logged = 0;
     uint32_t ring_pushes = 0;
-    uint32_t qspi_writes = 0;
-    uint32_t qspi_failures = 0;
+    uint32_t ascent_bytes = 0;
     uint32_t sd_writes = 0;
     uint32_t sd_failures = 0;
-    uint32_t max_qspi_us = 0;
     uint32_t max_sd_us = 0;
     uint32_t max_update_us = 0;
     uint16_t faults_seen = 0;
@@ -178,24 +175,21 @@ static void dbg_storage_summary(uint32_t now_ms) {
     }
     const bool due = now_ms - _dbg_storage.period_start_ms >= DEBUG_STORAGE_SUMMARY_MS;
     const bool slow =
-        _dbg_storage.max_qspi_us >= DEBUG_STORAGE_SLOW_US ||
         _dbg_storage.max_sd_us >= DEBUG_STORAGE_SLOW_US ||
         _dbg_storage.max_update_us >= DEBUG_STORAGE_SLOW_US;
     const bool fault_changed = _dbg_storage.faults_seen != _faults;
-    const bool failure = _dbg_storage.qspi_failures || _dbg_storage.sd_failures;
+    const bool failure = _dbg_storage.sd_failures != 0;
     if (!due && !slow && !fault_changed && !failure) return;
 
     LOG_INFO("Storage dbg: phase=%s samples=%lu events=%lu ring=%lu "
-             "qspi=%lu/%lu sd=%lu/%lu max_us qspi=%lu sd=%lu update=%lu faults=0x%04X",
+             "ascent_buf=%lu/%u B sd=%lu/%lu max_us sd=%lu update=%lu faults=0x%04X",
              phase_name(g_state.phase),
              (unsigned long)_dbg_storage.samples_logged,
              (unsigned long)_dbg_storage.events_logged,
              (unsigned long)_dbg_storage.ring_pushes,
-             (unsigned long)_dbg_storage.qspi_writes,
-             (unsigned long)_dbg_storage.qspi_failures,
+             (unsigned long)_ascent_len, (unsigned)sizeof(_ascent_buf),
              (unsigned long)_dbg_storage.sd_writes,
              (unsigned long)_dbg_storage.sd_failures,
-             (unsigned long)_dbg_storage.max_qspi_us,
              (unsigned long)_dbg_storage.max_sd_us,
              (unsigned long)_dbg_storage.max_update_us,
              _faults);
@@ -251,8 +245,7 @@ static uint32_t config_hash() {
         (uint32_t)(APOGEE_BARO_FALL_M * 100.0f + 0.5f),
         LOG_RING_BUF_SECONDS, LOG_PRELAUNCH_RING_HZ,
         LOG_PAD_FILE_HZ, LOG_FLIGHT_FILE_HZ, LOG_RATE_DESCENT_HZ,
-        LOG_FLASH_PAGE_BUFFER_BYTES, LOG_FLASH_FLUSH_INTERVAL_MS,
-        LOG_FLASH_MAX_FAULTS,
+        LOG_ASCENT_BUF_BYTES, LOG_APOGEE_DUMP_DELAY_MS,
         LOG_SD_FLUSH_INTERVAL_MS, LOG_SD_MAX_FAULTS,
         LOG_SD_SLOW_DISABLE_US,
     };
@@ -260,8 +253,9 @@ static uint32_t config_hash() {
     return h;
 }
 
-static uint32_t read_counter_flash(const char* path, uint32_t fallback) {
-    File f = _flash.open(path, FILE_READ);
+// ── Boot/flight counters (persisted on SD now that QSPI is gone) ───────────────
+static uint32_t read_counter_sd(const char* path, uint32_t fallback) {
+    File f = SD.open(path, FILE_READ);
     if (!f) return fallback;
     char buf[16] = {0};
     const size_t n = f.readBytes(buf, sizeof(buf) - 1);
@@ -271,9 +265,9 @@ static uint32_t read_counter_flash(const char* path, uint32_t fallback) {
     return value == 0 ? fallback : value;
 }
 
-static void write_counter_flash(const char* path, uint32_t value) {
-    _flash.remove(path);
-    File f = _flash.open(path, FILE_WRITE);
+static void write_counter_sd(const char* path, uint32_t value) {
+    SD.remove(path);
+    File f = SD.open(path, FILE_WRITE);
     if (!f) {
         mark_fault(LOG_FAULT_FILE_OPEN, millis());
         return;
@@ -282,75 +276,7 @@ static void write_counter_flash(const char* path, uint32_t value) {
     f.close();
 }
 
-static void note_qspi_result(bool ok, uint32_t now_ms) {
-    if (ok) {
-        _qspi_consecutive_failures = 0;
-        return;
-    }
-    if (_qspi_consecutive_failures < UINT8_MAX) _qspi_consecutive_failures++;
-    mark_fault(LOG_FAULT_FLASH_WRITE, now_ms);
-#ifdef APEX_DEBUG
-    _dbg_storage.qspi_failures++;
-#endif
-    if (!_qspi_suspended && _qspi_consecutive_failures >= LOG_FLASH_MAX_FAULTS) {
-        _qspi_suspended = true;
-        LOG_ERROR("QSPI LittleFS log suspended after %u consecutive failures",
-                  (unsigned)_qspi_consecutive_failures);
-    }
-}
-
-static bool qspi_write_page(const uint8_t* data, size_t len, uint32_t now_ms, bool sync) {
-    if (!_flash_log || _qspi_suspended) {
-        mark_fault(LOG_FAULT_FILE_OPEN, now_ms);
-        return false;
-    }
-    const uint32_t start_us = micros();
-    const bool ok = (_flash_log.write(data, len) == len);
-    if (ok && sync) _flash_log.flush();
-    const uint32_t elapsed_us = micros() - start_us;
-    note_qspi_result(ok, now_ms);
-#ifndef APEX_DEBUG
-    (void)elapsed_us;
-#endif
-#ifdef APEX_DEBUG
-    if (ok) _dbg_storage.qspi_writes++;
-    dbg_record_max(_dbg_storage.max_qspi_us, elapsed_us);
-#endif
-    return ok;
-}
-
-static bool qspi_flush_buffer(uint32_t now_ms, bool force_sync) {
-    if (_qspi_len == 0) {
-        if (force_sync && _flash_log && !_qspi_suspended) _flash_log.flush();
-        return true;
-    }
-    memset(_qspi_buf + _qspi_len, 0xFF, sizeof(_qspi_buf) - _qspi_len);
-    const bool ok = qspi_write_page(_qspi_buf, sizeof(_qspi_buf), now_ms, force_sync);
-    _qspi_len = 0;
-    if (ok) _last_qspi_flush_ms = now_ms;
-    return ok;
-}
-
-static bool qspi_append(const uint8_t* data, size_t len, uint32_t now_ms) {
-    if (!_flash_log || _qspi_suspended) return false;
-    bool ok = true;
-    while (len > 0) {
-        const size_t room = sizeof(_qspi_buf) - _qspi_len;
-        const size_t n = len < room ? len : room;
-        memcpy(_qspi_buf + _qspi_len, data, n);
-        _qspi_len += n;
-        data += n;
-        len -= n;
-        if (_qspi_len == sizeof(_qspi_buf)) {
-            const bool wrote = qspi_write_page(_qspi_buf, sizeof(_qspi_buf), now_ms, false);
-            _qspi_len = 0;
-            ok = wrote && ok;
-            if (wrote) _last_qspi_flush_ms = now_ms;
-        }
-    }
-    return ok;
-}
-
+// ── SD sink ───────────────────────────────────────────────────────────────────
 static void note_sd_result(bool ok, uint32_t elapsed_us, uint32_t now_ms) {
     const bool slow = elapsed_us >= LOG_SD_SLOW_DISABLE_US;
     if (ok && !slow) {
@@ -365,7 +291,7 @@ static void note_sd_result(bool ok, uint32_t elapsed_us, uint32_t now_ms) {
     if (!_sd.suspended &&
         (_sd.consecutive_failures >= LOG_SD_MAX_FAULTS || slow)) {
         _sd.suspended = true;
-        LOG_ERROR("SD mirror suspended (%s, elapsed_us=%lu)",
+        LOG_ERROR("SD logging suspended (%s, elapsed_us=%lu)",
                   ok ? "slow write" : "write fault",
                   (unsigned long)elapsed_us);
     }
@@ -396,14 +322,14 @@ static bool sd_flush_buffer(uint32_t now_ms, bool force) {
     return ok;
 }
 
+// SD writes are withheld during BOOST/COAST — a FAT stall there would delay
+// burnout/apogee detection. Those records go to the ascent RAM buffer instead.
+// If the RAM buffer overflows (ascent longer than budget), SD becomes the only
+// path left, so allow it — degraded in-flight data beats none.
 static bool sd_live_allowed() {
-    // SD is normally withheld during BOOST/COAST/DESCENT — its flush stalls
-    // (>1s) would wreck launch-detection timing. But if QSPI has truly
-    // suspended (LOG_FLASH_MAX_FAULTS consecutive failures), SD is the only
-    // logging path left; better degraded in-flight data than none.
-    if (_qspi_suspended) return true;
+    if (_ascent_overflow) return true;
     const FlightPhase p = g_state.phase;
-    return p == FlightPhase::IDLE || p == FlightPhase::ARMED || p == FlightPhase::LANDED;
+    return !(p == FlightPhase::BOOST || p == FlightPhase::COAST);
 }
 
 static void sd_buffer_record(const uint8_t* data, size_t len, uint32_t now_ms) {
@@ -414,6 +340,50 @@ static void sd_buffer_record(const uint8_t* data, size_t len, uint32_t now_ms) {
         memcpy(_sd.buf + _sd.len, data, len);
         _sd.len += len;
     }
+}
+
+// ── Ascent RAM black box ──────────────────────────────────────────────────────
+static inline bool ascent_phase(FlightPhase p) {
+    return p == FlightPhase::BOOST || p == FlightPhase::COAST;
+}
+
+// Append a framed record to the RAM buffer. Returns false if it didn't fit (the
+// caller then routes the record to SD-live as a degraded fallback).
+static bool ascent_append(const uint8_t* frame, size_t len, uint32_t now_ms) {
+    if (_ascent_overflow) return false;
+    if (_ascent_len + len > sizeof(_ascent_buf)) {
+        _ascent_overflow = true;
+        mark_fault(LOG_FAULT_RECORD_DROP, now_ms);
+        LOG_ERROR("Ascent RAM buffer full at %lu B — falling back to SD-live",
+                  (unsigned long)_ascent_len);
+        return false;
+    }
+    memcpy(_ascent_buf + _ascent_len, frame, len);
+    _ascent_len += len;
+#ifdef APEX_DEBUG
+    _dbg_storage.ascent_bytes += len;
+#endif
+    return true;
+}
+
+static void flush_ascent_to_sd(uint32_t now_ms) {
+    if (_ascent_flushed) return;
+    _ascent_flushed = true;
+    if (_ascent_len == 0) return;
+    if (!(_health & STORAGE_OK_SD) || !_sd.file || _sd.suspended) return;
+
+    // One blocking pass — we are under canopy, timing no longer matters.
+    sd_flush_buffer(now_ms, true);            // commit any pending live bytes first
+    size_t off = 0;
+    while (off < _ascent_len) {
+        size_t n = _ascent_len - off;
+        if (n > SD_BUFFER_BYTES) n = SD_BUFFER_BYTES;
+        if (!sd_write_direct(_ascent_buf + off, n, now_ms, false)) break;
+        off += n;
+    }
+    if (_sd.file) _sd.file.flush();
+    storage_log_event(LOG_EVENT_PHASE, "ascent ram dumped to sd");
+    sd_flush_buffer(now_ms, true);
 }
 
 static int8_t current_gps_fix() {
@@ -449,8 +419,17 @@ static bool write_record(uint8_t type, uint32_t time_ms,
     ((LogHeader*)frame)->crc = crc;
 
     const size_t frame_len = sizeof(hdr) + length;
-    const bool ok = qspi_append(frame, frame_len, time_ms);
-    sd_buffer_record(frame, frame_len, time_ms);
+
+    // Route: ascent (BOOST/COAST) → RAM black box; everything else → SD-live.
+    // On RAM overflow the record falls through to SD so nothing is silently lost.
+    bool ok = true;
+    if (ascent_phase(g_state.phase) && !_ascent_overflow) {
+        if (!ascent_append(frame, frame_len, time_ms)) {
+            sd_buffer_record(frame, frame_len, time_ms);
+        }
+    } else {
+        sd_buffer_record(frame, frame_len, time_ms);
+    }
 #ifdef APEX_DEBUG
     if (type == LOG_REC_SAMPLE) _dbg_storage.samples_logged++;
     if (type == LOG_REC_EVENT) _dbg_storage.events_logged++;
@@ -519,23 +498,7 @@ static void flush_prelaunch_ring() {
 }
 
 static void flush_logs(uint32_t now_ms, bool force) {
-    if (_flash_log && !_qspi_suspended &&
-        (force || (_qspi_len > 0 &&
-                   now_ms - _last_qspi_flush_ms >= LOG_FLASH_FLUSH_INTERVAL_MS))) {
-        qspi_flush_buffer(now_ms, force);
-    }
     sd_flush_buffer(now_ms, force);
-}
-
-static bool flash_init() {
-    if (!_flash.begin()) {
-        LOG_ERROR("Storage: QSPI LittleFS mount failed");
-        return false;
-    }
-    _flash.mkdir(LOG_DIR);
-    LOG_INFO("Storage: QSPI LittleFS OK — %lu KB total, %lu KB used",
-             _flash.totalSize() / 1024, _flash.usedSize() / 1024);
-    return true;
 }
 
 static bool sd_init() {
@@ -550,17 +513,12 @@ static bool sd_init() {
 }
 
 static void open_logs() {
+    if (!(_health & STORAGE_OK_SD)) return;
     snprintf(_log_path, sizeof(_log_path), LOG_DIR "/BOOT_%05lu.APXLOG",
              (unsigned long)_boot_id);
-    _flash_log = _flash.open(_log_path, FILE_WRITE);
-    if (!_flash_log) mark_fault(LOG_FAULT_FILE_OPEN, millis());
-
-    if (_health & STORAGE_OK_SD) {
-        snprintf(_sd.path, sizeof(_sd.path), LOG_DIR "/BOOT_%05lu.APXLOG",
-                 (unsigned long)_boot_id);
-        _sd.file = SD.open(_sd.path, FILE_WRITE);
-        if (!_sd.file) mark_fault(LOG_FAULT_FILE_OPEN, millis());
-    }
+    snprintf(_sd.path, sizeof(_sd.path), "%s", _log_path);
+    _sd.file = SD.open(_sd.path, FILE_WRITE);
+    if (!_sd.file) mark_fault(LOG_FAULT_FILE_OPEN, millis());
 }
 
 static void write_boot_record() {
@@ -583,33 +541,9 @@ static void write_boot_record() {
     boot.log_flight_hz = LOG_FLIGHT_FILE_HZ;
     boot.storage_health = _health;
     write_record(LOG_REC_BOOT, millis(), &boot, sizeof(boot));
-    storage_log_event(LOG_EVENT_BOOT, storage_logging_ready() ? "littlefs qspi ready" : "storage not ready");
+    storage_log_event(LOG_EVENT_BOOT,
+                      storage_logging_ready() ? "sd logging ready" : "storage not ready");
     flush_logs(millis(), true);
-}
-
-static void dump_qspi_file_to_sd(uint32_t now_ms) {
-    if (_sd_dumped) return;
-    _sd_dumped = true;
-    if (!(_health & STORAGE_OK_SD) || !_sd.file || _sd.suspended) return;
-    flush_logs(now_ms, true);
-    if (!_flash_log) return;
-    _flash_log.flush();
-
-    File rd = _flash.open(_log_path, FILE_READ);
-    if (!rd) {
-        mark_fault(LOG_FAULT_FILE_OPEN, now_ms);
-        return;
-    }
-    uint8_t buf[512];
-    while (rd.available()) {
-        const int n = rd.read(buf, sizeof(buf));
-        if (n <= 0) break;
-        if (!sd_write_direct(buf, (size_t)n, now_ms, false)) break;
-    }
-    rd.close();
-    if (_sd.file) _sd.file.flush();
-    storage_log_event(LOG_EVENT_PHASE, "qspi sd dump complete");
-    sd_flush_buffer(now_ms, true);
 }
 
 uint8_t storage_init() {
@@ -621,36 +555,31 @@ uint8_t storage_init() {
     _seq = 0;
     _flight_started = false;
     _ring_flushed = false;
-    _sd_dumped = false;
+    _ascent_flushed = false;
     _ring_head = 0;
     _ring_count = 0;
-    _qspi_len = 0;
-    _qspi_consecutive_failures = 0;
-    _qspi_suspended = false;
+    _ascent_len = 0;
+    _ascent_overflow = false;
     _sd = BufferedFileSink{};
 
-    if (flash_init()) _health |= STORAGE_OK_FLASH;
-    if (sd_init())    _health |= STORAGE_OK_SD;
+    if (sd_init()) _health |= STORAGE_OK_SD;
 
-    if (_health & STORAGE_OK_FLASH) {
-        _boot_id = read_counter_flash(LOG_NEXT_BOOT_PATH, 1);
-        _next_flight_id = read_counter_flash(LOG_NEXT_FLIGHT_PATH, 1);
-        write_counter_flash(LOG_NEXT_BOOT_PATH, _boot_id + 1);
+    if (_health & STORAGE_OK_SD) {
+        _boot_id = read_counter_sd(LOG_NEXT_BOOT_PATH, 1);
+        _next_flight_id = read_counter_sd(LOG_NEXT_FLIGHT_PATH, 1);
+        write_counter_sd(LOG_NEXT_BOOT_PATH, _boot_id + 1);
         open_logs();
     } else {
         mark_fault(LOG_FAULT_FILE_OPEN, millis());
-    }
-
-    if (_health != (STORAGE_OK_FLASH | STORAGE_OK_SD)) {
-        LOG_ERROR("Storage: launch logging degraded (health=0x%02X)", _health);
+        LOG_ERROR("Storage: SD unavailable — launch logging unavailable (health=0x%02X)",
+                  _health);
     }
 
     write_boot_record();
 
 #ifdef USB_MTPDISK_SERIAL
     MTP.begin();
-    if (_health & STORAGE_OK_FLASH) MTP.addFilesystem(_flash, "APEX-FLASH");
-    if (_health & STORAGE_OK_SD)    MTP.addFilesystem(SD,     "APEX-SD");
+    if (_health & STORAGE_OK_SD) MTP.addFilesystem(SD, "APEX-SD");
 #endif
 
     return _health;
@@ -661,11 +590,11 @@ uint16_t storage_faults() { return _faults; }
 uint32_t storage_boot_id() { return _boot_id; }
 
 bool storage_logging_ready() {
-    const uint16_t fatal_faults = LOG_FAULT_FLASH_WRITE | LOG_FAULT_RECORD_DROP;
-    return (_health & STORAGE_OK_FLASH) &&
-           _flash_log &&
-           !_qspi_suspended &&
-           ((_faults & fatal_faults) == 0);
+    // SD is the only non-volatile medium now, so it is the launch gate.
+    return (_health & STORAGE_OK_SD) &&
+           _sd.file &&
+           !_sd.suspended &&
+           ((_faults & LOG_FAULT_RECORD_DROP) == 0);
 }
 
 void storage_log_event(uint8_t event_id, const char* detail) {
@@ -686,7 +615,7 @@ void storage_begin_flight(uint32_t now_ms, const char* reason) {
     if (_flight_started) return;
     _flight_started = true;
     _flight_id = _next_flight_id++;
-    write_counter_flash(LOG_NEXT_FLIGHT_PATH, _next_flight_id);
+    write_counter_sd(LOG_NEXT_FLIGHT_PATH, _next_flight_id);
     storage_log_event(LOG_EVENT_LAUNCH_DETECTED, reason);
     flush_prelaunch_ring();
     flush_logs(now_ms, true);
@@ -720,11 +649,19 @@ void storage_log_update(uint32_t now_ms) {
         write_record(LOG_REC_SAMPLE, now_ms, &s, sizeof(s));
     }
 
-    flush_logs(now_ms, false);
+    // SD flushing only happens when SD-live is allowed (i.e. not mid-ascent).
+    if (sd_live_allowed()) flush_logs(now_ms, false);
 
-    if (_flight_started && phase == FlightPhase::LANDED &&
-        now_ms - g_state.phase_entry_ms >= LOG_LANDING_DUMP_DELAY_MS) {
-        dump_qspi_file_to_sd(now_ms);
+    // Dump the ascent RAM black box to SD a few seconds after apogee (under
+    // canopy), with a landing fallback if DESCENT was skipped entirely.
+    if (_flight_started && !_ascent_flushed && _ascent_len > 0) {
+        const bool apogee_window =
+            (phase == FlightPhase::DESCENT &&
+             now_ms - g_state.phase_entry_ms >= LOG_APOGEE_DUMP_DELAY_MS);
+        const bool landed =
+            (phase == FlightPhase::LANDED &&
+             now_ms - g_state.phase_entry_ms >= LOG_LANDING_DUMP_DELAY_MS);
+        if (apogee_window || landed) flush_ascent_to_sd(now_ms);
     }
 #ifdef APEX_DEBUG
     dbg_record_max(_dbg_storage.max_update_us, micros() - update_start_us);
@@ -734,76 +671,25 @@ void storage_log_update(uint32_t now_ms) {
 
 void storage_end_session(uint32_t now_ms, const char* reason) {
     storage_log_event(LOG_EVENT_HIL_SESSION_END, reason);
+    flush_ascent_to_sd(now_ms);
     flush_logs(now_ms, true);
     _flight_started = false;
     _flight_id = 0;
     _ring_flushed = false;
     _ring_head = 0;
     _ring_count = 0;
+    _ascent_flushed = false;
+    _ascent_len = 0;
+    _ascent_overflow = false;
 }
 
 bool storage_format_qspi(uint32_t now_ms) {
-    if (!(_health & STORAGE_OK_FLASH)) return false;
-#ifdef USB_MTPDISK_SERIAL
-    if (MTP) {
-        Serial.println("#ERROR: QSPI format refused — MTP session active; finish/close Logs refresh and retry");
-        return false;
-    }
-#endif
-    flush_logs(now_ms, true);
-    if (_flash_log) _flash_log.close();
-    if (_sd.file) _sd.file.close();
-
-#ifdef USB_MTPDISK_SERIAL
-    // MTP_Teensy keeps its object index open after a host closes the session.
-    // Re-selecting the index filesystem uses PJRC's supported API to close that
-    // hidden handle before LittleFS erases the underlying QSPI volume.
-    if (!MTP.useFilesystemForIndexList(_flash)) {
-        Serial.println("#ERROR: QSPI format refused — could not release MTP index handle");
-        open_logs();
-        return false;
-    }
-#endif
-
-    const uint32_t total_kb = (uint32_t)(_flash.totalSize() / 1024);
-    const uint32_t used_before_kb = (uint32_t)(_flash.usedSize() / 1024);
-    Serial.printf("#INFO: QSPI LittleFS erase starting — %lu/%lu KB used\n",
-                  (unsigned long)used_before_kb, (unsigned long)total_kb);
-
-    const bool ok = _flash.lowLevelFormat(0);
-    if (!ok) {
-        _health &= ~STORAGE_OK_FLASH;
-        mark_fault(LOG_FAULT_FILE_OPEN, now_ms);
-        Serial.println("#ERROR: QSPI low-level erase failed — flash marked unhealthy");
-        return false;
-    }
-    _flash.mkdir(LOG_DIR);
-
-    _boot_id = 1;
-    _next_flight_id = 1;
-    _flight_id = 0;
-    _seq = 0;
-    _flight_started = false;
-    _ring_flushed = false;
-    _sd_dumped = false;
-    _ring_head = 0;
-    _ring_count = 0;
-    _qspi_len = 0;
-    _qspi_consecutive_failures = 0;
-    _qspi_suspended = false;
-    _sd.len = 0;
-    _sd.suspended = false;
-    _sd.consecutive_failures = 0;
-    _faults &= ~(LOG_FAULT_FLASH_WRITE | LOG_FAULT_FILE_OPEN | LOG_FAULT_RECORD_DROP);
-    _health |= STORAGE_OK_FLASH;
-
-    write_counter_flash(LOG_NEXT_BOOT_PATH, _boot_id + 1);
-    write_counter_flash(LOG_NEXT_FLIGHT_PATH, _next_flight_id);
-    open_logs();
-    write_boot_record();
-    Serial.printf("#INFO: QSPI LittleFS erased — fresh BOOT_%05lu session open (ready=%d)\n",
-                  (unsigned long)_boot_id, storage_logging_ready() ? 1 : 0);
-    return storage_logging_ready();
+    // The QSPI NAND is physically gone (replaced by undetected PSRAM). There is
+    // nothing to low-level format; SD logs are managed from the host instead.
+    (void)now_ms;
+    Serial.println("#WARN: FORMAT_QSPI ignored — no QSPI flash present (SD-only build). "
+                   "Delete SD logs from HORIZON / the host file browser instead.");
+    return false;
 }
 
 static void print_log_dir_entry(const char* medium, File& entry) {
@@ -835,21 +721,15 @@ static uint16_t print_log_dir(FS& fs, const char* medium) {
 }
 
 void storage_print_log_directory(uint32_t now_ms) {
-    flush_logs(now_ms, true);
+    if (sd_live_allowed()) flush_logs(now_ms, true);
     Serial.printf("#INFO: LOG_STATUS health=0x%02X faults=0x%04X boot_id=%lu "
-                  "flight_id=%lu ready=%d qspi_open=%d qspi_suspended=%d path=%s\n",
+                  "flight_id=%lu ready=%d sd_open=%d ascent_buf=%lu/%u dumped=%d path=%s\n",
                   _health, _faults, (unsigned long)_boot_id,
                   (unsigned long)_flight_id, storage_logging_ready() ? 1 : 0,
-                  _flash_log ? 1 : 0, _qspi_suspended ? 1 : 0, _log_path);
-
-    if (_health & STORAGE_OK_FLASH) {
-        print_log_dir(_flash, "QSPI");
-    } else {
-        Serial.println("#WARN: LOG_LIST medium=QSPI unavailable (flash not healthy)");
-    }
+                  _sd.file ? 1 : 0, (unsigned long)_ascent_len,
+                  (unsigned)sizeof(_ascent_buf), _ascent_flushed ? 1 : 0, _log_path);
 
     if (_health & STORAGE_OK_SD) {
-        sd_flush_buffer(now_ms, true);
         print_log_dir(SD, "SD");
     } else {
         Serial.println("#WARN: LOG_LIST medium=SD unavailable (SD not healthy)");

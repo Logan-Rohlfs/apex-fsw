@@ -376,6 +376,8 @@ class RadioWorker(QThread):
         emit(f">vert_accel:{t['vert_accel_mps2']:.3f}")
         emit(f">accel_z:{t['accel_z_mss']:.3f}")
         emit(f">roll_rate:{t['roll_rate_rads']:.4f}")
+        emit(f">tilt_deg:{t['tilt_deg']:.1f}")
+        emit(f">azimuth_deg:{t['azimuth_deg']:.1f}")
         emit(f">deployment:{t['deployment_frac']:.3f}")
         emit(f">gps_alt_msl:{t['gps_alt_msl_m']:.1f}")
         emit(f">gps_lat:{t['gps_lat_deg']:.6f}")

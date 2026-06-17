@@ -20,13 +20,15 @@ def test_flight_status_bits_decode_without_changing_body_size():
         b"KG5LDI", 42, phase_status, health, 3, 12,
         33.5, -101.8,
         2000, 1000, 500, 1200, 981, 1500, 25,
-        128, 50000, 24,
+        128, 50000, 24, 5, 900,
     )
 
-    assert len(body) == 38
+    assert len(body) == 41
     decoded = rx.parse_flight(body)
     assert decoded["phase"] == 3
     assert decoded["phase_name"] == "COAST"
+    assert decoded["tilt_deg"] == 5.0
+    assert decoded["azimuth_deg"] == 90.0
     assert decoded["airbrakes_authorized"]
     assert decoded["servo_powered"]
     assert decoded["arm_switches_closed"]
@@ -41,7 +43,7 @@ def test_flight_status_bits_decode_without_changing_body_size():
 def test_phase_mask_ignores_status_upper_bits():
     body = rx.FLIGHT_STRUCT.pack(
         b"KG5LDI", 1, 2 | rx.STATUS_SERVO_POWER, 0, -1, 0,
-        0.0, 0.0, *([0] * 7), 0, 0, 0,
+        0.0, 0.0, *([0] * 7), 0, 0, 0, 0, 0,
     )
     decoded = rx.parse_flight(body)
     assert decoded["phase_name"] == "BOOST"

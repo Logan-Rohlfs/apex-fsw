@@ -434,6 +434,14 @@ void fusion_update() {
     g_state.fused.altitude_agl_m     = _cf_alt_m;
     g_state.fused.velocity_mps       = _cf_vel_mps;
     g_state.fused.accel_mps2         = vert_accel;
+    g_state.fused.tilt_deg           = acosf(fmaxf(-1.0f, fminf(1.0f, vz))) * 57.29578f;
+    // Compass direction the nose leans toward: rotate the yaw-free lean vector
+    // (vx,vy) into the world frame by yaw → atan2 reduces to yaw + atan2(vy,vx).
+    // Mag-referenced; sign/offset convention to be validated on the bench.
+    float azimuth = (yaw + atan2f(vy, vx)) * 57.29578f;
+    azimuth = fmodf(azimuth, 360.0f);
+    if (azimuth < 0.0f) azimuth += 360.0f;
+    g_state.fused.azimuth_deg        = azimuth;
     g_state.fused.air_density_kgm3   = density;
     g_state.fused.predicted_apogee_m = pred_apo;
     g_state.fused.timestamp_ms       = now_ms;

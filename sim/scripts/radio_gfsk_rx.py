@@ -52,7 +52,7 @@ FRAME_TYPE_HK = 0x03
 # fsw/src/radio.cpp TelemFlight / TelemHousekeeping (packed, little-endian).
 # Scaled-int fields are converted back to SI here — keep in sync with the
 # scale comments in radio.cpp.
-FLIGHT_STRUCT = struct.Struct("<6sHBBbBff7hBHb")   # 38 bytes
+FLIGHT_STRUCT = struct.Struct("<6sHBBbBff7hBHbbH")  # 41 bytes
 HK_STRUCT = struct.Struct("<H3h3h2hH")             # 20 bytes
 PHASE_NAMES = ("IDLE", "ARMED", "BOOST", "COAST", "DESCENT", "LANDED")
 
@@ -79,7 +79,7 @@ MIN_BODY_LEN = min(BODY_LEN_BY_TYPE.values())
 def parse_flight(body: bytes) -> dict:
     (callsign, seq, phase_status, health, gps_fix, gps_sats, lat, lon,
      gps_alt, alt, vel, apogee, vacc, accel_z, roll, deploy,
-     baro2, btemp) = FLIGHT_STRUCT.unpack(body)
+     baro2, btemp, tilt, azimuth) = FLIGHT_STRUCT.unpack(body)
     phase = phase_status & PHASE_MASK
     return {
         "callsign": callsign.decode("ascii", "replace").strip("\x00 "),
@@ -111,6 +111,8 @@ def parse_flight(body: bytes) -> dict:
         "deployment_frac": deploy / 255.0,
         "baro_pa": baro2 * 2.0,
         "baro_temp_c": float(btemp),
+        "tilt_deg": float(tilt),
+        "azimuth_deg": azimuth * 0.1,
     }
 
 
