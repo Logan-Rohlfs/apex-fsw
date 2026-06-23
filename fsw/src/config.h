@@ -73,6 +73,24 @@
 #define PIN_BUZZER          6    // D6 — passive piezo driven with tone()
 #define BUZZER_ACTIVE       0    // 1 = self-driving (active) buzzer → digitalWrite
 
+// ── CW station ID for the video downlink (FCC Part 97 §97.119) ────────────────
+// A 1 kHz tone keyed in Morse on PIN_CW_ID, wired into the VTX audio input, so
+// the video transmission carries its own station ID. Distinct from the data
+// telemetry's RADIO_CALLSIGN — this IDs the analog video link operator. Sent
+// every CW_ID_INTERVAL_MS while the radio switch is on (VTX powered). The
+// scheduler (cw_id.cpp) is fully non-blocking; the tone is hardware PWM on
+// PIN_CW_ID = D15 = QuadTimer3_3, an independent PWM block from the servo
+// (FlexPWM2_3 / D37) and buzzer (FlexPWM2_2 / D6), so its 1 kHz cannot disturb
+// the 50 Hz servo. tone()/delay() are unusable here (all PITs are consumed by
+// the fusion/baro/mag timers, and blocking would wreck flight timing).
+#define PIN_CW_ID            15
+#define CW_ID_CALLSIGN       "KJ5CLF"
+#define CW_TONE_HZ           1000
+#define CW_PWM_RES_BITS      12          // matches control_init's analogWriteResolution(12)
+#define CW_DOT_MS            100         // dot; dash = 3x, intra-gap = 1x, letter-gap = 3x
+#define CW_ID_INTERVAL_MS    600000UL    // re-ID every 10 minutes
+#define CW_ID_FIRST_DELAY_MS 5000UL      // first ID this long after boot / radio-enable
+
 // ─── Radio ────────────────────────────────────────────────────────────────────
 // RF4463PRO-433 / Si4463 crystal frequency used by POWER_UP and PLL math.
 // NiceRF material confirms a 10 ppm crystal but is inconsistent/sparse on the

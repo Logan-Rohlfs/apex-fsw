@@ -122,6 +122,130 @@ class SerialWorker(QThread):
         self.wait(3000)
 
 
+class ReplayWorker(QThread):
+    """Replay a decoded flight-log CSV through the >key:value pipeline so a
+    recorded flight scrolls across the Sensors page exactly like a live one.
+
+    Emits the same line protocol SerialWorker does — it plugs into _on_line with
+    no special casing — paced by the log's own sample timestamps × a speed
+    multiplier (0 = as fast as possible). Long idle gaps (the armed pad sit) are
+    compressed to _MAX_GAP_S so playback stays watchable.
+    """
+
+    line_received  = pyqtSignal(str)
+    status_changed = pyqtSignal(str, bool)   # (message, is_error)
+    progress       = pyqtSignal(float)       # 0..1 fraction streamed
+
+    # CSV column -> >plot key (Sensors-page PLOT_GROUPS + GPS).
+    _PLOT_MAP = {
+        "alt_m": "alt_agl", "vel_mps": "velocity", "pred_apogee_m": "pred_apogee",
+        "vert_accel_mps2": "vert_accel", "ax_mss": "accel_x", "ay_mss": "accel_y",
+        "az_mss": "accel_z", "gx_rads": "gyro_x", "gy_rads": "gyro_y",
+        "gz_rads": "gyro_z", "highg_x_mss": "highg_x", "baro_temp_c": "baro_temp",
+        "deploy": "deployment", "gps_alt_msl_m": "gps_alt_msl",
+        "gps_lat_deg": "gps_lat", "gps_lon_deg": "gps_lon",
+    }
+    # CSV column -> !state key (emitted only when the value changes).
+    _STATE_MAP = {"phase": "phase", "gps_fix": "gps_fix",
+                  "gps_sats": "gps_sats", "storage_health": "health"}
+    _MAX_GAP_S = 1.0
+
+    def __init__(self):
+        super().__init__()
+        self._path = ""
+        self._speed = 1.0
+        self._running = False
+
+    def configure(self, csv_path, speed: float = 1.0):
+        self._path = str(csv_path)
+        self._speed = max(0.0, float(speed))
+
+    def run(self):
+        self._running = True
+        try:
+            with open(self._path, newline="") as f:
+                rows = list(csv.DictReader(f))
+        except OSError as exc:
+            self.status_changed.emit(f"Replay: cannot open log — {exc}", True)
+            self._running = False
+            return
+
+        name = Path(self._path).stem
+        total = len(rows) or 1
+        speed_txt = "max" if self._speed == 0 else f"{self._speed:g}×"
+        self.status_changed.emit(f"Replaying {name} ({speed_txt})", False)
+
+        prev_ms = None
+        last_state: dict = {}
+        for i, row in enumerate(rows):
+            if not self._running:
+                break
+
+            ts = row.get("sample_ms") or row.get("time_ms") or ""
+            try:
+                cur_ms = float(ts)
+            except ValueError:
+                cur_ms = prev_ms if prev_ms is not None else 0.0
+
+            # Pace against the log's own timeline (compressing long gaps).
+            if prev_ms is not None and self._speed > 0:
+                dt = (cur_ms - prev_ms) / 1000.0 / self._speed
+                if dt > 0:
+                    time.sleep(min(dt, self._MAX_GAP_S))
+            prev_ms = cur_ms
+
+            rtype = (row.get("record_type") or "").upper()
+            if rtype == "EVENT":
+                ev = (row.get("event") or "").strip()
+                detail = (row.get("event_detail") or "").strip()
+                self.line_received.emit(
+                    f"#INFO: [{cur_ms / 1000:.1f}s] EVENT {ev} {detail}".rstrip())
+                continue
+            if rtype and rtype != "SAMPLE":
+                continue   # BOOT record etc.
+
+            for col, key in self._PLOT_MAP.items():
+                v = row.get(col)
+                if v in (None, "", "nan"):
+                    continue
+                try:
+                    self.line_received.emit(f">{key}:{float(v):.4f}")
+                except ValueError:
+                    pass
+
+            baro = row.get("baro_pa")
+            if baro not in (None, "", "nan"):
+                try:
+                    pa = float(baro)
+                    self.line_received.emit(f">baro_pa:{pa:.0f}")
+                    if pa > 0:
+                        alt = 44330.0 * (1.0 - (pa / 101325.0) ** (1.0 / 5.255))
+                        self.line_received.emit(f">baro_alt:{alt:.1f}")
+                except ValueError:
+                    pass
+
+            for col, key in self._STATE_MAP.items():
+                v = row.get(col)
+                if v in (None, ""):
+                    continue
+                v = v.strip()
+                if last_state.get(key) != v:
+                    last_state[key] = v
+                    self.line_received.emit(f"!{key}:{v}")
+
+            if i % 50 == 0:
+                self.progress.emit(i / total)
+
+        self.progress.emit(1.0)
+        if self._running:
+            self.status_changed.emit(f"Replay complete — {name}", False)
+        self._running = False
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+
 class RadioWorker(QThread):
     line_received  = pyqtSignal(str)
     # Telemetry data lines carry the frame's true reception time (monotonic s),

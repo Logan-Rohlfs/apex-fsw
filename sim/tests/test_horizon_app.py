@@ -253,3 +253,48 @@ def test_plot_height_is_bounded(app, win):
     group = win._serial_groups[0]
     assert group.plot.minimumHeight() == 160
     assert group.plot.maximumHeight() == 260
+
+
+# ── Log replay: decoded CSV → Sensors plots ──────────────────────────────────
+
+def test_replay_streams_log_into_sensors(app, win, tmp_path):
+    """A decoded flight CSV replays through the same >key/!key pipeline a live
+    serial flight uses — plots fill, phase updates, events log, baro_alt derives."""
+    import csv as _csv
+
+    p = tmp_path / "Flight_09_BOOT_00099.csv"
+    cols = ["record_type", "sample_ms", "time_ms", "phase", "alt_m", "vel_mps",
+            "baro_pa", "gps_fix", "gps_sats", "event", "event_detail"]
+    with open(p, "w", newline="") as f:
+        wr = _csv.DictWriter(f, fieldnames=cols)
+        wr.writeheader()
+        wr.writerow({"record_type": "BOOT", "time_ms": "0"})
+        wr.writerow({"record_type": "EVENT", "time_ms": "100",
+                     "event": "LAUNCH_DETECTED", "event_detail": "accel"})
+        wr.writerow({"record_type": "SAMPLE", "sample_ms": "100", "phase": "BOOST",
+                     "alt_m": "12.5", "vel_mps": "40", "baro_pa": "100000",
+                     "gps_fix": "3", "gps_sats": "9"})
+        wr.writerow({"record_type": "SAMPLE", "sample_ms": "110", "phase": "BOOST",
+                     "alt_m": "20.0", "vel_mps": "45", "baro_pa": "99000",
+                     "gps_fix": "3", "gps_sats": "9"})
+
+    win.tab_bar.setCurrentIndex(0)   # Sensors page (serial routing)
+    app.processEvents()
+
+    win._replay_worker.configure(str(p), 0.0)   # 0 = max speed, no pacing
+    win._replay_worker.start()
+    deadline = time.monotonic() + 10
+    while win._replay_worker.isRunning() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    for _ in range(5):
+        app.processEvents()
+
+    assert not win._replay_worker.isRunning()
+    group = win._key_to_group_serial.get("alt_agl")
+    assert group is not None
+    assert len(group._t["alt_agl"]) == 2          # two SAMPLE rows
+    assert win.state_panel.phase_label.text() == "BOOST"
+    assert "LAUNCH_DETECTED" in win.log_view.toPlainText()
+    assert "baro_alt" in win._key_to_group_serial  # derived from baro_pa
+    assert win.replay_btn.text() == "▶ Replay log…"   # reset when finished

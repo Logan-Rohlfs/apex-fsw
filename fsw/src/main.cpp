@@ -11,6 +11,7 @@
 #include "storage.h"
 #include "control.h"
 #include "board.h"
+#include "cw_id.h"
 
 // APEX_HIL and APEX_DEBUG are mutually exclusive.
 // Interleaved text output causes CRC false-failures in the Python parser.
@@ -155,6 +156,7 @@ void setup() {
     radio_init();
     control_init();
     control_boot_self_test();
+    cw_id_init();     // CW video-ID scheduler (must follow control_init's PWM-res setup)
     if (!all_ok)
         LOG_WARN("One or more sensors failed init (health=0x%02X)", sensors_health());
 
@@ -519,6 +521,7 @@ void loop() {
 
     status_buzzer_update();
     board_update(millis());
+    cw_id_update(millis());
     storage_mtp_loop();
     led_update();
 }

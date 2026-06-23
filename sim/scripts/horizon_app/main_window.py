@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import serial
@@ -23,7 +24,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSplitter, QScrollArea, QFrame,
     QTextEdit, QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit,
-    QTabBar,
+    QTabBar, QFileDialog,
 )
 
 from . import theme
@@ -35,8 +36,9 @@ from .constants import (
 from .widgets import PlotGroupWidget, SpectrumPanel, CommandInput
 from .state_panel import StatePanel
 from .connection import ConnectionBar
-from .workers import SerialWorker, RadioWorker, HilWorker, LogOpsWorker
+from .workers import SerialWorker, RadioWorker, HilWorker, LogOpsWorker, ReplayWorker
 from .log_panel import LogPanelMixin
+from .paths import _SIM_ROOT
 
 _SETTINGS_ORG = "SpaceRaiders"
 _SETTINGS_APP = "HORIZON"
@@ -57,6 +59,7 @@ class MainWindow(QMainWindow, LogPanelMixin):
         self._radio_worker = RadioWorker()
         self._hil_worker = HilWorker()
         self._log_ops = LogOpsWorker()
+        self._replay_worker = ReplayWorker()
         self._log_export_after_pull = False
         self._last_export_dir = None
         self._t_start = None
@@ -298,6 +301,22 @@ class MainWindow(QMainWindow, LogPanelMixin):
         self.clear_btn.clicked.connect(self._clear_data)
         layout.addWidget(self.clear_btn)
 
+        # ── Log replay (Sensors page only) — stream a decoded flight CSV ──────
+        self.replay_speed_combo = QComboBox()
+        for label, mult in (("1×", 1.0), ("2×", 2.0), ("5×", 5.0),
+                            ("20×", 20.0), ("Max", 0.0)):
+            self.replay_speed_combo.addItem(label, mult)
+        self.replay_speed_combo.setFixedWidth(64)
+        self.replay_speed_combo.setToolTip("Replay speed (× real time; Max = no pacing)")
+        self.replay_btn = QPushButton("▶ Replay log…")
+        self.replay_btn.setFixedWidth(120)
+        self.replay_btn.setToolTip(
+            "Stream a decoded flight-log CSV through the plots as if it were live.")
+        self.replay_btn.clicked.connect(self._toggle_replay)
+        self._replay_widgets = [self.replay_speed_combo, self.replay_btn]
+        layout.addWidget(self.replay_speed_combo)
+        layout.addWidget(self.replay_btn)
+
         return bar
 
     # ── Page routing ────────────────────────────────────────────────────────
@@ -321,6 +340,9 @@ class MainWindow(QMainWindow, LogPanelMixin):
         self.hil_compare_check.setVisible(hil and not hil_fake)
         for w in (self.window_label, self.window_spin, self.clear_btn):
             w.setVisible(not logs)
+        # Replay drives the serial/Sensors plots, so offer it only there.
+        for w in self._replay_widgets:
+            w.setVisible(mode == "serial")
         self.logs_hint_label.setVisible(logs)
         if hil:
             self._update_hil_buttons()
@@ -388,7 +410,8 @@ class MainWindow(QMainWindow, LogPanelMixin):
         self._update_hil_buttons()
 
     def _stop_active(self):
-        for w in (self._worker, self._radio_worker, self._hil_worker):
+        for w in (self._worker, self._radio_worker, self._hil_worker,
+                  self._replay_worker):
             if w.isRunning():
                 w.stop()
         self._set_disconnected()
@@ -415,6 +438,10 @@ class MainWindow(QMainWindow, LogPanelMixin):
         self._hil_worker.lines_received.connect(self._on_lines)
         self._hil_worker.status_changed.connect(self._on_status)
         self._hil_worker.finished.connect(self._on_worker_finished)
+        self._replay_worker.line_received.connect(self._on_line)
+        self._replay_worker.status_changed.connect(self._on_status)
+        self._replay_worker.progress.connect(self._on_replay_progress)
+        self._replay_worker.finished.connect(self._on_replay_finished)
         self._log_ops.progress.connect(self._append_log_decode_text)
         self._log_ops.done.connect(self._on_log_job_done)
         self._log_ops.failed.connect(self._on_log_job_failed)
@@ -701,6 +728,40 @@ class MainWindow(QMainWindow, LogPanelMixin):
         if (not self._worker.isRunning() and not self._radio_worker.isRunning()
                 and not self._hil_worker.isRunning()):
             self._set_disconnected()
+
+    # ── Log replay ────────────────────────────────────────────────────────────
+    def _toggle_replay(self):
+        if self._replay_worker.isRunning():
+            self._replay_worker.stop()
+            return
+
+        default_dir = _SIM_ROOT / "output" / "log_exports"
+        start_dir = str(default_dir if default_dir.exists() else _SIM_ROOT)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Replay flight log", start_dir, "Decoded log (*.csv);;All files (*)")
+        if not path:
+            return
+
+        # Replay drives the serial/Sensors plots — make sure that page is active.
+        self.tab_bar.setCurrentIndex(0)
+        self._clear_data()
+        speed = self.replay_speed_combo.currentData()
+        self._replay_worker.configure(path, speed)
+        self._replay_worker.start()
+        self.replay_btn.setText("■ Stop replay")
+        self.conn.set_status(True, f"Replaying {Path(path).name}")
+
+    def _on_replay_progress(self, frac: float):
+        self.conn.set_status(True, f"Replaying… {frac * 100:.0f}%")
+
+    def _on_replay_finished(self):
+        self.replay_btn.setText("▶ Replay log…")
+        if not self._any_source_running():
+            self._set_disconnected()
+
+    def _any_source_running(self) -> bool:
+        return (self._worker.isRunning() or self._radio_worker.isRunning()
+                or self._hil_worker.isRunning() or self._replay_worker.isRunning())
 
     def _send_command(self):
         text = self.cmd_input.text().strip()
